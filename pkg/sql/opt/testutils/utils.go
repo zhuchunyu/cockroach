@@ -15,6 +15,9 @@
 package testutils
 
 import (
+	"path/filepath"
+	"testing"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -45,14 +48,51 @@ func ParseTypes(colStrs []string) ([]types.T, error) {
 
 // ParseScalarExpr parses a scalar expression and converts it to a
 // tree.TypedExpr.
-func ParseScalarExpr(sql string, ivh *tree.IndexedVarHelper) (tree.TypedExpr, error) {
+func ParseScalarExpr(sql string, ivc tree.IndexedVarContainer) (tree.TypedExpr, error) {
 	expr, err := parser.ParseExpr(sql)
 	if err != nil {
 		return nil, err
 	}
 
 	sema := tree.MakeSemaContext(false /* privileged */)
-	sema.IVarHelper = ivh
+	sema.IVarContainer = ivc
 
 	return expr.TypeCheck(&sema, types.Any)
 }
+
+// ExecuteTestDDL parses the given DDL SQL statement and creates objects in the
+// test catalog. This is used to test without spinning up a cluster.
+func ExecuteTestDDL(tb testing.TB, sql string, catalog *TestCatalog) string {
+	stmt, err := parser.ParseOne(sql)
+	if err != nil {
+		tb.Fatalf("%v", err)
+	}
+
+	if stmt.StatementType() != tree.DDL {
+		tb.Fatalf("statement type is not DDL: %v", stmt.StatementType())
+	}
+
+	switch stmt := stmt.(type) {
+	case *tree.CreateTable:
+		tab := catalog.CreateTable(stmt)
+		return tab.String()
+
+	default:
+		tb.Fatalf("expected CREATE TABLE statement but found: %v", stmt)
+		return ""
+	}
+}
+
+// GetTestFiles returns the set of test files that matches the Glob pattern.
+func GetTestFiles(tb testing.TB, testdataGlob string) []string {
+	paths, err := filepath.Glob(testdataGlob)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if len(paths) == 0 {
+		tb.Fatalf("no testfiles found matching: %s", testdataGlob)
+	}
+	return paths
+}
+
+var _ = GetTestFiles

@@ -75,6 +75,12 @@ func StoreLastUpKey() roachpb.Key {
 	return MakeStoreKey(localStoreLastUpSuffix, nil)
 }
 
+// StoreHLCUpperBoundKey returns the key for storing an upper bound to the
+// wall time used by HLC
+func StoreHLCUpperBoundKey() roachpb.Key {
+	return MakeStoreKey(localHLCUpperBoundSuffix, nil)
+}
+
 // StoreSuggestedCompactionKey returns a store-local key for a
 // suggested compaction. It combines the specified start and end keys.
 func StoreSuggestedCompactionKey(start, end roachpb.Key) roachpb.Key {
@@ -659,6 +665,31 @@ func DecodeTablePrefix(key roachpb.Key) ([]byte, uint64, error) {
 	return encoding.DecodeUvarintAscending(key)
 }
 
+// DecodeDescMetadataID decodes a descriptor ID from a descriptor metadata key.
+func DecodeDescMetadataID(key roachpb.Key) (uint64, error) {
+	// Extract object ID from key.
+	// TODO(marc): move sql/keys.go to keys (or similar) and use a DecodeDescMetadataKey.
+	// We should also check proper encoding.
+	remaining, tableID, err := DecodeTablePrefix(key)
+	if err != nil {
+		return 0, err
+	}
+	if tableID != DescriptorTableID {
+		return 0, errors.Errorf("key is not a descriptor table entry: %v", key)
+	}
+	// DescriptorTable.PrimaryIndex.ID
+	remaining, _, err = encoding.DecodeUvarintAscending(remaining)
+	if err != nil {
+		return 0, err
+	}
+	// descID
+	_, id, err := encoding.DecodeUvarintAscending(remaining)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // MakeFamilyKey returns the key for the family in the given row by appending to
 // the passed key.
 func MakeFamilyKey(key []byte, famID uint32) []byte {
@@ -674,9 +705,22 @@ func MakeFamilyKey(key []byte, famID uint32) []byte {
 	return encoding.EncodeUvarintAscending(key, uint64(len(key)-size))
 }
 
+const (
+	// SequenceIndexID is the ID of the single index on each special single-column,
+	// single-row sequence table.
+	SequenceIndexID = 1
+	// SequenceColumnFamilyID is the ID of the column family on each special single-column,
+	// single-row sequence table.
+	SequenceColumnFamilyID = 0
+)
+
 // MakeSequenceKey returns the key used to store the value of a sequence.
 func MakeSequenceKey(tableID uint32) []byte {
-	return makeKey(MakeTablePrefix(tableID), SequenceSuffix)
+	key := MakeTablePrefix(tableID)
+	key = encoding.EncodeUvarintAscending(key, SequenceIndexID)        // Index id
+	key = encoding.EncodeUvarintAscending(key, 0)                      // Primary key value
+	key = encoding.EncodeUvarintAscending(key, SequenceColumnFamilyID) // Column family
+	return key
 }
 
 // GetRowPrefixLength returns the length of the row prefix of the key. A table

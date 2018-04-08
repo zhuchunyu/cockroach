@@ -82,9 +82,6 @@ type Iterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg protoutil.Message) error
-	// Less returns true if the key the iterator is currently positioned at is
-	// less than the specified key.
-	Less(key MVCCKey) bool
 	// ComputeStats scans the underlying engine from start to end keys and
 	// computes stats counters based on the values. This method is used after a
 	// range is split to recompute stats for each subrange. The start key is
@@ -99,22 +96,26 @@ type Iterator interface {
 	// allowMeta2Splits is true and keys.NoSplitSpansWithoutMeta2Splits if
 	// allowMeta2Splits is false.
 	//
-	// TODO: remove allowMeta2Splits in version 1.3.
+	// TODO(nvanbenschoten): remove allowMeta2Splits in version 2.1.
 	FindSplitKey(start, end, minSplitKey MVCCKey, targetSize int64, allowMeta2Splits bool) (MVCCKey, error)
 	// MVCCGet retrieves the value for the key at the specified timestamp. The
 	// value is returned in batch repr format with the key being present as the
 	// empty string. If an intent exists at the specified key, it will be
 	// returned in batch repr format in the separate intent return value.
+	// Specify true for tombstones to return a value if the key has been
+	// deleted (Value.RawBytes will be empty).
 	MVCCGet(key roachpb.Key, timestamp hlc.Timestamp,
-		txn *roachpb.Transaction, consistent bool,
+		txn *roachpb.Transaction, consistent, tombstones bool,
 	) (*roachpb.Value, []roachpb.Intent, error)
 	// MVCCScan scans the underlying engine from start to end keys and returns
 	// key/value pairs which have a timestamp less than or equal to the supplied
-	// timestamp, up to a max rows. The key/value pairs are returned in the batch
-	// repr format and can be iterated over using RocksDBBatchReader.
+	// timestamp, up to a max rows. The key/value pairs are returned as a buffer
+	// of varint-prefixed slices, alternating from key to value, numKvs pairs.
+	// Specify true for tombstones to return deleted values (the value portion
+	// will be empty).
 	MVCCScan(start, end roachpb.Key, max int64, timestamp hlc.Timestamp,
-		txn *roachpb.Transaction, consistent, reverse bool,
-	) (kvs []byte, intents []byte, err error)
+		txn *roachpb.Transaction, consistent, reverse, tombstone bool,
+	) (kvs []byte, numKvs int64, intents []byte, err error)
 }
 
 // Reader is the read interface to an engine's data.
@@ -253,8 +254,11 @@ type Engine interface {
 	// original engine has been stopped.
 	NewSnapshot() Reader
 	// IngestExternalFile links a file into the RocksDB log-structured
-	// merge-tree.
-	IngestExternalFile(ctx context.Context, path string, move bool) error
+	// merge-tree. May modify the file (including the underlying file in
+	// the case of hard-links) if allowFileModification is passed as
+	// well. See additional comments in db.cc's IngestExternalFile
+	// explaining modification behavior.
+	IngestExternalFile(ctx context.Context, path string, allowFileModification bool) error
 	// ApproximateDiskBytes returns an approximation of the on-disk size for the given key span.
 	ApproximateDiskBytes(from, to roachpb.Key) (uint64, error)
 	// CompactRange ensures that the specified range of key value pairs is
@@ -288,6 +292,8 @@ type Batch interface {
 	// situations where we know all of the batched operations are for distinct
 	// keys.
 	Distinct() ReadWriter
+	// Empty returns whether the batch is empty or not.
+	Empty() bool
 	// Repr returns the underlying representation of the batch and can be used to
 	// reconstitute the batch on a remote node using Writer.ApplyBatchRepr().
 	Repr() []byte

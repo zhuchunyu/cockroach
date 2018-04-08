@@ -16,9 +16,11 @@ syntax = "proto3";
 package cockroach.server.diagnosticspb;
 option go_package = "diagnosticspb";
 
+import "config/zone.proto";
 import "gogoproto/gogo.proto";
 import "roachpb/app_stats.proto";
 import "sql/sqlbase/structured.proto";
+import "roachpb/metadata.proto";
 
 message DiagnosticReport {
   NodeInfo node = 1 [(gogoproto.nullable) = false];
@@ -26,6 +28,9 @@ message DiagnosticReport {
   repeated sql.sqlbase.TableDescriptor schema = 3 [(gogoproto.nullable) = false];
   repeated sql.CollectedStatementStatistics sql_stats = 4 [(gogoproto.nullable) = false];
   map<string, int64> unimplemented_errors = 5;
+  map<string, string> altered_settings = 6;
+  map<string, int64> error_counts = 7;
+  map<int64, config.ZoneConfig> zone_configs = 8 [(gogoproto.nullable) = false];
 }
 
 message NodeInfo {
@@ -33,6 +38,7 @@ message NodeInfo {
   int64 bytes = 2;
   int64 key_count = 3;
   int64 range_count = 4;
+  roachpb.Locality locality = 5 [(gogoproto.nullable) = false];
 }
 
 message StoreInfo {

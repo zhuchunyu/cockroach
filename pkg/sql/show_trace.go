@@ -64,8 +64,8 @@ SELECT %s
                message,
                tag,
                loc,
-               first_value(operation) OVER (PARTITION BY txn_idx, span_idx ORDER BY message_idx) as operation,
-               (txn_idx, span_idx) AS span
+               first_value(operation) OVER (PARTITION BY span_idx ORDER BY message_idx) as operation,
+               span_idx AS span
           FROM crdb_internal.session_trace)
  %s
  ORDER BY timestamp
@@ -266,7 +266,7 @@ func (n *showTraceNode) Next(params runParams) (bool, error) {
 		n.run.stopTracing = nil
 
 		var err error
-		n.run.traceRows, err = params.extendedEvalCtx.Tracing.generateSessionTraceVTable()
+		n.run.traceRows, err = params.extendedEvalCtx.Tracing.getRecording()
 		if err != nil {
 			return false, err
 		}
@@ -296,10 +296,7 @@ func (n *showTraceNode) Close(ctx context.Context) {
 	}
 }
 
-var sessionTraceTableName = tree.TableName{
-	DatabaseName: tree.Name("crdb_internal"),
-	TableName:    tree.Name("session_trace"),
-}
+var sessionTraceTableName = tree.MakeTableNameWithSchema("", "crdb_internal", "session_trace")
 
 var errTracingAlreadyEnabled = errors.New(
 	"cannot run SHOW TRACE FOR on statement while session tracing is enabled" +

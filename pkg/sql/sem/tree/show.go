@@ -162,9 +162,32 @@ func (node *ShowSessions) Format(ctx *FmtCtx) {
 	}
 }
 
+// ShowSchemas represents a SHOW SCHEMAS statement.
+type ShowSchemas struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSchemas) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SCHEMAS")
+	if node.Database != "" {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.Database)
+	}
+}
+
 // ShowTables represents a SHOW TABLES statement.
 type ShowTables struct {
-	Database Name
+	TableNamePrefix
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowTables) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW TABLES")
+	if node.ExplicitSchema {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.TableNamePrefix)
+	}
 }
 
 // ShowConstraints represents a SHOW CONSTRAINTS statement.
@@ -181,15 +204,6 @@ func (node *ShowConstraints) Format(ctx *FmtCtx) {
 	}
 }
 
-// Format implements the NodeFormatter interface.
-func (node *ShowTables) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW TABLES")
-	if node.Database != "" {
-		ctx.WriteString(" FROM ")
-		ctx.FormatNode(&node.Database)
-	}
-}
-
 // ShowGrants represents a SHOW GRANTS statement.
 // TargetList is defined in grant.go.
 type ShowGrants struct {
@@ -203,6 +217,25 @@ func (node *ShowGrants) Format(ctx *FmtCtx) {
 	if node.Targets != nil {
 		ctx.WriteString(" ON ")
 		ctx.FormatNode(node.Targets)
+	}
+	if node.Grantees != nil {
+		ctx.WriteString(" FOR ")
+		ctx.FormatNode(&node.Grantees)
+	}
+}
+
+// ShowRoleGrants represents a SHOW GRANTS ON ROLE statement.
+type ShowRoleGrants struct {
+	Roles    NameList
+	Grantees NameList
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowRoleGrants) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW GRANTS ON ROLE")
+	if node.Roles != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(&node.Roles)
 	}
 	if node.Grantees != nil {
 		ctx.WriteString(" FOR ")
@@ -317,12 +350,17 @@ func (node *ShowFingerprints) Format(ctx *FmtCtx) {
 
 // ShowTableStats represents a SHOW STATISTICS FOR TABLE statement.
 type ShowTableStats struct {
-	Table NormalizableTableName
+	Table     NormalizableTableName
+	UsingJSON bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTableStats) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW STATISTICS FOR TABLE ")
+	ctx.WriteString("SHOW STATISTICS ")
+	if node.UsingJSON {
+		ctx.WriteString("USING JSON ")
+	}
+	ctx.WriteString("FOR TABLE ")
 	ctx.FormatNode(&node.Table)
 }
 

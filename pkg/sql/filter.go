@@ -42,7 +42,7 @@ func (f *filterNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum,
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
 func (f *filterNode) IndexedVarResolvedType(idx int) types.T {
-	return f.source.info.sourceColumns[idx].Typ
+	return f.source.info.SourceColumns[idx].Typ
 }
 
 // IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.
@@ -57,9 +57,9 @@ func (f *filterNode) Next(params runParams) (bool, error) {
 			return false, err
 		}
 
-		params.extendedEvalCtx.IVarHelper = &f.ivarHelper
+		params.extendedEvalCtx.PushIVarContainer(f)
 		passesFilter, err := sqlbase.RunFilter(f.filter, params.EvalContext())
-		params.extendedEvalCtx.IVarHelper = nil
+		params.extendedEvalCtx.PopIVarContainer()
 		if err != nil {
 			return false, err
 		}

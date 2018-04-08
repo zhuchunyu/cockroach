@@ -35,6 +35,8 @@ type CreateUserNode struct {
 	run createUserRun
 }
 
+var userTableName = tree.NewTableName("system", "users")
+
 // CreateUser creates a user.
 // Privileges: INSERT on system.users.
 //   notes: postgres allows the creation of users with an empty password. We do
@@ -47,7 +49,7 @@ func (p *planner) CreateUser(ctx context.Context, n *tree.CreateUser) (planNode,
 func (p *planner) CreateUserNode(
 	ctx context.Context, nameE, passwordE tree.Expr, ifNotExists bool, isRole bool, opName string,
 ) (*CreateUserNode, error) {
-	tDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), &tree.TableName{DatabaseName: "system", TableName: "users"})
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +74,10 @@ func (n *CreateUserNode) startExec(params runParams) error {
 	normalizedUsername, hashedPassword, err := n.userAuthInfo.resolve()
 	if err != nil {
 		return err
+	}
+
+	if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Insecure {
+		return errors.New("cluster in insecure mode; user cannot use password authentication")
 	}
 
 	var opName string
@@ -146,9 +152,9 @@ func (*CreateUserNode) Close(context.Context) {}
 func (n *CreateUserNode) FastPathResults() (int, bool) { return n.run.rowsAffected, true }
 
 const usernameHelp = "usernames are case insensitive, must start with a letter " +
-	"or underscore, may contain letters, digits or underscores, and must not exceed 63 characters"
+	"or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters"
 
-var usernameRE = regexp.MustCompile(`^[\p{Ll}_][\p{Ll}0-9_]{0,62}$`)
+var usernameRE = regexp.MustCompile(`^[\p{Ll}_][\p{Ll}0-9_-]{0,62}$`)
 
 var blacklistedUsernames = map[string]struct{}{
 	security.NodeUser: {},

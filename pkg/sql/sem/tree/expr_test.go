@@ -19,11 +19,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
 
 // TestUnresolvedNameString tests the string representation of tree.UnresolvedName and thus tree.Name.
@@ -49,67 +49,9 @@ func TestUnresolvedNameString(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		n := tree.Name(tc.in)
-		q := tree.UnresolvedName{&n}
+		q := tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{tc.in}}
 		if q.String() != tc.out {
 			t.Errorf("expected q.String() == %q, got %q", tc.out, q.String())
-		}
-	}
-}
-
-func TestNormalizeNameInExpr(t *testing.T) {
-	testCases := []struct {
-		in, out string
-		err     string
-	}{
-		{`foo`, `foo`, ``},
-		{`*`, `*`, ``},
-		{`foo.bar`, `foo.bar`, ``},
-		{`foo.*`, `foo.*`, ``},
-		{`test.foo.*`, `test.foo.*`, ``},
-		{`foo.bar[blah]`, `foo.bar`, ``},
-		{`foo[bar]`, `foo`, ``},
-		{`test.*[foo]`, `test.*`, ``},
-
-		{`"".foo`, ``, `empty table name`},
-		{`"".*`, ``, `empty table name`},
-		{`""`, ``, `empty column name`},
-		{`foo.*.bar`, ``, `invalid table name: "foo.*"`},
-		{`foo.*.bar[baz]`, ``, `invalid table name: "foo.*"`},
-		{`test.foo.*.bar[foo]`, ``, `invalid table name: "test.foo.*"`},
-	}
-
-	for _, tc := range testCases {
-		stmt, err := parser.ParseOne("SELECT " + tc.in)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.in, err)
-		}
-		var vBase tree.VarName
-		startExpr := stmt.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr
-		for {
-			switch e := startExpr.(type) {
-			case tree.VarName:
-				vBase = e
-			case *tree.IndirectionExpr:
-				startExpr = e.Expr
-				continue
-			default:
-				t.Fatalf("%s does not parse to a tree.VarName or tree.IndirectionExpr", tc.in)
-			}
-			break
-		}
-		v, err := vBase.NormalizeVarName()
-		if tc.err != "" {
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("%s: expected %s, but found %v", tc.in, tc.err, err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("%s: expected success, but found %v", tc.in, err)
-		}
-		if out := v.String(); tc.out != out {
-			t.Errorf("%s: expected %s, but found %s", tc.in, tc.out, out)
 		}
 	}
 }
@@ -182,7 +124,7 @@ func TestExprString(t *testing.T) {
 			t.Errorf("Print/parse/print cycle changes the string: `%s` vs `%s`", str, str2)
 		}
 		// Compare the normalized expressions.
-		ctx := tree.NewTestingEvalContext()
+		ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer ctx.Mon.Stop(context.Background())
 		normalized, err := ctx.NormalizeExpr(typedExpr)
 		if err != nil {

@@ -69,7 +69,7 @@ func processExpression(exprSpec Expression, h *tree.IndexedVarHelper) (tree.Type
 	}
 
 	// Convert to a fully typed expression.
-	typedExpr, err := tree.TypeCheck(expr, &tree.SemaContext{IVarHelper: h}, types.Any)
+	typedExpr, err := tree.TypeCheck(expr, &tree.SemaContext{IVarContainer: h.Container()}, types.Any)
 	if err != nil {
 		return nil, errors.Wrap(err, expr.String())
 	}
@@ -80,7 +80,6 @@ func processExpression(exprSpec Expression, h *tree.IndexedVarHelper) (tree.Type
 // exprHelper implements the common logic around evaluating an expression that
 // depends on a set of values.
 type exprHelper struct {
-	//lint:ignore U1000 this marker prevents by-value copies.
 	noCopy util.NoCopy
 
 	expr tree.TypedExpr
@@ -150,9 +149,9 @@ func (eh *exprHelper) init(
 // returns whether the filter passes.
 func (eh *exprHelper) evalFilter(row sqlbase.EncDatumRow) (bool, error) {
 	eh.row = row
-	eh.evalCtx.IVarHelper = &eh.vars
+	eh.evalCtx.PushIVarContainer(eh)
 	pass, err := sqlbase.RunFilter(eh.expr, eh.evalCtx)
-	eh.evalCtx.IVarHelper = nil
+	eh.evalCtx.PopIVarContainer()
 	return pass, err
 }
 
@@ -165,8 +164,8 @@ func (eh *exprHelper) evalFilter(row sqlbase.EncDatumRow) (bool, error) {
 func (eh *exprHelper) eval(row sqlbase.EncDatumRow) (tree.Datum, error) {
 	eh.row = row
 
-	eh.evalCtx.IVarHelper = &eh.vars
+	eh.evalCtx.PushIVarContainer(eh)
 	d, err := eh.expr.Eval(eh.evalCtx)
-	eh.evalCtx.IVarHelper = nil
+	eh.evalCtx.PopIVarContainer()
 	return d, err
 }

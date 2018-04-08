@@ -20,19 +20,27 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+//
+// This file contains routines for low-level access to stored
+// descriptors.
+//
+// For higher levels in the SQL layer, these interface are likely not
+// suitable; consider instead schema_accessors.go and resolver.go.
+//
+
 var (
-	errEmptyDatabaseName = errors.New("empty database name")
-	errNoDatabase        = errors.New("no database specified")
-	errNoTable           = errors.New("no table specified")
+	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
+	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
+	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
+	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
 )
 
 type descriptorAlreadyExistsErr struct {
@@ -129,13 +137,6 @@ func (p *planner) createDescriptorWithID(
 	b.CPut(idKey, descID, nil)
 	b.CPut(descKey, descDesc, nil)
 
-	p.testingVerifyMetadata().setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
-		if err := expectDescriptorID(systemConfig, idKey, descID); err != nil {
-			return err
-		}
-		return expectDescriptor(systemConfig, descKey, descDesc)
-	})
-
 	if desc, ok := descriptor.(*sqlbase.TableDescriptor); ok {
 		p.Tables().addUncommittedTable(*desc)
 	}
@@ -189,13 +190,9 @@ func getDescriptorByID(
 		if table == nil {
 			return errors.Errorf("%q is not a table", desc.String())
 		}
-		table.MaybeUpgradeFormatVersion()
-		// TODO(dan): Write the upgraded TableDescriptor back to kv. This will break
-		// the ability to use a previous version of cockroach with the on-disk data,
-		// but it's worth it to avoid having to do the upgrade every time the
-		// descriptor is fetched. Our current test for this enforces compatibility
-		// backward and forward, so that'll have to be extended before this is done.
-		if err := table.Validate(ctx, txn); err != nil {
+		table.MaybeFillInDescriptor()
+
+		if err := table.Validate(ctx, txn, nil /* clusterVersion */); err != nil {
 			return err
 		}
 		*t = *table
@@ -204,6 +201,7 @@ func getDescriptorByID(
 		if database == nil {
 			return errors.Errorf("%q is not a database", desc.String())
 		}
+
 		if err := database.Validate(); err != nil {
 			return err
 		}
@@ -233,50 +231,6 @@ func GetAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 			descs[i] = desc.GetDatabase()
 		default:
 			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
-		}
-	}
-	return descs, nil
-}
-
-// getDescriptorsFromTargetList fetches the descriptors for the targets.
-func getDescriptorsFromTargetList(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, db string, targets tree.TargetList,
-) ([]sqlbase.DescriptorProto, error) {
-	if targets.Databases != nil {
-		if len(targets.Databases) == 0 {
-			return nil, errNoDatabase
-		}
-		descs := make([]sqlbase.DescriptorProto, 0, len(targets.Databases))
-		for _, database := range targets.Databases {
-			descriptor, err := MustGetDatabaseDesc(ctx, txn, vt, string(database))
-			if err != nil {
-				return nil, err
-			}
-			descs = append(descs, descriptor)
-		}
-		return descs, nil
-	}
-
-	if len(targets.Tables) == 0 {
-		return nil, errNoTable
-	}
-	descs := make([]sqlbase.DescriptorProto, 0, len(targets.Tables))
-	for _, tableTarget := range targets.Tables {
-		tableGlob, err := tableTarget.NormalizeTablePattern()
-		if err != nil {
-			return nil, err
-		}
-		tables, err := expandTableGlob(ctx, txn, vt, db, tableGlob)
-		if err != nil {
-			return nil, err
-		}
-		for i := range tables {
-			descriptor, err := MustGetTableOrViewDesc(
-				ctx, txn, vt, &tables[i], true /*allowAdding*/)
-			if err != nil {
-				return nil, err
-			}
-			descs = append(descs, descriptor)
 		}
 	}
 	return descs, nil

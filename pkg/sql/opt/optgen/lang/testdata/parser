@@ -2,6 +2,11 @@
 # Define without tags.
 #
 parse
+# This is a file header, and shouldn't be part of Lt's comment.
+
+# This is a comment about Lt.
+# And another information-packed line about it as well.
+#
 define Lt {
     Left  Expr
     Right Expr
@@ -10,13 +15,14 @@ define Lt {
 (Root
 	Defines=(DefineSet
 		(Define
+			Comments=(Comments # This is a comment about Lt. # And another information-packed line about it as well. #)
 			Tags=(Tags)
 			Name="Lt"
 			Fields=(DefineFields
-				(DefineField Name="Left" Type="Expr" Src=<test.opt:2:5>)
-				(DefineField Name="Right" Type="Expr" Src=<test.opt:3:5>)
+				(DefineField Name="Left" Type="Expr" Src=<test.opt:7:5>)
+				(DefineField Name="Right" Type="Expr" Src=<test.opt:8:5>)
 			)
-			Src=<test.opt:1:1>
+			Src=<test.opt:6:1>
 		)
 	)
 	Rules=(RuleSet)
@@ -26,6 +32,7 @@ define Lt {
 # Define with tags.
 #
 parse
+# Comment on definition with a tag. 
 [Tag1, Tag2]
 define Not {
     Input Expr
@@ -34,12 +41,13 @@ define Not {
 (Root
 	Defines=(DefineSet
 		(Define
+			Comments=(Comments # Comment on definition with a tag. )
 			Tags=(Tags Tag1 Tag2)
 			Name="Not"
 			Fields=(DefineFields
-				(DefineField Name="Input" Type="Expr" Src=<test.opt:3:5>)
+				(DefineField Name="Input" Type="Expr" Src=<test.opt:4:5>)
 			)
-			Src=<test.opt:1:1>
+			Src=<test.opt:2:1>
 		)
 	)
 	Rules=(RuleSet)
@@ -87,6 +95,50 @@ test.opt:22:5: expected define field name, found '('
 test.opt:27:11: expected define field type, found '1'
 
 #
+# Multiple rules with comments.
+#
+parse
+# This is the One rule.
+[One]
+(One) => (One)
+
+# This is an intermediate comment that shouldn't be included.
+
+# This is the Two rule.
+[Two]
+(Two) => (Two)
+----
+(Root
+	Defines=(DefineSet)
+	Rules=(RuleSet
+		(Rule
+			Comments=(Comments # This is the One rule.)
+			Name="One"
+			Tags=(Tags)
+			Match=(Match
+				Names=(Names One)
+				Args=(List)
+				Src=<test.opt:3:1>
+			)
+			Replace=(Construct Name=One Args=(List) Src=<test.opt:3:10>)
+			Src=<test.opt:2:1>
+		)
+		(Rule
+			Comments=(Comments # This is the Two rule.)
+			Name="Two"
+			Tags=(Tags)
+			Match=(Match
+				Names=(Names Two)
+				Args=(List)
+				Src=<test.opt:9:1>
+			)
+			Replace=(Construct Name=Two Args=(List) Src=<test.opt:9:10>)
+			Src=<test.opt:8:1>
+		)
+	)
+)
+
+#
 # Match multiple op names.
 #
 parse
@@ -97,14 +149,15 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Tag"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OneOp TwoOp)
+				Names=(Names One Two)
 				Args=(List)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="One" Args=(List) Src=<test.opt:2:16>)
+			Replace=(Construct Name=One Args=(List) Src=<test.opt:2:16>)
 			Src=<test.opt:1:1>
 		)
 	)
@@ -116,11 +169,15 @@ parse
 parse
 [Tag]
 (Op
-    (SubOp *)    # Nested match
-    "hello"      # String
-    ^(SubOp)     # Negation
-    *            # Any
-    [... * ...]  # List
+    (SubOp *)     # Nested match
+    "hello"       # String
+    ^(SubOp)      # Negation
+    *             # Any
+    [ ... * ... ] # ListAny
+    [ * ... ]     # ListFirst
+    [ ... * ]     # ListLast
+    [ * ]         # ListSingle
+    []            # ListEmpty
 )
 =>
 (Op)
@@ -129,31 +186,36 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Tag"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Match
-						Names=(OpNames SubOpOp)
+						Names=(Names SubOp)
 						Args=(List (MatchAny))
 						Src=<test.opt:3:5>
 					)
 					"hello"
 					(MatchNot
 						Input=(Match
-							Names=(OpNames SubOpOp)
+							Names=(Names SubOp)
 							Args=(List)
 							Src=<test.opt:5:6>
 						)
 						Src=<test.opt:5:5>
 					)
 					(MatchAny)
-					(MatchList MatchItem=(MatchAny) Src=<test.opt:7:5>)
+					(MatchListAny MatchItem=(MatchAny) Src=<test.opt:7:5>)
+					(MatchListFirst MatchItem=(MatchAny) Src=<test.opt:8:5>)
+					(MatchListLast MatchItem=(MatchAny) Src=<test.opt:9:5>)
+					(MatchListSingle MatchItem=(MatchAny) Src=<test.opt:10:5>)
+					(MatchListEmpty)
 				)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="Op" Args=(List) Src=<test.opt:10:1>)
+			Replace=(Construct Name=Op Args=(List) Src=<test.opt:14:1>)
 			Src=<test.opt:1:1>
 		)
 	)
@@ -178,15 +240,16 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Bind"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Bind
 						Label="match"
 						Target=(Match
-							Names=(OpNames SubOpOp)
+							Names=(Names SubOp)
 							Args=(List (MatchAny))
 							Src=<test.opt:3:12>
 						)
@@ -197,7 +260,7 @@ parse
 						Label="not"
 						Target=(MatchNot
 							Input=(Match
-								Names=(OpNames SubOpOp)
+								Names=(Names SubOp)
 								Args=(List)
 								Src=<test.opt:5:11>
 							)
@@ -208,13 +271,13 @@ parse
 					(Bind Label="any" Target=(MatchAny) Src=<test.opt:6:5>)
 					(Bind
 						Label="list"
-						Target=(MatchList MatchItem=(MatchAny) Src=<test.opt:7:11>)
+						Target=(MatchListAny MatchItem=(MatchAny) Src=<test.opt:7:11>)
 						Src=<test.opt:7:5>
 					)
 				)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="Op" Args=(List) Src=<test.opt:10:1>)
+			Replace=(Construct Name=Op Args=(List) Src=<test.opt:10:1>)
 			Src=<test.opt:1:1>
 		)
 	)
@@ -231,22 +294,31 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="boolean"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames opOp)
+				Names=(Names op)
 				Args=(List
 					(MatchAnd
 						Left=(MatchAny)
 						Right=(MatchAnd
 							Left=(MatchNot
 								Input=(MatchNot
-									Input=(MatchInvoke FuncName="func" Args=(List) Src=<test.opt:2:11>)
+									Input=(Match
+										Names=(Names func)
+										Args=(List)
+										Src=<test.opt:2:11>
+									)
 									Src=<test.opt:2:10>
 								)
 								Src=<test.opt:2:9>
 							)
-							Right=(MatchInvoke FuncName="func2" Args=(List) Src=<test.opt:2:20>)
+							Right=(Match
+								Names=(Names func2)
+								Args=(List)
+								Src=<test.opt:2:20>
+							)
 							Src=<test.opt:2:9>
 						)
 						Src=<test.opt:2:5>
@@ -254,99 +326,176 @@ parse
 				)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="op" Args=(List) Src=<test.opt:2:32>)
+			Replace=(Construct Name=op Args=(List) Src=<test.opt:2:32>)
 			Src=<test.opt:1:1>
 		)
 	)
 )
 
 #
-# Match invoke expression.
+# Match nested custom functions with literal name argument.
 #
 parse
 [Invoke]
-(Op $left:* $right:* & (Invoke $right $left)) => (Op)
+(Op $left:* $right:* & (Invoke $right (Invoke2 $left SomeOp))) => (Op)
 ----
 (Root
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Invoke"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Bind Label="left" Target=(MatchAny) Src=<test.opt:2:5>)
-					(MatchAnd
-						Left=(Bind Label="right" Target=(MatchAny) Src=<test.opt:2:13>)
-						Right=(MatchInvoke
-							FuncName="Invoke"
-							Args=(List
-								(Ref Label="right" Src=<test.opt:2:32>)
-								(Ref Label="left" Src=<test.opt:2:39>)
+					(Bind
+						Label="right"
+						Target=(MatchAnd
+							Left=(MatchAny)
+							Right=(Match
+								Names=(Names Invoke)
+								Args=(List
+									(Ref Label="right" Src=<test.opt:2:32>)
+									(Match
+										Names=(Names Invoke2)
+										Args=(List
+											(Ref Label="left" Src=<test.opt:2:48>)
+											SomeOp
+										)
+										Src=<test.opt:2:39>
+									)
+								)
+								Src=<test.opt:2:24>
 							)
-							Src=<test.opt:2:24>
+							Src=<test.opt:2:20>
 						)
 						Src=<test.opt:2:13>
 					)
 				)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="Op" Args=(List) Src=<test.opt:2:50>)
+			Replace=(Construct Name=Op Args=(List) Src=<test.opt:2:67>)
 			Src=<test.opt:1:1>
 		)
 	)
 )
 
 #
-# Match list expression.
+# Match list expressions.
 #
 parse
 [List]
-(Op [ ... $item:[ ... $item2:(SubOp) ... ] & (Func $item) ... ]) => (Op)
+(Op
+    $any:[ ... $first:[ $item:(SubOp) ... ] & (Func $first $item) ... ]
+    $last:[ ... $item:* & ^(Func $item) ]
+    $single:[ $item:(SubOp) & (Func $item) ]
+    $empty:[]
+)
+=>
+(Op)
 ----
 (Root
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="List"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
-					(MatchList
-						MatchItem=(MatchAnd
-							Left=(Bind
-								Label="item"
-								Target=(MatchList
-									MatchItem=(Bind
-										Label="item2"
-										Target=(Match
-											Names=(OpNames SubOpOp)
-											Args=(List)
-											Src=<test.opt:2:30>
+					(Bind
+						Label="any"
+						Target=(MatchListAny
+							MatchItem=(Bind
+								Label="first"
+								Target=(MatchAnd
+									Left=(MatchListFirst
+										MatchItem=(Bind
+											Label="item"
+											Target=(Match
+												Names=(Names SubOp)
+												Args=(List)
+												Src=<test.opt:3:31>
+											)
+											Src=<test.opt:3:25>
 										)
-										Src=<test.opt:2:23>
+										Src=<test.opt:3:23>
 									)
-									Src=<test.opt:2:17>
+									Right=(Match
+										Names=(Names Func)
+										Args=(List
+											(Ref Label="first" Src=<test.opt:3:53>)
+											(Ref Label="item" Src=<test.opt:3:60>)
+										)
+										Src=<test.opt:3:47>
+									)
+									Src=<test.opt:3:23>
 								)
-								Src=<test.opt:2:11>
+								Src=<test.opt:3:16>
 							)
-							Right=(MatchInvoke
-								FuncName="Func"
-								Args=(List
-									(Ref Label="item" Src=<test.opt:2:52>)
-								)
-								Src=<test.opt:2:46>
-							)
-							Src=<test.opt:2:11>
+							Src=<test.opt:3:10>
 						)
-						Src=<test.opt:2:5>
+						Src=<test.opt:3:5>
 					)
+					(Bind
+						Label="last"
+						Target=(MatchListLast
+							MatchItem=(Bind
+								Label="item"
+								Target=(MatchAnd
+									Left=(MatchAny)
+									Right=(MatchNot
+										Input=(Match
+											Names=(Names Func)
+											Args=(List
+												(Ref Label="item" Src=<test.opt:4:34>)
+											)
+											Src=<test.opt:4:28>
+										)
+										Src=<test.opt:4:27>
+									)
+									Src=<test.opt:4:23>
+								)
+								Src=<test.opt:4:17>
+							)
+							Src=<test.opt:4:11>
+						)
+						Src=<test.opt:4:5>
+					)
+					(Bind
+						Label="single"
+						Target=(MatchListSingle
+							MatchItem=(Bind
+								Label="item"
+								Target=(MatchAnd
+									Left=(Match
+										Names=(Names SubOp)
+										Args=(List)
+										Src=<test.opt:5:21>
+									)
+									Right=(Match
+										Names=(Names Func)
+										Args=(List
+											(Ref Label="item" Src=<test.opt:5:37>)
+										)
+										Src=<test.opt:5:31>
+									)
+									Src=<test.opt:5:21>
+								)
+								Src=<test.opt:5:15>
+							)
+							Src=<test.opt:5:13>
+						)
+						Src=<test.opt:5:5>
+					)
+					(Bind Label="empty" Target=(MatchListEmpty) Src=<test.opt:6:5>)
 				)
 				Src=<test.opt:2:1>
 			)
-			Replace=(Construct OpName="Op" Args=(List) Src=<test.opt:2:69>)
+			Replace=(Construct Name=Op Args=(List) Src=<test.opt:9:1>)
 			Src=<test.opt:1:1>
 		)
 	)
@@ -363,10 +512,11 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="ConstructString"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List)
 				Src=<test.opt:2:1>
 			)
@@ -387,10 +537,11 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="ConstructBound"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Bind Label="input" Target=(MatchAny) Src=<test.opt:2:5>)
 				)
@@ -407,32 +558,83 @@ parse
 #
 parse
 [Construct]
-(Op $input:*) => (Op $input (SubOp "foo"))
+(Op $input:*) => (Op $input (SubOp "foo" AnotherOp))
 ----
 (Root
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Construct"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Bind Label="input" Target=(MatchAny) Src=<test.opt:2:5>)
 				)
 				Src=<test.opt:2:1>
 			)
 			Replace=(Construct
-				OpName="Op"
+				Name=Op
 				Args=(List
 					(Ref Label="input" Src=<test.opt:2:22>)
 					(Construct
-						OpName="SubOp"
-						Args=(List "foo")
+						Name=SubOp
+						Args=(List "foo" AnotherOp)
 						Src=<test.opt:2:29>
 					)
 				)
 				Src=<test.opt:2:18>
+			)
+			Src=<test.opt:1:1>
+		)
+	)
+)
+
+#
+# Replace with construct list expression.
+#
+parse
+[ConstructList]
+(Op $left:* $right:*)
+=>
+(Op [$left "foo" [] [$right] AnotherOp])
+----
+(Root
+	Defines=(DefineSet)
+	Rules=(RuleSet
+		(Rule
+			Comments=(Comments)
+			Name="ConstructList"
+			Tags=(Tags)
+			Match=(Match
+				Names=(Names Op)
+				Args=(List
+					(Bind Label="left" Target=(MatchAny) Src=<test.opt:2:5>)
+					(Bind Label="right" Target=(MatchAny) Src=<test.opt:2:13>)
+				)
+				Src=<test.opt:2:1>
+			)
+			Replace=(Construct
+				Name=Op
+				Args=(List
+					(ConstructList
+						Items=(List
+							(Ref Label="left" Src=<test.opt:4:6>)
+							"foo"
+							(ConstructList Items=(List) Src=<test.opt:4:18>)
+							(ConstructList
+								Items=(List
+									(Ref Label="right" Src=<test.opt:4:22>)
+								)
+								Src=<test.opt:4:21>
+							)
+							AnotherOp
+						)
+						Src=<test.opt:4:5>
+					)
+				)
+				Src=<test.opt:4:1>
 			)
 			Src=<test.opt:1:1>
 		)
@@ -450,18 +652,19 @@ parse
 	Defines=(DefineSet)
 	Rules=(RuleSet
 		(Rule
+			Comments=(Comments)
 			Name="Construct"
 			Tags=(Tags)
 			Match=(Match
-				Names=(OpNames OpOp)
+				Names=(Names Op)
 				Args=(List
 					(Bind Label="input" Target=(MatchAny) Src=<test.opt:2:5>)
 				)
 				Src=<test.opt:2:1>
 			)
 			Replace=(Construct
-				OpName=(Construct
-					OpName="MakeOpName"
+				Name=(Construct
+					Name=MakeOpName
 					Args=(List
 						(Ref Label="input" Src=<test.opt:2:31>)
 					)
@@ -469,7 +672,7 @@ parse
 				)
 				Args=(List
 					(Construct
-						OpName="SubOp"
+						Name=SubOp
 						Args=(List
 							(Ref Label="input" Src=<test.opt:2:46>)
 						)
@@ -498,59 +701,44 @@ parse
 [Tag]
 (Op $*) => (Op)
 
-# Expected bind colon
-[Tag]
-(Op $bind*) => (Op)
-
 # Expected match pattern
 [Tag]
 (Op 1) => (Op)
 
-# Expected custom function call
+# Expected match pattern
 [Tag]
 (Op * & $foo:*) => (Op)
 
-# Expected custom function name
+# Expected operator name
 [Tag]
 (Op * & ^(*)) => (Op)
-
-# Cannot bind custom function call arguments
-[Tag]
-(Op * & (Func $foo:*)) => (Op)
-
-# Expected variable reference
-[Tag]
-(Op * & (Func *)) => (Op)
-
-# Expected start ellipses
-[Tag]
-(Op []) => (Op)
 
 # Expected match pattern in list
 [Tag]
 (Op [ ... 123 ... ]) => (Op)
 
-# Expected end ellipses
-[Tag]
-(Op [ ... * ]) => (Op)
-
-# Expected list end bracket
+# Expected list end bracket (any case)
 [Tag]
 (Op [ ... * ...) => (Op)
+
+# Expected list end bracket (last case)
+[Tag]
+(Op [ ... * ) => (Op)
+
+# Expected list end bracket (empty case)
+[Tag]
+(Op [ ) => (Op)
 ----
 test.opt:2:1: expected define statement or rule, found '('
-test.opt:6:7: expected operator name, found '*'
-test.opt:10:6: expected bind label, found '*'
-test.opt:14:10: expected ':', found '*'
-test.opt:18:5: expected match pattern, found '1'
-test.opt:22:9: expected custom function call, found '$'
-test.opt:26:11: expected custom function name, found '*'
-test.opt:30:19: cannot bind custom function call arguments
-test.opt:34:15: expected variable reference, found '*'
-test.opt:38:6: expected '...', found ']'
-test.opt:42:11: expected match pattern, found '1'
-test.opt:46:13: expected '...', found ']'
-test.opt:50:16: expected ']', found ')'
+test.opt:6:7: expected name, found '*'
+test.opt:10:6: expected label, found '*'
+test.opt:14:5: expected match pattern, found '1'
+test.opt:18:9: expected match pattern, found '$'
+test.opt:22:11: expected name, found '*'
+test.opt:26:11: expected match pattern, found '1'
+test.opt:30:16: expected ']', found ')'
+test.opt:34:13: expected ']', found ')'
+test.opt:38:7: expected match pattern, found ')'
 
 #
 # Replace error cases + recovery cases.
@@ -585,3 +773,12 @@ parse
 (Op)
 ----
 test.opt:2:5: expected '=>', found EOF
+
+#
+# Error opening file. Ensure that file error is last error, with no recovery
+# attempted.
+#
+parse unknown.opt
+define Empty {}
+----
+unknown file 'unknown.opt'

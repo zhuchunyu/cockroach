@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -47,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -54,16 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-)
-
-// logStatementsExecuteEnabled causes the Executor to log executed
-// statements and, if any, resulting errors.
-var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
-	"sql.trace.log_statement_execute",
-	"set to true to enable logging of executed statements",
-	false,
 )
 
 // ClusterOrganization is the organization name.
@@ -73,14 +64,19 @@ var ClusterOrganization = settings.RegisterStringSetting(
 	"",
 )
 
-var errNoTransactionInProgress = errors.New("there is no transaction in progress")
-var errStaleMetadata = errors.New("metadata is still stale")
-var errTransactionInProgress = errors.New("there is already a transaction in progress")
+// ClusterSecret is a cluster specific secret. This setting is hidden.
+var ClusterSecret = func() *settings.StringSetting {
+	s := settings.RegisterStringSetting(
+		"cluster.secret",
+		"cluster specific secret",
+		"",
+	)
+	s.Hide()
+	return s
+}()
 
-func errWrongNumberOfPreparedStatements(n int) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidPreparedStatementDefinitionError,
-		"prepared statement had %d statements, expected 1", n)
-}
+var errNoTransactionInProgress = errors.New("there is no transaction in progress")
+var errTransactionInProgress = errors.New("there is already a transaction in progress")
 
 const sqlTxnName string = "sql txn"
 const sqlImplicitTxnName string = "sql txn implicit"
@@ -105,19 +101,19 @@ var (
 		Help: "Number of SQL SELECT statements"}
 	MetaSQLExecLatency = metric.Metadata{
 		Name: "sql.exec.latency",
-		Help: "Latency of SQL statement execution"}
+		Help: "Latency in nanoseconds of SQL statement execution"}
 	MetaSQLServiceLatency = metric.Metadata{
 		Name: "sql.service.latency",
-		Help: "Latency of SQL request execution"}
+		Help: "Latency in nanoseconds of SQL request execution"}
 	MetaDistSQLSelect = metric.Metadata{
 		Name: "sql.distsql.select.count",
 		Help: "Number of DistSQL SELECT statements"}
 	MetaDistSQLExecLatency = metric.Metadata{
 		Name: "sql.distsql.exec.latency",
-		Help: "Latency of DistSQL statement execution"}
+		Help: "Latency in nanoseconds of DistSQL statement execution"}
 	MetaDistSQLServiceLatency = metric.Metadata{
 		Name: "sql.distsql.service.latency",
-		Help: "Latency of DistSQL request execution"}
+		Help: "Latency in nanoseconds of DistSQL request execution"}
 	MetaUpdate = metric.Metadata{
 		Name: "sql.update.count",
 		Help: "Number of SQL UPDATE statements"}
@@ -213,7 +209,7 @@ type Executor struct {
 	// Transient stats.
 	SelectCount   *metric.Counter
 	TxnBeginCount *metric.Counter
-	EngineMetrics sqlEngineMetrics
+	EngineMetrics EngineMetrics
 
 	// txnCommitCount counts the number of times a COMMIT was attempted.
 	TxnCommitCount *metric.Counter
@@ -227,13 +223,7 @@ type Executor struct {
 	MiscCount        *metric.Counter
 	QueryCount       *metric.Counter
 
-	// System Config and mutex.
-	systemConfig config.SystemConfig
-	// databaseCache is updated with systemConfigMu held, but read atomically in
-	// order to avoid recursive locking. See WaitForGossipUpdate.
-	databaseCache    atomic.Value
-	systemConfigMu   syncutil.Mutex
-	systemConfigCond *sync.Cond
+	dbCache *databaseCacheHolder
 
 	distSQLPlanner *DistSQLPlanner
 
@@ -241,9 +231,10 @@ type Executor struct {
 	sqlStats sqlStats
 
 	// Attempts to use unimplemented features.
-	unimplementedErrors struct {
+	errorCounts struct {
 		syncutil.Mutex
-		counts map[string]int64
+		unimplemented map[string]int64
+		codes         map[string]int64
 	}
 }
 
@@ -275,6 +266,8 @@ type ExecutorConfig struct {
 	JobRegistry     *jobs.Registry
 	VirtualSchemas  *VirtualSchemaHolder
 	DistSQLPlanner  *DistSQLPlanner
+	ExecLogger      *log.SecondaryLogger
+	AuditLogger     *log.SecondaryLogger
 
 	TestingKnobs              *ExecutorTestingKnobs
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
@@ -285,6 +278,11 @@ type ExecutorConfig struct {
 	// Caches updated by DistSQL.
 	RangeDescriptorCache *kv.RangeDescriptorCache
 	LeaseHolderCache     *kv.LeaseHolderCache
+
+	// ConnResultsBufferBytes is the size of the buffer in which each connection
+	// accumulates results set. Results are flushed to the network when this
+	// buffer overflows.
+	ConnResultsBufferBytes int
 }
 
 // Organization returns the value of cluster.organization.
@@ -299,15 +297,11 @@ func (*ExecutorTestingKnobs) ModuleTestingKnobs() {}
 
 // StatementFilter is the type of callback that
 // ExecutorTestingKnobs.StatementFilter takes.
-type StatementFilter func(context.Context, string, ResultsWriter, error) error
+type StatementFilter func(context.Context, string, error)
 
 // ExecutorTestingKnobs is part of the context used to control parts of the
 // system during testing.
 type ExecutorTestingKnobs struct {
-	// WaitForGossipUpdate causes metadata-mutating operations to wait
-	// for the new metadata to back-propagate through gossip.
-	WaitForGossipUpdate bool
-
 	// CheckStmtStringChange causes Executor.execStmtGroup to verify that executed
 	// statements are not modified during execution.
 	CheckStmtStringChange bool
@@ -317,21 +311,13 @@ type ExecutorTestingKnobs struct {
 	// statement has been executed.
 	StatementFilter StatementFilter
 
-	// BeforePrepare is called by the Executor before preparing any statement. It
-	// gives access to the planner that will be used to do the prepare. If any of
-	// the return values are not nil, the values are used as the prepare results
-	// and normal preparation is short-circuited.
-	BeforePrepare func(ctx context.Context, stmt string, planner *planner) (*PreparedStatement, error)
-
 	// BeforeExecute is called by the Executor before plan execution. It is useful
 	// for synchronizing statement execution, such as with parallel statemets.
 	BeforeExecute func(ctx context.Context, stmt string, isParallel bool)
 
 	// AfterExecute is like StatementFilter, but it runs in the same goroutine of the
 	// statement.
-	AfterExecute func(
-		ctx context.Context, stmt string, res StatementResult, err error,
-	)
+	AfterExecute func(ctx context.Context, stmt string, err error)
 
 	// DisableAutoCommit, if set, disables the auto-commit functionality of some
 	// SQL statements. That functionality allows some statements to commit
@@ -380,7 +366,7 @@ func NewExecutor(cfg ExecutorConfig, stopper *stop.Stopper) *Executor {
 		TxnAbortCount:    metric.NewCounter(MetaTxnAbort),
 		TxnRollbackCount: metric.NewCounter(MetaTxnRollback),
 		SelectCount:      metric.NewCounter(MetaSelect),
-		EngineMetrics: sqlEngineMetrics{
+		EngineMetrics: EngineMetrics{
 			DistSQLSelectCount: metric.NewCounter(MetaDistSQLSelect),
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
 			DistSQLExecLatency: metric.NewLatency(MetaDistSQLExecLatency,
@@ -399,18 +385,15 @@ func NewExecutor(cfg ExecutorConfig, stopper *stop.Stopper) *Executor {
 		MiscCount:   metric.NewCounter(MetaMisc),
 		QueryCount:  metric.NewCounter(MetaQuery),
 		sqlStats:    sqlStats{st: cfg.Settings, apps: make(map[string]*appStats)},
+		// The cache will be updated on Start() through gossip.
+		dbCache: newDatabaseCacheHolder(newDatabaseCache(config.SystemConfig{})),
 	}
 }
 
 // Start starts workers for the executor.
-func (e *Executor) Start(
-	ctx context.Context, startupMemMetrics *MemoryMetrics, dsp *DistSQLPlanner,
-) {
+func (e *Executor) Start(ctx context.Context, dsp *DistSQLPlanner) {
 	ctx = e.AnnotateCtx(ctx)
 	e.distSQLPlanner = dsp
-
-	e.databaseCache.Store(newDatabaseCache(e.systemConfig))
-	e.systemConfigCond = sync.NewCond(&e.systemConfigMu)
 
 	gossipUpdateC := e.cfg.Gossip.RegisterSystemConfigChannel()
 	e.stopper.RunWorker(ctx, func(ctx context.Context) {
@@ -418,7 +401,7 @@ func (e *Executor) Start(
 			select {
 			case <-gossipUpdateC:
 				sysCfg, _ := e.cfg.Gossip.GetSystemConfig()
-				e.updateSystemConfig(sysCfg)
+				e.dbCache.updateSystemConfig(sysCfg)
 			case <-e.stopper.ShouldStop():
 				return
 			}
@@ -438,29 +421,73 @@ func (e *Executor) AnnotateCtx(ctx context.Context) context.Context {
 	return e.cfg.AmbientCtx.AnnotateCtx(ctx)
 }
 
-// updateSystemConfig is called whenever the system config gossip entry is updated.
-func (e *Executor) updateSystemConfig(cfg config.SystemConfig) {
-	e.systemConfigMu.Lock()
-	defer e.systemConfigMu.Unlock()
-	e.systemConfig = cfg
-	// The database cache gets reset whenever the system config changes.
-	e.databaseCache.Store(newDatabaseCache(cfg))
-	e.systemConfigCond.Broadcast()
+// databaseCacheHolder is a thread-safe container for a *databaseCache.
+// It also allows clients to block until the cache is updated to a desired
+// state.
+//
+// NOTE(andrei): The way in which we handle the database cache is funky: there's
+// this top-level holder, which gets updated on gossip updates. Then, each
+// session gets its *databaseCache, which is updated from the holder after every
+// transaction - the SystemConfig is updated and the lazily computer map of db
+// names to ids is wiped. So many session are sharing and contending on a
+// mutable cache, but nobody's sharing this holder. We should make up our mind
+// about whether we like the sharing or not and, if we do, share the holder too.
+// Also, we could use the SystemConfigDeltaFilter to limit the updates to
+// databases that chaged.
+type databaseCacheHolder struct {
+	mu struct {
+		syncutil.Mutex
+		c  *databaseCache
+		cv *sync.Cond
+	}
 }
 
-// getDatabaseCache returns a database cache with a copy of the latest
-// system config.
-func (e *Executor) getDatabaseCache() *databaseCache {
-	if v := e.databaseCache.Load(); v != nil {
-		return v.(*databaseCache)
+func newDatabaseCacheHolder(c *databaseCache) *databaseCacheHolder {
+	dc := &databaseCacheHolder{}
+	dc.mu.c = c
+	dc.mu.cv = sync.NewCond(&dc.mu.Mutex)
+	return dc
+}
+
+func (dc *databaseCacheHolder) getDatabaseCache() *databaseCache {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.mu.c
+}
+
+// waitForCacheState implements the dbCacheSubscriber interface.
+func (dc *databaseCacheHolder) waitForCacheState(cond func(*databaseCache) (bool, error)) error {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	for {
+		done, err := cond(dc.mu.c)
+		if err != nil {
+			return err
+		}
+		if done {
+			break
+		}
+		dc.mu.cv.Wait()
 	}
 	return nil
 }
 
-// Prepare returns the result types of the given statement. pinfo may
-// contain partial type information for placeholders. Prepare will
-// populate the missing types. The PreparedStatement is returned (or
-// nil if there are no results).
+// databaseCacheHolder implements the dbCacheSubscriber interface.
+var _ dbCacheSubscriber = &databaseCacheHolder{}
+
+// updateSystemConfig is called whenever a new system config gossip entry is
+// received.
+func (dc *databaseCacheHolder) updateSystemConfig(cfg config.SystemConfig) {
+	dc.mu.Lock()
+	dc.mu.c = newDatabaseCache(cfg)
+	dc.mu.cv.Broadcast()
+	dc.mu.Unlock()
+}
+
+// Prepare returns the result types of the given statement. placeholderHints may
+// contain partial type information for placeholders. Prepare will populate the
+// missing types. The PreparedStatement is returned (or nil if there are no
+// results).
 func (e *Executor) Prepare(
 	stmt Statement, stmtStr string, session *Session, placeholderHints tree.PlaceholderTypes,
 ) (res *PreparedStatement, err error) {
@@ -480,12 +507,16 @@ func (e *Executor) Prepare(
 	}
 
 	prepared.Statement = stmt.AST
-	prepared.AnonymizedStr = session.appStats.getStrForStmt(stmt)
+	prepared.AnonymizedStr = anonymizeStmt(stmt)
 
 	if err := placeholderHints.ProcessPlaceholderAnnotations(stmt.AST); err != nil {
 		return nil, err
 	}
-	protoTS, err := isAsOf(session, stmt.AST, e.cfg.Clock.Now())
+	evalCtx := session.extendedEvalCtx(
+		session.TxnState.mu.txn,
+		e.cfg.Clock.PhysicalTime(),
+		e.cfg.Clock.PhysicalTime()).EvalContext
+	protoTS, err := isAsOf(stmt.AST, &evalCtx, e.cfg.Clock.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -520,34 +551,32 @@ func (e *Executor) Prepare(
 	planner.extendedEvalCtx.PrepareOnly = true
 	planner.extendedEvalCtx.ActiveMemAcc = &prepared.memAcc
 
+	ctx := session.Ctx()
 	if protoTS != nil {
 		planner.asOfSystemTime = true
 		// We can't use cached descriptors anywhere in this query, because
 		// we want the descriptors at the timestamp given, not the latest
 		// known to the cache.
 		planner.avoidCachedDescriptors = true
-		txn.SetFixedTimestamp(session.Ctx(), *protoTS)
+		txn.SetFixedTimestamp(ctx, *protoTS)
 	}
 
-	if filter := e.cfg.TestingKnobs.BeforePrepare; filter != nil {
-		res, err := filter(session.Ctx(), stmtStr, planner)
-		if res != nil || err != nil {
-			return res, err
-		}
-	}
-
-	if err := planner.prepare(session.Ctx(), stmt.AST); err != nil {
+	startTime := timeutil.Now()
+	if err := planner.prepare(ctx, stmt.AST); err != nil {
+		planner.maybeLogStatementInternal(ctx, "prepare", 0, err, startTime)
 		return nil, err
 	}
+	planner.maybeLogStatementInternal(ctx, "prepare", 0, nil, startTime)
+
 	if planner.curPlan.plan == nil {
 		// The statement cannot be prepared. Nothing to do.
 		return prepared, nil
 	}
 	defer func() {
-		planner.curPlan.close(session.Ctx())
+		planner.curPlan.close(ctx)
 		// NB: if we start caching the plan, we'll want to keep around the memory
 		// account used for the plan, rather than clearing it.
-		prepared.memAcc.Clear(session.Ctx())
+		prepared.memAcc.Clear(ctx)
 	}()
 	prepared.Columns = planner.curPlan.columns()
 	for _, c := range prepared.Columns {
@@ -600,29 +629,8 @@ func (e *Executor) ExecuteStatements(
 	session *Session, stmts string, pinfo *tree.PlaceholderInfo,
 ) error {
 	session.resetForBatch(e)
-	session.phaseTimes[sessionStartBatch] = timeutil.Now()
 
 	defer session.maybeRecover("executing", stmts)
-
-	// If the Executor wants config updates to be blocked, then block them so
-	// that session.testingVerifyMetadataFn can later be run on a known version
-	// of the system config. The point is to lock the system config so that no
-	// gossip updates sneak in under us. We're then able to assert that the
-	// verify callback only succeeds after a gossip update.
-	//
-	// This lock does not change semantics. Even outside of tests, the Executor
-	// uses static systemConfig for a user request, so locking the Executor's
-	// systemConfig cannot change the semantics of the SQL operation being
-	// performed under lock.
-	//
-	// NB: The locking here implies that ExecuteStatements cannot be
-	// called recursively. So don't do that and don't try to adjust this locking
-	// to allow this method to be called recursively (sync.{Mutex,RWMutex} do not
-	// allow that).
-	if e.cfg.TestingKnobs.WaitForGossipUpdate {
-		e.systemConfigCond.L.Lock()
-		defer e.systemConfigCond.L.Unlock()
-	}
 
 	// Send the Request for SQL execution and set the application-level error
 	// for each result in the reply.
@@ -635,18 +643,12 @@ func (e *Executor) ExecutePreparedStatement(
 ) error {
 	defer session.maybeRecover("executing", stmt.Str)
 
-	// Block system config updates. For more details, see the comment in
-	// ExecuteStatements.
-	if e.cfg.TestingKnobs.WaitForGossipUpdate {
-		e.systemConfigCond.L.Lock()
-		defer e.systemConfigCond.L.Unlock()
-	}
-
 	{
 		// No parsing is taking place, but we need to set the parsing phase time
 		// because the service latency is measured from
 		// phaseTimes[sessionStartParse].
 		now := timeutil.Now()
+		session.phaseTimes[sessionQueryReceived] = now
 		session.phaseTimes[sessionStartParse] = now
 		session.phaseTimes[sessionEndParse] = now
 	}
@@ -660,10 +662,6 @@ func (e *Executor) ExecutePreparedStatement(
 func (e *Executor) execPrepared(
 	session *Session, stmt *PreparedStatement, pinfo *tree.PlaceholderInfo,
 ) error {
-	if log.V(2) || logStatementsExecuteEnabled.Get(&e.cfg.Settings.SV) {
-		log.Infof(session.Ctx(), "execPrepared: %s", stmt.Str)
-	}
-
 	var stmts StatementList
 	if stmt.Statement != nil {
 		stmts = StatementList{{
@@ -693,19 +691,14 @@ func (e *Executor) execPrepared(
 func (e *Executor) execRequest(session *Session, sql string, pinfo *tree.PlaceholderInfo) error {
 	txnState := &session.TxnState
 
-	if log.V(2) || logStatementsExecuteEnabled.Get(&e.cfg.Settings.SV) {
-		log.Infof(session.Ctx(), "execRequest: %s", sql)
-	}
-
-	session.phaseTimes[sessionStartParse] = timeutil.Now()
+	now := timeutil.Now()
+	session.phaseTimes[sessionQueryReceived] = now
+	session.phaseTimes[sessionStartParse] = now
 	sl, err := parser.Parse(sql)
 	stmts := NewStatementList(sl)
 	session.phaseTimes[sessionEndParse] = timeutil.Now()
 
 	if err != nil {
-		if log.V(2) || logStatementsExecuteEnabled.Get(&e.cfg.Settings.SV) {
-			log.Infof(session.Ctx(), "execRequest: error: %v", err)
-		}
 		// A parse error occurred: we can't determine if there were multiple
 		// statements or only one, so just pretend there was one.
 		if txnState.mu.txn != nil {
@@ -724,11 +717,30 @@ func (e *Executor) RecordError(err error) {
 	if err == nil {
 		return
 	}
-	if pgErr, ok := pgerror.GetPGCause(err); ok {
-		if pgErr.Code == pgerror.CodeFeatureNotSupportedError {
-			e.recordUnimplementedFeature(pgErr.InternalCommand)
-		}
+	e.errorCounts.Lock()
+
+	if e.errorCounts.codes == nil {
+		e.errorCounts.codes = make(map[string]int64)
 	}
+	if pgErr, ok := pgerror.GetPGCause(err); ok {
+		e.errorCounts.codes[pgErr.Code]++
+
+		if pgErr.Code == pgerror.CodeFeatureNotSupportedError {
+			if feature := pgErr.InternalCommand; feature != "" {
+				if e.errorCounts.unimplemented == nil {
+					e.errorCounts.unimplemented = make(map[string]int64)
+				}
+				e.errorCounts.unimplemented[feature]++
+			}
+		}
+	} else {
+		typ := util.ErrorSource(err)
+		if typ == "" {
+			typ = "unknown"
+		}
+		e.errorCounts.codes[typ]++
+	}
+	e.errorCounts.Unlock()
 }
 
 // execParsed executes a batch of statements received as a unit from the client
@@ -774,7 +786,13 @@ func (e *Executor) execParsed(
 				// Check for AS OF SYSTEM TIME. If it is present but not detected here,
 				// it will raise an error later on.
 				var err error
-				protoTS, err = isAsOf(session, stmtsToExec[0].AST, e.cfg.Clock.Now())
+				evalCtx := session.extendedEvalCtx(
+					session.TxnState.mu.txn,
+					e.cfg.Clock.PhysicalTime(),
+					e.cfg.Clock.PhysicalTime()).EvalContext
+				protoTS, err = isAsOf(
+					stmtsToExec[0].AST, &evalCtx, e.cfg.Clock.Now(),
+				)
 				if err != nil {
 					return err
 				}
@@ -846,54 +864,25 @@ func (e *Executor) execParsed(
 			txnState.finishSQLTxn(session)
 		}
 
-		// Verify that the metadata callback fails, if one was set. This is
-		// the precondition for validating that we need a gossip update for
-		// the callback to eventually succeed. Note that we are careful to
-		// check this just once per metadata callback (setting the callback
-		// clears session.verifyFnCheckedOnce).
-		if e.cfg.TestingKnobs.WaitForGossipUpdate {
-			// Turn off test verification of metadata changes made by the
-			// transaction if an error is seen during a transaction.
+		// If we're no longer in a transaction, exec the schema changes.
+		// They'll short-circuit themselves if the mutation that queued
+		// them has been rolled back from the table descriptor. (It's
+		// important that this condition match the one used to call
+		// finishSQLTxn above:
+		if txnState.State() == NoTxn {
+			blockOpt := blockForDBCacheUpdate
 			if err != nil {
-				session.testingVerifyMetadataFn = nil
+				blockOpt = dontBlockForDBCacheUpdate
 			}
-			if fn := session.testingVerifyMetadataFn; fn != nil && !session.verifyFnCheckedOnce {
-				if fn(e.systemConfig) == nil {
-					panic(fmt.Sprintf(
-						"expected %q (or the statements before them) to require a "+
-							"gossip update, but they did not", stmts))
-				}
-				session.verifyFnCheckedOnce = true
-			}
-		}
-
-		// If the txn is not in an "open" state any more, exec the schema changes.
-		// They'll short-circuit themselves if the mutation that queued them has
-		// been rolled back from the table descriptor.
-		if !txnState.TxnIsOpen() {
-			// Verify that metadata callback eventually succeeds, if one was
-			// set.
-			if e.cfg.TestingKnobs.WaitForGossipUpdate {
-				if fn := session.testingVerifyMetadataFn; fn != nil {
-					if !session.verifyFnCheckedOnce {
-						panic("initial state of the condition to verify was not checked")
-					}
-
-					for fn(e.systemConfig) != nil {
-						e.systemConfigCond.Wait()
-					}
-
-					session.testingVerifyMetadataFn = nil
-				}
-			}
-
 			// Release any leases the transaction(s) may have used.
-			session.tables.releaseTables(session.Ctx())
+			if err := session.tables.releaseTables(session.Ctx(), blockOpt); err != nil {
+				return err
+			}
 
 			// Exec the schema changers (if the txn rolled back, the schema changers
 			// will short-circuit because the corresponding descriptor mutation is not
 			// found).
-			if err := txnState.schemaChangers.execSchemaChanges(session.Ctx(), e, session); err != nil {
+			if err := txnState.schemaChangers.execSchemaChanges(session.Ctx(), &e.cfg); err != nil {
 				return err
 			}
 		}
@@ -920,9 +909,9 @@ func (e *Executor) execParsed(
 //
 // Args:
 // stmtsToExec: A prefix of these will be executed. The remaining ones will be
-// returned as remainingStmts.
+//   returned as remainingStmts.
 // txnPrefix: Set if stmtsToExec corresponds to the start of the current
-// transaction. Used to trap nested BEGINs.
+//   transaction. Used to trap nested BEGINs.
 // autoCommit: If set, the transaction will be committed after running the
 //   statement. If set, stmtsToExec can only contain a single statement.
 //   If set, the transaction state will always be NoTxn when this function
@@ -930,13 +919,13 @@ func (e *Executor) execParsed(
 //   Errors encountered when committing are reported to the caller and are
 //   indistinguishable from errors encountered while running the query.
 // protoTS: If not nil, the transaction proto sets its Orig and Max timestamps
-// to it each retry.
+//   to it each retry.
 //
 // Returns:
 // remainingStmts: all the statements that were not executed.
 // transitionToOpen: specifies if the caller should move from state AutoRetry to
-// state Open. This will be false if the state is not AutoRetry when this
-// returns.
+//   state Open. This will be false if the state is not AutoRetry when this
+//   returns.
 // err: An error that occurred while executing the queries.
 func runWithAutoRetry(
 	e *Executor,
@@ -990,8 +979,8 @@ func runWithAutoRetry(
 
 		// Run some statements.
 		remainingStmts, transitionToOpen, err = runTxnAttempt(
-			e, session, stmtsToExec, pinfo, origState,
-			txnPrefix, asOfSystemTime, avoidCachedDescriptors, automaticRetryCount, txnState.txnResults)
+			e, session, stmtsToExec, pinfo, origState, txnPrefix, autoCommit,
+			asOfSystemTime, avoidCachedDescriptors, automaticRetryCount, txnState.txnResults)
 
 		// Sanity checks.
 		if err != nil && txnState.TxnIsOpen() {
@@ -1014,48 +1003,7 @@ func runWithAutoRetry(
 			}
 		}
 
-		// Check if we need to auto-commit. If so, we end the transaction now; the
-		// transaction was only supposed to exist for the statement that we just
-		// ran.
 		if autoCommit {
-			if err == nil {
-				txn := txnState.mu.txn
-				if txn == nil {
-					log.Fatalf(session.Ctx(), "implicit txn returned with no error and yet "+
-						"the kv txn is gone. No state transition should have done that. State: %s",
-						txnState.State())
-				}
-
-				// We were told to autoCommit. The KV txn might already be committed
-				// (planNodes are free to do that when running an implicit transaction,
-				// and some try to do it to take advantage of 1-PC txns). If it is, then
-				// there's nothing to do. If it isn't, then we commit it here.
-				//
-				// NOTE(andrei): It bothers me some that we're peeking at txn to figure
-				// out whether we committed or not, where SQL could already know that -
-				// individual statements could report this back.
-				if txn.IsAborted() {
-					log.Fatalf(session.Ctx(), "#7881: the statement we just ran didn't generate an error "+
-						"but the txn proto is aborted. This should never happen. txn: %+v",
-						txn)
-				}
-
-				if !txn.IsCommitted() {
-					var skipCommit bool
-					if e.cfg.TestingKnobs.BeforeAutoCommit != nil {
-						err = e.cfg.TestingKnobs.BeforeAutoCommit(session.Ctx(), stmtsToExec[0].String())
-						skipCommit = err != nil
-					}
-					if !skipCommit {
-						err = txn.Commit(session.Ctx())
-					}
-					log.Eventf(session.Ctx(), "AutoCommit. err: %v\ntxn: %+v", err, txn.Proto())
-					if err != nil {
-						err = txnState.updateStateAndCleanupOnErr(err, e)
-					}
-				}
-			}
-
 			// After autoCommit, unless we're in RestartWait, we leave the transaction
 			// in NoTxn, regardless of whether we executed the query successfully or
 			// we encountered an error.
@@ -1112,14 +1060,16 @@ func runWithAutoRetry(
 //
 // Args:
 // txnPrefix: set if the start of the batch corresponds to the start of the
-// current transaction. Used to trap nested BEGINs.
+//   current transaction. Used to trap nested BEGINs.
+// autoCommit: If set, the transaction will be committed after running the
+//   statement.
 // txnResults: used to push query results.
 //
 // It returns:
 // remainingStmts: all the statements that were not executed.
 // transitionToOpen: specifies if the caller should move from state AutoRetry to
-// state Open. This will be false if the state is not AutoRetry when this
-// returns.
+//   state Open. This will be false if the state is not AutoRetry when this
+//   returns.
 func runTxnAttempt(
 	e *Executor,
 	session *Session,
@@ -1127,6 +1077,7 @@ func runTxnAttempt(
 	pinfo *tree.PlaceholderInfo,
 	origState TxnStateEnum,
 	txnPrefix bool,
+	autoCommit bool,
 	asOfSystemTime bool,
 	avoidCachedDescriptors bool,
 	automaticRetryCount int,
@@ -1175,6 +1126,47 @@ func runTxnAttempt(
 		// If the transaction is done, stop executing more statements.
 		if !txnState.TxnIsOpen() {
 			break
+		}
+	}
+
+	// Check if we need to auto-commit. If so, we end the transaction now; the
+	// transaction was only supposed to exist for the statement that we just
+	// ran. This needs to happen before the txnResults Flush below.
+	if autoCommit {
+		txn := txnState.mu.txn
+		if txn == nil {
+			log.Fatalf(session.Ctx(), "implicit txn returned with no error and yet "+
+				"the kv txn is gone. No state transition should have done that. State: %s",
+				txnState.State())
+		}
+
+		// We were told to autoCommit. The KV txn might already be committed
+		// (planNodes are free to do that when running an implicit transaction,
+		// and some try to do it to take advantage of 1-PC txns). If it is, then
+		// there's nothing to do. If it isn't, then we commit it here.
+		//
+		// NOTE(andrei): It bothers me some that we're peeking at txn to figure
+		// out whether we committed or not, where SQL could already know that -
+		// individual statements could report this back.
+		if txn.IsAborted() {
+			log.Fatalf(session.Ctx(), "#7881: the statement we just ran didn't generate an error "+
+				"but the txn proto is aborted. This should never happen. txn: %+v",
+				txn)
+		}
+
+		if !txn.IsCommitted() {
+			if filter := e.cfg.TestingKnobs.BeforeAutoCommit; filter != nil {
+				if err := filter(session.Ctx(), stmts[0].String()); err != nil {
+					err = txnState.updateStateAndCleanupOnErr(err, e)
+					return nil, false, err
+				}
+			}
+			err := txn.Commit(session.Ctx())
+			log.Eventf(session.Ctx(), "AutoCommit. err: %v\ntxn: %+v", err, txn.Proto())
+			if err != nil {
+				err = txnState.updateStateAndCleanupOnErr(err, e)
+				return nil, false, err
+			}
 		}
 	}
 
@@ -1242,7 +1234,7 @@ func (e *Executor) execSingleStatement(
 		panic("execStmt called outside of a txn")
 	}
 
-	queryID := e.generateQueryID()
+	queryID := e.generateID()
 
 	queryMeta := &queryMeta{
 		start: session.phaseTimes[sessionEndParse],
@@ -1308,9 +1300,7 @@ func (e *Executor) execSingleStatement(
 		}
 	}
 	if filter := e.cfg.TestingKnobs.StatementFilter; filter != nil {
-		if err := filter(session.Ctx(), stmt.String(), session.ResultsWriter, err); err != nil {
-			return err
-		}
+		filter(session.Ctx(), stmt.String(), err)
 	}
 	if err != nil {
 		// If error contains a context cancellation error, wrap it with a
@@ -1500,9 +1490,7 @@ func (e *Executor) execStmtInCommitWaitTxn(
 // sessionEventf logs an event to the current transaction context and to the
 // session event log.
 func sessionEventf(session *Session, format string, args ...interface{}) {
-	if session.eventLog == nil {
-		log.VEventf(session.context, 2, format, args...)
-	} else {
+	if session.eventLog != nil {
 		str := fmt.Sprintf(format, args...)
 		log.VEvent(session.context, 2, str)
 		session.eventLog.Printf("%s", str)
@@ -1596,50 +1584,6 @@ func (e *Executor) execStmtInOpenTxn(
 		if err != nil {
 			return
 		}
-		// Generally, if the transaction is serializable and it has been pushed,
-		// we don't deal with it until commit time (when we return a retriable error).
-		// This is because we want the transaction to continue and lay down all the intents it wants,
-		// so that a future attempt is more likely to succeed.
-		// However, there are two situations when we do want to detect the push and restart early:
-		//
-		// 1. If we can still automatically retry the txn, we go ahead and retry now -
-		// if we'd execute further statements, we probably wouldn't be allowed to retry automatically any more.
-		//
-		// 2. If the client is not following the client-directed retries protocol,
-		// then technically there won't be any retries,
-		// so the client would not benefit from letting the transaction run more statements.
-		if txnState.isSerializableRestart() && (txnState.State() == AutoRetry || !txnState.retryIntent) {
-			// If we just ran a statement synchronously, then the parallel queue
-			// would have been synchronized first, so this would be a no-op.
-			// However, if we just ran a statement asynchronously, then the
-			// queue could still contain statements executing. So if we're in a
-			// SerializableRestart state, we synchronize to drain the rest of
-			// the stmts and clear the parallel batch's error-set before
-			// restarting. If we did not drain the parallel stmts then the
-			// txn.Reset call below might cause them to write at the wrong
-			// epoch.
-			//
-			// TODO(nvanbenschoten): like in Session.Finish, we should try to
-			// actively cancel these parallel queries instead of just waiting
-			// for them to finish.
-			if parErr := session.synchronizeParallelStmts(session.Ctx()); parErr != nil {
-				// If synchronizing results in a non-retryable error, it takes priority.
-				if _, ok := parErr.(*roachpb.HandledRetryableTxnError); !ok {
-					err = parErr
-					return
-				}
-			}
-			txnState.mu.txn.Proto().Restart(
-				0 /* userPriority */, 0 /* upgradePriority */, e.cfg.Clock.Now())
-			err = roachpb.NewHandledRetryableTxnError(
-				"serializable transaction timestamp pushed (detected by SQL Executor)",
-				txnState.mu.txn.ID(),
-				// No updated transaction required; we've already manually updated our
-				// client.Txn.
-				roachpb.Transaction{},
-			)
-			err = txnState.updateStateAndCleanupOnErr(err, e)
-		}
 	}()
 
 	// Check if the statement is parallelized or is independent from parallel
@@ -1649,6 +1593,9 @@ func (e *Executor) execStmtInOpenTxn(
 	_, independentFromParallelStmts := stmt.AST.(tree.IndependentFromParallelizedPriors)
 	if !(parallelize || independentFromParallelStmts) {
 		if err := session.synchronizeParallelStmts(session.Ctx()); err != nil {
+			if _, isCommit := stmt.AST.(*tree.CommitTransaction); isCommit {
+				txnState.commitSeen = true
+			}
 			return err
 		}
 	}
@@ -1688,11 +1635,11 @@ func (e *Executor) execStmtInOpenTxn(
 		return nil
 
 	case *tree.RollbackTransaction:
-		// Turn off test verification of metadata changes made by the
-		// transaction.
-		session.testingVerifyMetadataFn = nil
 		// RollbackTransaction is executed fully here; there's no planNode for it
 		// and a planner is not involved at all.
+		if err := session.tables.releaseTables(txnState.Ctx, dontBlockForDBCacheUpdate); err != nil {
+			log.Warningf(txnState.Ctx, "releaseTables failed: %s", err)
+		}
 		transition = rollbackSQLTransaction(txnState, res)
 		explicitStateTransition = true
 		return nil
@@ -1750,16 +1697,21 @@ func (e *Executor) execStmtInOpenTxn(
 		return res.CloseResult()
 
 	case *tree.Execute:
-		// Substitute the placeholder information and actual statement with that of
-		// the saved prepared statement and pass control back to the ordinary
-		// execute path.
-		ps, newPInfo, err := getPreparedStatementForExecute(
-			&session.PreparedStatements, session.data.SearchPath, s,
-		)
+		name := s.Name.String()
+		ps, ok := session.PreparedStatements.Get(name)
+		if !ok {
+			err := pgerror.NewErrorf(
+				pgerror.CodeInvalidSQLStatementNameError,
+				"prepared statement %q does not exist", name,
+			)
+			return err
+		}
+		var err error
+		pinfo, err = fillInPlaceholders(ps, name, s.Params, session.data.SearchPath)
 		if err != nil {
 			return err
 		}
-		pinfo = newPInfo
+
 		stmt.AST = ps.Statement
 		stmt.ExpectedTypes = ps.Columns
 		stmt.AnonymizedStr = ps.AnonymizedStr
@@ -1779,7 +1731,18 @@ func (e *Executor) execStmtInOpenTxn(
 				stmtTimestamp: e.cfg.Clock.PhysicalTime(),
 			}
 		}
-		cm, err := newCopyMachine(session.Ctx(), session.conn, session, s, txnOpt)
+		cm, err := newCopyMachine(
+			session.Ctx(), session.conn,
+			s,
+			txnOpt,
+			&e.cfg,
+			// resetPlanner
+			func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time) {
+				session.resetPlanner(
+					p, txn, txnTS, stmtTS,
+					nil /* reCache */, session.statsCollector())
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -1921,8 +1884,7 @@ func rollbackSQLTransaction(txnState *txnState, res StatementResult) stateTransi
 		panic(fmt.Sprintf("rollbackSQLTransaction called on txn in wrong state: %s (txn: %s)",
 			txnState.State(), txnState.mu.txn.Proto()))
 	}
-	err := txnState.mu.txn.Rollback(txnState.Ctx)
-	if err != nil {
+	if err := txnState.mu.txn.Rollback(txnState.Ctx); err != nil {
 		log.Warningf(txnState.Ctx, "txn rollback failed: %s", err)
 	}
 	// We're done with this txn.
@@ -2000,33 +1962,24 @@ func commitSQLTransaction(
 // exectDistSQL converts the current logical plan to a distributed SQL
 // physical plan and runs it.
 func (e *Executor) execDistSQL(
-	planner *planner, plan planNode, rowResultWriter StatementResult,
+	planner *planner, plan planNode, rowResultWriter StatementResult, stmtType tree.StatementType,
 ) error {
 	ctx := planner.EvalContext().Ctx()
 	recv := makeDistSQLReceiver(
-		ctx, rowResultWriter,
+		ctx, rowResultWriter, stmtType,
 		e.cfg.RangeDescriptorCache, e.cfg.LeaseHolderCache,
 		planner.txn,
 		func(ts hlc.Timestamp) {
 			_ = e.cfg.Clock.Update(ts)
 		},
 	)
-	if err := e.distSQLPlanner.PlanAndRun(
-		ctx, planner.txn, plan, recv, &planner.extendedEvalCtx,
-	); err != nil {
-		return err
-	}
-	if recv.err != nil {
-		return recv.err
-	}
-	return nil
+	e.distSQLPlanner.PlanAndRun(ctx, planner.txn, plan, recv, &planner.extendedEvalCtx)
+	return rowResultWriter.Err()
 }
 
-// execLocal runs the given logical plan using the local
+// execLocal runs the current logical plan using the local
 // (non-distributed) SQL implementation.
-func (e *Executor) execLocal(
-	planner *planner, plan planNode, rowResultWriter StatementResult,
-) error {
+func (e *Executor) execLocal(planner *planner, rowResultWriter StatementResult) error {
 	ctx := planner.EvalContext().Ctx()
 
 	// Create a BoundAccount to track the memory usage of each row.
@@ -2046,7 +1999,7 @@ func (e *Executor) execLocal(
 
 	switch rowResultWriter.StatementType() {
 	case tree.RowsAffected:
-		count, err := countRowsAffected(params, plan)
+		count, err := countRowsAffected(params, planner.curPlan.plan)
 		if err != nil {
 			return err
 		}
@@ -2102,6 +2055,33 @@ func countRowsAffected(params runParams, p planNode) (int, error) {
 	return count, err
 }
 
+// shouldUseOptimizer determines whether we should use the experimental
+// optimizer for planning.
+func shouldUseOptimizer(optMode sessiondata.OptimizerMode, stmt Statement) bool {
+	switch optMode {
+	case sessiondata.OptimizerAlways:
+		// Don't try to run SET commands with the optimizer in Always mode, or
+		// else we can't switch to another mode.
+		if _, setVar := stmt.AST.(*tree.SetVar); !setVar {
+			return true
+		}
+
+	case sessiondata.OptimizerOn:
+		// Only handle a subset of the statement types (currently read-only queries).
+		switch stmt.AST.(type) {
+		case *tree.ParenSelect, *tree.Select, *tree.SelectClause,
+			*tree.UnionClause, *tree.ValuesClause:
+			return true
+		case *tree.Explain:
+			// The optimizer doesn't yet support EXPLAIN but if we return false, it gets
+			// executed with the old planner which can be very confusing; it's
+			// preferable to error out.
+			return true
+		}
+	}
+	return false
+}
+
 // shouldUseDistSQL determines whether we should use DistSQL for the
 // given logical plan, based on the session settings.
 func shouldUseDistSQL(
@@ -2109,14 +2089,25 @@ func shouldUseDistSQL(
 	distSQLMode sessiondata.DistSQLExecMode,
 	dp *DistSQLPlanner,
 	planner *planner,
-	plan planNode,
 ) (bool, error) {
 	if distSQLMode == sessiondata.DistSQLOff {
 		return false, nil
 	}
 
+	plan := planner.curPlan.plan
+
 	// Don't try to run empty nodes (e.g. SET commands) with distSQL.
 	if _, ok := plan.(*zeroNode); ok {
+		return false, nil
+	}
+
+	// We don't support subqueries yet.
+	if len(planner.curPlan.subqueryPlans) > 0 {
+		if distSQLMode == sessiondata.DistSQLAlways {
+			err := newQueryNotSupportedError("subqueries not supported yet")
+			log.VEventf(ctx, 1, "query not supported for distSQL: %s", err)
+			return false, err
+		}
 		return false, nil
 	}
 
@@ -2147,6 +2138,8 @@ func shouldUseDistSQL(
 //
 // cols represents the columns of the result rows. Should be nil if
 // stmt.AST.StatementType() != tree.Rows.
+//
+// If an error is returned, it is to be considered a query execution error.
 func initStatementResult(res StatementResult, stmt Statement, cols sqlbase.ResultColumns) error {
 	stmtAst := stmt.AST
 	res.BeginResult(stmtAst)
@@ -2166,29 +2159,44 @@ func (e *Executor) execStmt(
 ) error {
 	ctx := session.Ctx()
 
-	// Perform logical planning and measure the duration of that phase.
 	planner.statsCollector.PhaseTimes()[plannerStartLogicalPlan] = timeutil.Now()
-	err := planner.makePlan(ctx, stmt)
-	planner.statsCollector.PhaseTimes()[plannerEndLogicalPlan] = timeutil.Now()
+	useOptimizer := shouldUseOptimizer(session.data.OptimizerMode, stmt)
+	var err error
+	if useOptimizer {
+		// Experimental path (disabled by default).
+		err = planner.makeOptimizerPlan(ctx, stmt)
+	} else {
+		err = planner.makePlan(ctx, stmt)
+	}
 	if err != nil {
+		planner.maybeLogStatement(ctx, "exec", 0, err)
 		return err
 	}
+	planner.statsCollector.PhaseTimes()[plannerEndLogicalPlan] = timeutil.Now()
+
 	defer planner.curPlan.close(ctx)
+
+	defer func() { planner.maybeLogStatement(ctx, "exec", res.RowsAffected(), res.Err()) }()
 
 	// Prepare the result set, and determine the execution parameters.
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
 		cols = planColumns(planner.curPlan.plan)
 	}
-	err = initStatementResult(res, stmt, cols)
-	if err != nil {
+	if err := initStatementResult(res, stmt, cols); err != nil {
 		return err
 	}
 
-	useDistSQL, err := shouldUseDistSQL(session.Ctx(),
-		session.data.DistSQLMode, e.distSQLPlanner, planner, planner.curPlan.plan)
-	if err != nil {
-		return err
+	useDistSQL := false
+	// TODO(radu): for now, we restrict the optimizer to local execution.
+	if !useOptimizer {
+		var err error
+		useDistSQL, err = shouldUseDistSQL(
+			session.Ctx(), session.data.DistSQLMode, e.distSQLPlanner, planner,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Start execution.
@@ -2199,19 +2207,21 @@ func (e *Executor) execStmt(
 	planner.statsCollector.PhaseTimes()[plannerStartExecStmt] = timeutil.Now()
 	session.setQueryExecutionMode(stmt.queryID, useDistSQL, false /* isParallel */)
 	if useDistSQL {
-		err = e.execDistSQL(planner, planner.curPlan.plan, res)
+		err = e.execDistSQL(planner, planner.curPlan.plan, res, stmt.AST.StatementType())
 	} else {
-		err = e.execLocal(planner, planner.curPlan.plan, res)
+		err = e.execLocal(planner, res)
 	}
+	// Ensure the error is saved where maybeLogStatement can find it.
+	res.SetError(err)
 	planner.statsCollector.PhaseTimes()[plannerEndExecStmt] = timeutil.Now()
 
 	// Complete execution: record results and optionally run the test
 	// hook.
 	recordStatementSummary(
-		planner, stmt, useDistSQL, automaticRetryCount, res, err, &e.EngineMetrics,
+		planner, stmt, useDistSQL, automaticRetryCount, res.RowsAffected(), err, &e.EngineMetrics,
 	)
 	if e.cfg.TestingKnobs.AfterExecute != nil {
-		e.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), res, err)
+		e.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), err)
 	}
 	if err != nil {
 		return err
@@ -2241,6 +2251,7 @@ func (e *Executor) execStmtInParallel(
 	}
 
 	if err := planner.makePlan(ctx, stmt); err != nil {
+		planner.maybeLogStatement(ctx, "par-prepare", 0, err)
 		return nil, err
 	}
 	var cols sqlbase.ResultColumns
@@ -2256,8 +2267,14 @@ func (e *Executor) execStmtInParallel(
 		// TODO(andrei): this should really be a result writer implementation that
 		// does nothing.
 		bufferedWriter := newBufferedWriter(session.makeBoundAccount())
+
+		defer func() {
+			params.p.maybeLogStatement(ctx, "par-exec", bufferedWriter.RowsAffected(), bufferedWriter.Err())
+		}()
+
 		err := initStatementResult(bufferedWriter, stmt, cols)
 		if err != nil {
+			bufferedWriter.SetError(err)
 			return err
 		}
 
@@ -2266,11 +2283,14 @@ func (e *Executor) execStmtInParallel(
 		}
 
 		planner.statsCollector.PhaseTimes()[plannerStartExecStmt] = timeutil.Now()
-		err = e.execLocal(planner, planner.curPlan.plan, bufferedWriter)
+		err = e.execLocal(planner, bufferedWriter)
+		// Ensure err is saved where maybeLogStatement can find it.
+		bufferedWriter.SetError(err)
 		planner.statsCollector.PhaseTimes()[plannerEndExecStmt] = timeutil.Now()
-		recordStatementSummary(planner, stmt, false, 0, bufferedWriter, err, &e.EngineMetrics)
+		recordStatementSummary(
+			planner, stmt, false, 0, bufferedWriter.RowsAffected(), err, &e.EngineMetrics)
 		if e.cfg.TestingKnobs.AfterExecute != nil {
-			e.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), bufferedWriter, err)
+			e.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), err)
 		}
 		results := bufferedWriter.results()
 		results.Close(ctx)
@@ -2278,10 +2298,16 @@ func (e *Executor) execStmtInParallel(
 		session.removeActiveQuery(stmt.queryID)
 		return err
 	}); err != nil {
+		planner.maybeLogStatement(ctx, "par-queue", 0, err)
 		return nil, err
 	}
 
 	return cols, nil
+}
+
+// Cfg returns a reference to the ExecutorConfig.
+func (e *Executor) Cfg() *ExecutorConfig {
+	return &e.cfg
 }
 
 // updateStmtCounts updates metrics for the number of times the different types of SQL
@@ -2312,15 +2338,10 @@ func (e *Executor) updateStmtCounts(stmt Statement) {
 	}
 }
 
-// generateQueryID generates a unique ID for a query based on the node's
-// ID and its current HLC timestamp.
-func (e *Executor) generateQueryID() uint128.Uint128 {
-	timestamp := e.cfg.Clock.Now()
-
-	loInt := (uint64)(e.cfg.NodeID.Get())
-	loInt = loInt | ((uint64)(timestamp.Logical) << 32)
-
-	return uint128.FromInts((uint64)(timestamp.WallTime), loInt)
+// generateID generates a unique ID based on the node's ID and its current HLC
+// timestamp, which can be used as an ID for a query or a session.
+func (e *Executor) generateID() ClusterWideID {
+	return GenerateClusterWideID(e.cfg.Clock.Now(), e.cfg.NodeID.Get())
 }
 
 // golangFillQueryArguments populates the placeholder map with
@@ -2389,7 +2410,7 @@ func golangFillQueryArguments(pinfo *tree.PlaceholderInfo, args []interface{}) {
 func checkResultType(typ types.T) error {
 	// Compare all types that can rely on == equality.
 	switch types.UnwrapType(typ) {
-	case types.Null:
+	case types.Unknown:
 	case types.Bool:
 	case types.Int:
 	case types.Float:
@@ -2526,7 +2547,9 @@ func decimalToHLC(d *apd.Decimal) (hlc.Timestamp, error) {
 //
 // max is a lower bound on what the transaction's timestamp will be.
 // Used to check that the user didn't specify a timestamp in the future.
-func isAsOf(session *Session, stmt tree.Statement, max hlc.Timestamp) (*hlc.Timestamp, error) {
+func isAsOf(
+	stmt tree.Statement, evalCtx *tree.EvalContext, max hlc.Timestamp,
+) (*hlc.Timestamp, error) {
 	var asOf tree.AsOfClause
 	switch s := stmt.(type) {
 	case *tree.Select:
@@ -2547,7 +2570,7 @@ func isAsOf(session *Session, stmt tree.Statement, max hlc.Timestamp) (*hlc.Time
 
 		asOf = sc.From.AsOf
 	case *tree.ShowTrace:
-		return isAsOf(session, s.Statement, max)
+		return isAsOf(s.Statement, evalCtx, max)
 	case *tree.Scrub:
 		if s.AsOf.Expr == nil {
 			return nil, nil
@@ -2557,13 +2580,7 @@ func isAsOf(session *Session, stmt tree.Statement, max hlc.Timestamp) (*hlc.Time
 		return nil, nil
 	}
 
-	// the evalCtx is not needed for the purposes of evaluating AOST. See #16424.
-	evalCtx := session.extendedEvalCtx(
-		nil,         /* txn */
-		time.Time{}, /* txnTimestamp */
-		time.Time{}, /* stmtTimestamp */
-	)
-	ts, err := EvalAsOfTimestamp(&evalCtx.EvalContext, asOf, max)
+	ts, err := EvalAsOfTimestamp(evalCtx, asOf, max)
 	return &ts, err
 }
 

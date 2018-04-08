@@ -37,6 +37,7 @@ import (
 
 // GetTableDescriptor retrieves a table descriptor directly from the KV layer.
 func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDescriptor {
+	// log.VEventf(context.TODO(), 2, "GetTableDescriptor %q %q", database, table)
 	dbNameKey := MakeNameMetadataKey(keys.RootNamespaceID, database)
 	gr, err := kvDB.Get(context.TODO(), dbNameKey)
 	if err != nil {
@@ -157,6 +158,8 @@ func RandDatum(rng *rand.Rand, typ ColumnType, nullOk bool) tree.Datum {
 		// TODO(justin)
 		return tree.DNull
 	case ColumnType_INT2VECTOR:
+		return tree.DNull
+	case ColumnType_OIDVECTOR:
 		return tree.DNull
 	default:
 		panic(fmt.Sprintf("invalid type %s", typ.String()))

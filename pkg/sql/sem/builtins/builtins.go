@@ -20,6 +20,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -414,6 +415,57 @@ var Builtins = map[string][]tree.Builtin{
 		},
 	},
 
+	"inet_contained_by_or_equals": {
+		tree.Builtin{
+			Types: tree.ArgTypes{
+				{"val", types.INet},
+				{"container", types.INet},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ipAddr := tree.MustBeDIPAddr(args[0]).IPAddr
+				other := tree.MustBeDIPAddr(args[1]).IPAddr
+				return tree.MakeDBool(tree.DBool(ipAddr.ContainedByOrEquals(&other))), nil
+			},
+			Info: "Test for subnet inclusion or equality, using only the network parts of the addresses. " +
+				"The host part of the addresses is ignored.",
+		},
+	},
+
+	"inet_contains_or_contained_by": {
+		tree.Builtin{
+			Types: tree.ArgTypes{
+				{"val", types.INet},
+				{"val", types.INet},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ipAddr := tree.MustBeDIPAddr(args[0]).IPAddr
+				other := tree.MustBeDIPAddr(args[1]).IPAddr
+				return tree.MakeDBool(tree.DBool(ipAddr.ContainsOrContainedBy(&other))), nil
+			},
+			Info: "Test for subnet inclusion, using only the network parts of the addresses. " +
+				"The host part of the addresses is ignored.",
+		},
+	},
+
+	"inet_contains_or_equals": {
+		tree.Builtin{
+			Types: tree.ArgTypes{
+				{"container", types.INet},
+				{"val", types.INet},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ipAddr := tree.MustBeDIPAddr(args[0]).IPAddr
+				other := tree.MustBeDIPAddr(args[1]).IPAddr
+				return tree.MakeDBool(tree.DBool(ipAddr.ContainsOrEquals(&other))), nil
+			},
+			Info: "Test for subnet inclusion or equality, using only the network parts of the addresses. " +
+				"The host part of the addresses is ignored.",
+		},
+	},
+
 	"from_ip": {
 		tree.Builtin{
 			Types:      tree.ArgTypes{{"val", types.Bytes}},
@@ -520,33 +572,46 @@ var Builtins = map[string][]tree.Builtin{
 			Types:      tree.ArgTypes{{"data", types.Bytes}, {"format", types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (_ tree.Datum, err error) {
-				data, format := string(*args[0].(*tree.DBytes)), string(tree.MustBeDString(args[1]))
-				if format != "hex" {
-					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' format is supported for ENCODE")
+				data, format := *args[0].(*tree.DBytes), string(tree.MustBeDString(args[1]))
+				switch format {
+				case "hex":
+					var buf bytes.Buffer
+					lex.HexEncodeString(&buf, string(data))
+					return tree.NewDString(buf.String()), nil
+				case "escape":
+					return tree.NewDString(encodeEscape([]byte(data))), nil
+				default:
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' and 'escape' formats are supported for ENCODE")
 				}
-				if !utf8.ValidString(data) {
-					return nil, pgerror.NewError(pgerror.CodeCharacterNotInRepertoireError, "invalid UTF-8 sequence")
-				}
-				return tree.NewDString(data), nil
 			},
-			Info: "Encodes `data` in the text format specified by `format` (only \"hex\" is supported).",
+			Info: "Encodes `data` in the text format specified by `format` (only \"hex\" and \"escape\" are supported).",
 		},
 	},
 
 	"decode": {
 		tree.Builtin{
 			Types:      tree.ArgTypes{{"text", types.String}, {"format", types.String}},
-			ReturnType: tree.FixedReturnType(types.String),
+			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (_ tree.Datum, err error) {
 				data, format := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
-				if format != "hex" {
-					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' format is supported for DECODE")
+				switch format {
+				case "hex":
+					decoded, err := hex.DecodeString(data)
+					if err != nil {
+						return nil, err
+					}
+					return tree.NewDBytes(tree.DBytes(decoded)), nil
+				case "escape":
+					decoded, err := decodeEscape(data)
+					if err != nil {
+						return nil, err
+					}
+					return tree.NewDBytes(tree.DBytes(decoded)), nil
+				default:
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' and 'escape' formats are supported for DECODE")
 				}
-				var buf bytes.Buffer
-				lex.HexEncodeString(&buf, data)
-				return tree.NewDString(buf.String()), nil
 			},
-			Info: "Decodes `data` as the format specified by `format` (only \"hex\" is supported).",
+			Info: "Decodes `data` as the format specified by `format` (only \"hex\" and \"escape\" are supported).",
 		},
 	},
 
@@ -976,11 +1041,11 @@ CockroachDB supports the following flags:
 			Impure:     true,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
-				qualifiedName, err := evalCtx.Planner.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
+				qualifiedName, err := evalCtx.Sequence.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
 				if err != nil {
 					return nil, err
 				}
-				res, err := evalCtx.Planner.IncrementSequence(evalCtx.Ctx(), qualifiedName)
+				res, err := evalCtx.Sequence.IncrementSequence(evalCtx.Ctx(), qualifiedName)
 				if err != nil {
 					return nil, err
 				}
@@ -998,11 +1063,11 @@ CockroachDB supports the following flags:
 			Impure:     true,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
-				qualifiedName, err := evalCtx.Planner.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
+				qualifiedName, err := evalCtx.Sequence.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
 				if err != nil {
 					return nil, err
 				}
-				res, err := evalCtx.Planner.GetLatestValueInSessionForSequence(evalCtx.Ctx(), qualifiedName)
+				res, err := evalCtx.Sequence.GetLatestValueInSessionForSequence(evalCtx.Ctx(), qualifiedName)
 				if err != nil {
 					return nil, err
 				}
@@ -1039,13 +1104,13 @@ CockroachDB supports the following flags:
 			Impure:     true,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
-				qualifiedName, err := evalCtx.Planner.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
+				qualifiedName, err := evalCtx.Sequence.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
 				if err != nil {
 					return nil, err
 				}
 
 				newVal := tree.MustBeDInt(args[1])
-				if err := evalCtx.Planner.SetSequenceValue(
+				if err := evalCtx.Sequence.SetSequenceValue(
 					evalCtx.Ctx(), qualifiedName, int64(newVal), true); err != nil {
 					return nil, err
 				}
@@ -1063,7 +1128,7 @@ CockroachDB supports the following flags:
 			Impure:     true,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
-				qualifiedName, err := evalCtx.Planner.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
+				qualifiedName, err := evalCtx.Sequence.ParseQualifiedTableName(evalCtx.Ctx(), string(name))
 				if err != nil {
 					return nil, err
 				}
@@ -1071,7 +1136,7 @@ CockroachDB supports the following flags:
 				isCalled := bool(tree.MustBeDBool(args[2]))
 
 				newVal := tree.MustBeDInt(args[1])
-				if err := evalCtx.Planner.SetSequenceValue(
+				if err := evalCtx.Sequence.SetSequenceValue(
 					evalCtx.Ctx(), qualifiedName, int64(newVal), isCalled); err != nil {
 					return nil, err
 				}
@@ -1623,8 +1688,19 @@ CockroachDB supports the following flags:
 	},
 
 	"json_remove_path": {
-	// TODO(justin): added here so #- can be desugared into it, still needs to be
-	// implemented.
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"val", types.JSON}, {"path", types.TArray{Typ: types.String}}},
+			ReturnType: tree.FixedReturnType(types.JSON),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				path := darrayToStringSlice(*tree.MustBeDArray(args[1]))
+				s, _, err := tree.MustBeDJSON(args[0]).JSON.RemovePath(path)
+				if err != nil {
+					return nil, err
+				}
+				return &tree.DJSON{JSON: s}, nil
+			},
+			Info: "Remove the specified path from the JSON object.",
+		},
 	},
 
 	"json_extract_path": {jsonExtractPathImpl},
@@ -1741,7 +1817,7 @@ CockroachDB supports the following flags:
 
 	"round": {
 		floatBuiltin1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(round(x))), nil
+			return tree.NewDFloat(tree.DFloat(math.RoundToEven(x))), nil
 		}, "Rounds `val` to the nearest integer using half to even (banker's) rounding."),
 		decimalBuiltin1(func(x *apd.Decimal) (tree.Datum, error) {
 			return roundDecimal(x, 0)
@@ -1899,6 +1975,40 @@ CockroachDB supports the following flags:
 	},
 
 	// Array functions.
+
+	"string_to_array": {
+		tree.Builtin{
+			Types:        tree.ArgTypes{{"str", types.String}, {"delimiter", types.String}},
+			ReturnType:   tree.FixedReturnType(types.TArray{Typ: types.String}),
+			Category:     categoryArray,
+			NullableArgs: true,
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, nil
+				}
+				str := string(tree.MustBeDString(args[0]))
+				delimOrNil := stringOrNil(args[1])
+				return stringToArray(str, delimOrNil, nil)
+			},
+			Info: "Split a string into components on a delimiter.",
+		},
+		tree.Builtin{
+			Types:        tree.ArgTypes{{"str", types.String}, {"delimiter", types.String}, {"null", types.String}},
+			ReturnType:   tree.FixedReturnType(types.TArray{Typ: types.String}),
+			Category:     categoryArray,
+			NullableArgs: true,
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, nil
+				}
+				str := string(tree.MustBeDString(args[0]))
+				delimOrNil := stringOrNil(args[1])
+				nullStr := stringOrNil(args[2])
+				return stringToArray(str, delimOrNil, nullStr)
+			},
+			Info: "Split a string into components on a delimiter with a specified string to consider NULL.",
+		},
+	},
 
 	"array_length": {
 		tree.Builtin{
@@ -2119,10 +2229,11 @@ CockroachDB supports the following flags:
 			ReturnType: tree.FixedReturnType(types.String),
 			Category:   categorySystemInfo,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				if len(ctx.SessionData.Database) == 0 {
+				hasFirst, first := ctx.SessionData.SearchPath.FirstSpecified()
+				if !hasFirst {
 					return tree.DNull, nil
 				}
-				return tree.NewDString(ctx.SessionData.Database), nil
+				return tree.NewDString(first), nil
 			},
 			Info: "Returns the current schema. This function is provided for " +
 				"compatibility with PostgreSQL. For a new CockroachDB application, " +
@@ -2141,11 +2252,6 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				includePgCatalog := *(args[0].(*tree.DBool))
 				schemas := tree.NewDArray(types.String)
-				if len(ctx.SessionData.Database) != 0 {
-					if err := schemas.Append(tree.NewDString(ctx.SessionData.Database)); err != nil {
-						return nil, err
-					}
-				}
 				var iter func() (string, bool)
 				if includePgCatalog {
 					iter = ctx.SessionData.SearchPath.Iter()
@@ -2153,9 +2259,6 @@ CockroachDB supports the following flags:
 					iter = ctx.SessionData.SearchPath.IterWithoutImplicitPGCatalog()
 				}
 				for p, ok := iter(); ok; p, ok = iter() {
-					if p == ctx.SessionData.Database {
-						continue
-					}
 					if err := schemas.Append(tree.NewDString(p)); err != nil {
 						return nil, err
 					}
@@ -2221,6 +2324,9 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				errCode := string(*args[0].(*tree.DString))
 				msg := string(*args[1].(*tree.DString))
+				if errCode == "" {
+					return nil, errors.New(msg)
+				}
 				return nil, pgerror.NewError(errCode, msg)
 			},
 			Category: categorySystemInfo,
@@ -2277,32 +2383,6 @@ CockroachDB supports the following flags:
 				}
 				if elapsed.Compare(minDuration) < 0 {
 					return nil, ctx.Txn.GenerateForcedRetryableError("forced by crdb_internal.force_retry()")
-				}
-				return tree.DZero, nil
-			},
-			Category: categorySystemInfo,
-			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
-		},
-		tree.Builtin{
-			Types: tree.ArgTypes{
-				{"val", types.Interval},
-				{"txnID", types.String}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Impure:     true,
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				minDuration := args[0].(*tree.DInterval).Duration
-				txnID := args[1].(*tree.DString)
-				elapsed := duration.Duration{
-					Nanos: int64(ctx.StmtTimestamp.Sub(ctx.TxnTimestamp)),
-				}
-				if elapsed.Compare(minDuration) < 0 {
-					uuid, err := uuid.FromString(string(*txnID))
-					if err != nil {
-						return nil, err
-					}
-					err = ctx.Txn.GenerateForcedRetryableError("forced by crdb_internal.force_retry()")
-					err.(*roachpb.HandledRetryableTxnError).TxnID = uuid
-					return nil, err
 				}
 				return tree.DZero, nil
 			},
@@ -2633,7 +2713,7 @@ var jsonBuildObjectImpl = tree.Builtin{
 				return nil, err
 			}
 
-			val, err := asJSON(args[i+1])
+			val, err := AsJSON(args[i+1])
 			if err != nil {
 				return nil, err
 			}
@@ -2650,7 +2730,7 @@ var toJSONImpl = tree.Builtin{
 	Types:      tree.ArgTypes{{"val", types.Any}},
 	ReturnType: tree.FixedReturnType(types.JSON),
 	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-		j, err := asJSON(args[0])
+		j, err := AsJSON(args[0])
 		if err != nil {
 			return nil, err
 		}
@@ -2666,7 +2746,7 @@ var jsonBuildArrayImpl = tree.Builtin{
 	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 		builder := json.NewArrayBuilder(len(args))
 		for _, arg := range args {
-			j, err := asJSON(arg)
+			j, err := AsJSON(arg)
 			if err != nil {
 				return nil, err
 			}
@@ -2695,7 +2775,7 @@ var jsonObjectImpls = []tree.Builtin{
 				if err != nil {
 					return nil, err
 				}
-				val, err := asJSON(arr.Array[i+1])
+				val, err := AsJSON(arr.Array[i+1])
 				if err != nil {
 					return nil, err
 				}
@@ -2726,7 +2806,7 @@ var jsonObjectImpls = []tree.Builtin{
 				if err != nil {
 					return nil, err
 				}
-				val, err := asJSON(values.Array[i])
+				val, err := AsJSON(values.Array[i])
 				if err != nil {
 					return nil, err
 				}
@@ -3206,74 +3286,6 @@ func overlay(s, to string, pos, size int) (tree.Datum, error) {
 	return tree.NewDString(string(runes[:pos]) + to + string(runes[after:])), nil
 }
 
-// Transcribed from Postgres' src/port/rint.c, with c-style comments preserved
-// for ease of mapping.
-//
-// https://github.com/postgres/postgres/blob/REL9_6_3/src/port/rint.c
-func round(x float64) float64 {
-	/* Per POSIX, NaNs must be returned unchanged. */
-	if math.IsNaN(x) {
-		return x
-	}
-
-	/* Both positive and negative zero should be returned unchanged. */
-	if x == 0.0 {
-		return x
-	}
-
-	roundFn := math.Ceil
-	if math.Signbit(x) {
-		roundFn = math.Floor
-	}
-
-	/*
-	 * Subtracting 0.5 from a number very close to -0.5 can round to
-	 * exactly -1.0, producing incorrect results, so we take the opposite
-	 * approach: add 0.5 to the negative number, so that it goes closer to
-	 * zero (or at most to +0.5, which is dealt with next), avoiding the
-	 * precision issue.
-	 */
-	xOrig := x
-	x -= math.Copysign(0.5, x)
-
-	/*
-	 * Be careful to return minus zero when input+0.5 >= 0, as that's what
-	 * rint() should return with negative input.
-	 */
-	if x == 0 || math.Signbit(x) != math.Signbit(xOrig) {
-		return math.Copysign(0.0, xOrig)
-	}
-
-	/*
-	 * For very big numbers the input may have no decimals.  That case is
-	 * detected by testing x+0.5 == x+1.0; if that happens, the input is
-	 * returned unchanged.  This also covers the case of minus infinity.
-	 */
-	if x == xOrig-math.Copysign(1.0, x) {
-		return xOrig
-	}
-
-	/* Otherwise produce a rounded estimate. */
-	r := roundFn(x)
-
-	/*
-	 * If the rounding did not produce exactly input+0.5 then we're done.
-	 */
-	if r != x {
-		return r
-	}
-
-	/*
-	 * The original fractional part was exactly 0.5 (since
-	 * floor(input+0.5) == input+0.5).  We need to round to nearest even.
-	 * Dividing input+0.5 by 2, taking the floor and multiplying by 2
-	 * yields the closest even number.  This part assumes that division by
-	 * 2 is exact, which should be OK because underflow is impossible
-	 * here: x is an integer.
-	 */
-	return roundFn(x*0.5) * 2.0
-}
-
 func roundDecimal(x *apd.Decimal, n int32) (tree.Datum, error) {
 	dd := &tree.DDecimal{}
 	_, err := tree.HighPrecisionCtx.Quantize(&dd.Decimal, x, -n)
@@ -3286,6 +3298,10 @@ var uniqueIntState struct {
 }
 
 var uniqueIntEpoch = time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+
+// NodeIDBits is the number of bits stored in the lower portion of
+// GenerateUniqueInt.
+const NodeIDBits = 15
 
 // GenerateUniqueInt creates a unique int composed of the current time at a
 // 10-microsecond granularity and the node-id. The node-id is stored in the
@@ -3302,25 +3318,30 @@ var uniqueIntEpoch = time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).Unix
 // adjustment)?
 func GenerateUniqueInt(nodeID roachpb.NodeID) tree.DInt {
 	const precision = uint64(10 * time.Microsecond)
-	const nodeIDBits = 15
 
 	nowNanos := timeutil.Now().UnixNano()
 	// Paranoia: nowNanos should never be less than uniqueIntEpoch.
 	if nowNanos < uniqueIntEpoch {
 		nowNanos = uniqueIntEpoch
 	}
-	id := uint64(nowNanos-uniqueIntEpoch) / precision
+	timestamp := uint64(nowNanos-uniqueIntEpoch) / precision
 
 	uniqueIntState.Lock()
-	if id <= uniqueIntState.timestamp {
-		id = uniqueIntState.timestamp + 1
+	if timestamp <= uniqueIntState.timestamp {
+		timestamp = uniqueIntState.timestamp + 1
 	}
-	uniqueIntState.timestamp = id
+	uniqueIntState.timestamp = timestamp
 	uniqueIntState.Unlock()
 
+	return GenerateUniqueID(int32(nodeID), timestamp)
+}
+
+// GenerateUniqueID encapsulates the logic to generate a unique number from
+// a nodeID and timestamp.
+func GenerateUniqueID(nodeID int32, timestamp uint64) tree.DInt {
 	// We xor in the nodeID so that nodeIDs larger than 32K will flip bits in the
 	// timestamp portion of the final value instead of always setting them.
-	id = (id << nodeIDBits) ^ uint64(nodeID)
+	id := (timestamp << NodeIDBits) ^ uint64(nodeID)
 	return tree.DInt(id)
 }
 
@@ -3457,6 +3478,106 @@ func truncateTime(fromTime *tree.DTime, timeSpan string) (*tree.DTime, error) {
 	return tree.MakeDTime(timeofday.New(hour, min, sec, micro)), nil
 }
 
+func stringOrNil(d tree.Datum) *string {
+	if d == tree.DNull {
+		return nil
+	}
+	s := string(tree.MustBeDString(d))
+	return &s
+}
+
+// stringToArray implements the string_to_array builtin - str is split on delim to form an array of strings.
+// If nullStr is set, any elements equal to it will be NULL.
+func stringToArray(str string, delimPtr *string, nullStr *string) (tree.Datum, error) {
+	var split []string
+
+	if delimPtr != nil {
+		delim := *delimPtr
+		if str == "" {
+			split = nil
+		} else if delim == "" {
+			split = []string{str}
+		} else {
+			split = strings.Split(str, delim)
+		}
+	} else {
+		// When given a NULL delimiter, string_to_array splits into each character.
+		split = make([]string, len(str))
+		for i, c := range str {
+			split[i] = string(c)
+		}
+	}
+
+	result := tree.NewDArray(types.String)
+	for _, s := range split {
+		var next tree.Datum = tree.NewDString(s)
+		if nullStr != nil && s == *nullStr {
+			next = tree.DNull
+		}
+		if err := result.Append(next); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// encodeEscape implements the encode(..., 'escape') Postgres builtin. It's
+// described "escape converts zero bytes and high-bit-set bytes to octal
+// sequences (\nnn) and doubles backslashes."
+func encodeEscape(input []byte) string {
+	var result bytes.Buffer
+	start := 0
+	for i := range input {
+		if input[i] == 0 || input[i]&128 != 0 {
+			result.Write(input[start:i])
+			start = i + 1
+			result.WriteString(fmt.Sprintf(`\%03o`, input[i]))
+		} else if input[i] == '\\' {
+			result.Write(input[start:i])
+			start = i + 1
+			result.WriteString(`\\`)
+		}
+	}
+	result.Write(input[start:])
+	return result.String()
+}
+
+var errInvalidSyntaxForDecode = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "invalid syntax for decode(..., 'escape')")
+
+func isOctalDigit(c byte) bool {
+	return '0' <= c && c <= '7'
+}
+
+func decodeOctalTriplet(input string) byte {
+	return (input[0]-'0')*64 + (input[1]-'0')*8 + (input[2] - '0')
+}
+
+// decodeEscape implements the decode(..., 'escape') Postgres builtin. The
+// escape format is described as "escape converts zero bytes and high-bit-set
+// bytes to octal sequences (\nnn) and doubles backslashes."
+func decodeEscape(input string) ([]byte, error) {
+	result := make([]byte, 0, len(input))
+	for i := 0; i < len(input); i++ {
+		if input[i] == '\\' {
+			if i+1 < len(input) && input[i+1] == '\\' {
+				result = append(result, '\\')
+				i++
+			} else if i+3 < len(input) &&
+				isOctalDigit(input[i+1]) &&
+				isOctalDigit(input[i+2]) &&
+				isOctalDigit(input[i+3]) {
+				result = append(result, decodeOctalTriplet(input[i+1:i+4]))
+				i += 3
+			} else {
+				return nil, errInvalidSyntaxForDecode
+			}
+		} else {
+			result = append(result, input[i])
+		}
+	}
+	return result, nil
+}
+
 func truncateTimestamp(
 	_ *tree.EvalContext, fromTime time.Time, timeSpan string,
 ) (*tree.DTimestampTZ, error) {
@@ -3522,7 +3643,8 @@ func truncateTimestamp(
 	return tree.MakeDTimestampTZ(toTime, time.Microsecond), nil
 }
 
-func asJSON(d tree.Datum) (json.JSON, error) {
+// AsJSON converts a datum into our standard json representation.
+func AsJSON(d tree.Datum) (json.JSON, error) {
 	switch t := d.(type) {
 	case *tree.DBool:
 		return json.FromBool(bool(*t)), nil
@@ -3541,7 +3663,7 @@ func asJSON(d tree.Datum) (json.JSON, error) {
 	case *tree.DArray:
 		builder := json.NewArrayBuilder(t.Len())
 		for _, e := range t.Array {
-			j, err := asJSON(e)
+			j, err := AsJSON(e)
 			if err != nil {
 				return nil, err
 			}
@@ -3551,7 +3673,7 @@ func asJSON(d tree.Datum) (json.JSON, error) {
 	case *tree.DTuple:
 		builder := json.NewObjectBuilder(len(t.D))
 		for i, e := range t.D {
-			j, err := asJSON(e)
+			j, err := AsJSON(e)
 			if err != nil {
 				return nil, err
 			}
@@ -3565,7 +3687,7 @@ func asJSON(d tree.Datum) (json.JSON, error) {
 			return json.NullJSONValue, nil
 		}
 
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unexpected type %T for asJSON", d)
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unexpected type %T for AsJSON", d)
 	}
 }
 

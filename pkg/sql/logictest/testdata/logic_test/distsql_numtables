@@ -129,7 +129,7 @@ nine-zero-zero-zero
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, str FROM NumToSquare JOIN NumToStr ON y = xsquared]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzUlVFr2zAQgN_3K8o9taBBJDvLYhj4cd1DO8rehh_U6JYYEsuTZFgp-e_D9iC1k93FqA_Joy19p7vv4O4VKmvwQe_QQ_YTJAhQICABASkImEMhoHZ2hd5b117pgXvzB7KZgLKqm9D-LgSsrEPIXiGUYYuQwQ_9vMUn1AYdCDAYdLntHqldudPuJa-aXbD-d6MdgoDHJmQ3uRS5gmIvwDbhX-hDxOeXm432m2G07n4hwAe9RsjkXrx7isHF5CcH-an_5neI01TWGXRoBpGKluSunCjyq_abb7asxjVu8Ve4zdXdF1euN-E2l3dvq0xHVR4qSCIqOJHeg_1o63GhJx9OBw_LC2-tvPrWqgs3rK7ecHLhhpOrN5xeuOH06g0zK_YJfW0rj2dN-FmbPpo19jq8bdwKvzu76p7pPx87rpuvBn3oT1X_cV_1R22C58PzGHgRAy9jYClpWk4wpqbB8xh4EQMvY-CRsSNajenZWzqhdSckLIe-Z2M6jWkWDTPNomGmWTTMNIuGuWbNY5r1KUY3DTO6aZjRTcOMbhrmdC9idH-O0U3DjG4aZnTTMKObhjndyxjdcsqyPJ6hU7blVJob_lP25VSacy6Ptgcpvdh_-BsAAP__m1K8ow==
+https://cockroachdb.github.io/distsqlplan/decode.html?eJzUlc-K2zAQh-99imVOu6BCJDtNYyj42O1htyy9FR-00TQxJJYrydBlybsXx4XUTjqzQj0kR__5RjPfDzSv0FiDD3qHHorvIEGAAgEZCMhBwBwqAa2zK_Teuv6XAbg3v6CYCaibtgv960rAyjqE4hVCHbYIBXzTz1t8Qm3QgQCDQdfbwyGtq3favZRNtwvW_-y0Q6j2AmwX_lQ7Fnl-udlovxkXKBVU-0qAD3qNUMi9-O9dBRfZkhy1pP7Z0rFO11hn0KEZVap6kvvlzFyftd98sXUzHWuLP8Jtqe4-uXq9CbelvAMBj10obkopynwy5XGCLGGCM-092Pe2nQ569uB8dLC8vDTl1aepLk-qunqp2eVJza5ean55UvOrl8psyCf0rW08vum2nvXto1njoMPbzq3wq7OrwzHD4-OBO1ycBn0Yvqrh4b4ZPvUNvh2ep8CLFHiZAktJ0zLCmIqD5ynwIgVepsATYye0mtKzv-mM1p2RsBz7nk3pPCUsGmbComEmLBpmwqJhLqx5SlgfUnTTMKObhhndNMzopmFO9yJF98cU3TTM6KZhRjcNM7ppmNO9TNEtY5bl6R0asy1jae7yj9mXsTTnXJ5sD1J6tX_3OwAA___3Q6o9
 
 # Save the result of the following statement to a label.
 query IT rowsort label-sq-str
@@ -143,26 +143,26 @@ SELECT x, str FROM NumToSquare JOIN NumToStr ON y = xsquared
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT x, str FROM NumToSquare JOIN NumToStr ON x = y WHERE x % 2 = 0
 ----
-render          0  render  ·               ·                    (x, str)                                 x!=NULL; key(x)
- │              0  ·       render 0        test.numtosquare.x   ·                                        ·
- │              0  ·       render 1        test.numtostr.str    ·                                        ·
- └── join       1  join    ·               ·                    (x, xsquared[omitted], y[omitted], str)  x=y; x!=NULL; key(x)
-      │         1  ·       type            inner                ·                                        ·
-      │         1  ·       equality        (x) = (y)            ·                                        ·
-      │         1  ·       mergeJoinOrder  +"(x=y)"             ·                                        ·
-      ├── scan  2  scan    ·               ·                    (x, xsquared[omitted])                   x!=NULL; key(x); +x
-      │         2  ·       table           numtosquare@primary  ·                                        ·
-      │         2  ·       spans           ALL                  ·                                        ·
-      │         2  ·       filter          (x % 2) = 0          ·                                        ·
-      └── scan  2  scan    ·               ·                    (y, str)                                 y!=NULL; key(y); +y
-·               2  ·       table           numtostr@primary     ·                                        ·
-·               2  ·       spans           ALL                  ·                                        ·
-·               2  ·       filter          (y % 2) = 0          ·                                        ·
+render          0  render  ·               ·                          (x, str)                                 x!=NULL; key(x)
+ │              0  ·       render 0        test.public.numtosquare.x  ·                                        ·
+ │              0  ·       render 1        test.public.numtostr.str   ·                                        ·
+ └── join       1  join    ·               ·                          (x, xsquared[omitted], y[omitted], str)  x=y; x!=NULL; key(x)
+      │         1  ·       type            inner                      ·                                        ·
+      │         1  ·       equality        (x) = (y)                  ·                                        ·
+      │         1  ·       mergeJoinOrder  +"(x=y)"                   ·                                        ·
+      ├── scan  2  scan    ·               ·                          (x, xsquared[omitted])                   x!=NULL; key(x); +x
+      │         2  ·       table           numtosquare@primary        ·                                        ·
+      │         2  ·       spans           ALL                        ·                                        ·
+      │         2  ·       filter          (x % 2) = 0                ·                                        ·
+      └── scan  2  scan    ·               ·                          (y, str)                                 y!=NULL; key(y); +y
+·               2  ·       table           numtostr@primary           ·                                        ·
+·               2  ·       spans           ALL                        ·                                        ·
+·               2  ·       filter          (y % 2) = 0                ·                                        ·
 
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, str FROM NumToSquare JOIN NumToStr ON x = y WHERE x % 2 = 0]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzclkFr2zAUx-_7FObBoKUaWLKzLIKCT4MMlo7S2_DBjd8Sg2N5kgwrJd992NpI42RShHaJb3asn5_e72_08gqNKHFV7FAB_w4UCDAgkACBFAjMICfQSrFGpYTslxhgWf4CHhOomrbT_c85gbWQCPwVdKVrBA5PxXONj1iUKIFAibqo6qFIK6tdIV-ypttpoX52hUQg8LmqNUoe3WQ0eh8xzvly9XQb3UexuQQCD53mUUYh3xMQnf5T-lDx-SXaFmp7XG1YnxNQutggcLon_70FLb32TzIW1AL7ZwuH93SNkCVKLI_elPfk3yXnFkBG70ytsYqvKDf4RVTNWEWNP_RNRu9u72W12ZrLt70mo14PfSQBfZzZ4Up8EO243bOF06PC9Pq_ATqRb4BdfxRsIlEk1x9FMpEo0uuPIp1IFI7_C4-oWtEovGgKxX0HWG7QSFGik2v8JsV6KGNuHwZuOOBLVNo8ZeZm2ZhH_QYvh2ch8DwEXoTAlNpp6mGM-cGzEHgeAi9C4JGxE5qN6fgtndh1J1aYHvuOx3QaEpYddoRlhx1h2WFHWHbYFdYsJKyPIbrtsEO3HXbotsMO3XbYpXseovtTiG477NBthx267bBDtx126V6E6KY-w_L0DPWZlr606_D3mZe-tMs5PZkeVun5_t3vAAAA__8hZ_Il
+https://cockroachdb.github.io/distsqlplan/decode.html?eJzclVFr2zAQx9_3KczBoKUaWLazLIKCnwYZLB2lb8MPbnxLDI7lSTKslHz3YWsji5OdYtSX-C2O9fPd_f6ge4VaFrjKd6hBfAcODCJgEAODBBjMIGPQKLlGraXqjlhgWfwCETIo66Y13d8Zg7VUCOIVTGkqBAFP-XOFj5gXqIBBgSYvq75Io8pdrl7Sut0ZqX-2uUJg8LmsDCoR3KQ8eB9EQojl6uk2uA9C-xMYPLRGBCmHbM9AtuZP6UPF55dgm-vtcbX-fMZAm3yDIPievfkIRl3Sv0_X0X-7PnynraUqUGFx9KWsI_8eOXcAUn5naw2n_4pqg19kWQ-nr_CHuUn53e29Kjdb-_MQD0vjwayHOWKPOc50uJIfZDMc92zh5Kgwv8rY-URij67SfjQR-_FV2o8nYj-5SvvJROw71v0j6kbWGi_aKGE3ARYbtFK0bNUavym57svYx4ee62_uArWxbyP7sKztq67By-GZDzz3gRc-MOc0zUcYi8bBMx947gMvfOCBsRM6GtLhv3RM645JmB_7Dod04hMWDTvComFHWDTsCIuGXWHNfML66KObhh26adihm4YdumnYpXvuo_uTj24aduimYYduGnbopmGX7oWPbj5mWZ7eoWO25VjadfmP2ZdjaZdzfrI9SOnZ_t3vAAAA__8YBOLQ
 
 # Save the result of the following statement to a label.
 query IT rowsort label-sq-2-str
@@ -193,7 +193,7 @@ SELECT SUM(y) FROM NumToStr
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT COUNT(*) FROM NumToStr]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzElE1r4zAQhu_7K5b3lAUdItvJZn3K0lMOjUs-6KGYoFqDMSSWkWRoCf7vxfYhjUnklqT4KMnPPPPKYo7IlaSlOJBB-AIOBg8MPhgCMEwQMxRaJWSM0vUnLbCQbwjHDFlelLbejhkSpQnhETaze0KIjXjd04qEJA0GSVZk-0ZS6Owg9Ps8Lw9WGVufRqUNfyOuGFRpTyWNFSkh5BX7uvZ_mmpKhVUd60O0XW52q-h5Pfpz1eRdNZ0EZa60JE3yrH5cfaOX9fZxt1huRnN-vRX_rBU-zF33aO94194wAXu0dwzoDxOwR3vHgMEwAXu0PzQOLphWZAqVG-qMhcuVx_W4IJlSO1uMKnVCT1oljaZdRg3XbEgytj3l7WKRt0d1g59h7oS9M5h3Yc9t7lH7Tjpww8EtfU-c8NRtnt5i_uuEZ27z7BbzP_e_Gvc8E_cj67rj6tdHAAAA__84_rTI
+https://cockroachdb.github.io/distsqlplan/decode.html?eJzElD9r8zAQh_f3U7zclIKGyHbS1FNKpwy1S_7QoZigWocxJDojydAS_N2L7SGNSeSWpHiU5Oee-8niDqBIYiT2aCB8Aw4MPGDgA4MAGEwgYVBoStEY0vUnLbCQHxCOGeSqKG29nTBISSOEB7C53SGEsBbvO1yikKiBgUQr8l0jKXS-F_pzrsq9JWPr07i04f-IFEJSMaDSHssaKzKEkFfs5-rHLNOYCUsd81O8idbbZfy6Gt1dNHkXTUdBqUhL1ChP6ifVL3pZbZ63i2g9mvPLrfgnrfDh7rtHfcP79oYL2aO-YUh_uJA96huGDIYL2aP-o_FwxrREU5Ay2BkT5yuP6_GBMsN21hgqdYovmtJG0y7jhms2JBrbnvJ2sVDtUd3gd5g7Ye8E5l3Yc5t71L6TDtxwcE3fEyc8dZun15jvnfDMbZ5dY35w_6txzzNxP7KuO6n-fQUAAP__1iC8mA==
 
 query I
 SELECT COUNT(*) FROM NumToStr
@@ -204,7 +204,7 @@ SELECT COUNT(*) FROM NumToStr
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT COUNT(*) FROM NumToStr WHERE str LIKE '%five%']
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzMlM-Lm0AUx-_9K-RBSApziD-SpnNKKW2RtlqMoYdFguu8FcE4MjMuuwT_90U9ZCPJuEuy4NF5fufz4b3hHaDgDL14jxLoHZhAwAICNhBwgMACIgKl4AlKyUXzSxdw2RPQOYGsKCvVHEcEEi4Q6AFUpnIECmF8n2OAMUMBBBiqOMtbSCmyfSye10W1V1yqpvozyxUKaqwt44_7-4cxnTxkjziZUko3YeB6v4CAXylqQFQT4JU6YqWKUwRq1uTtat_SVGAaK94z--5vvXAX-P83s88XSdZF0hFQFVwwFMhO7o_qd7hstn93rhfO1uZlFftExRzvPAbUbjgPa7xNGFC7YRPs8TZhQO2GTXDG24QBtQ9aT2dIAcqSFxJ7a-r8zfNmfSFLsdt1klciwX-CJy2m-_TbXHvAUKquanYfbtGVGsHXYVMbtk7CZj9s6ckDaFubdvRh5xrvhTa81JOX15C_aMMrPXl1DfmrflbzgWeif2R9dlR_egkAAP__3ivlzg==
+https://cockroachdb.github.io/distsqlplan/decode.html?eJzMlM-Lm0AUx-_9K-RBSApziD-SpnNKKW2RtlqMoYdFguu8FcE4MjMuuwT_90U9ZCPJuEuy4NF5fufz4b3hHaDgDL14jxLoHZhAwAICNhBwgMACIgKl4AlKyUXzSxdw2RPQOYGsKCvVHEcEEi4Q6AFUpnIECmF8n2OAMUMBBBiqOMtbSCmyfSye10W1V1yqpvozyxUKaqwt44_7-4cxnTxkjziZUko3YeB6v4CAXylqeLxAiGoCvFJHtFRxikDNmrxd71uaCkxjxXt23_2tF-4C__9m9vkiybpIOgKqgguGAtnJ_VH9DpfN9u_O9cLZ2rysYp-omOOeyYDeDWdijbsRA3o3bIQ97kYM6N2wEc64GzGg90Hr6gwpQFnyQmJvbZ2_ed6sM2QpdrtP8kok-E_wpMV0n36baw8YStVVze7DLbpSI_g6bGrD1knY7IctPXkAbWvTjj7sXOO90IaXevLyGvIXbXilJ6-uIX_Vz2o-8Ez0j6zPjupPLwEAAP__-mDtng==
 
 # Result calculated here: https://play.golang.org/p/e-YsJRDsXF
 query I
@@ -220,12 +220,18 @@ SELECT COUNT(*) FROM NumToStr WHERE str LIKE '%five%'
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT y FROM NumToStr LIMIT 5]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzEk7tq60AQhvvzFOav94B1S7GVW0Owg0kXVGy0g1mQdsReIMHo3YNWhSPjxAQVKmdG3_wfYvYCy5oOqiMP-YYMAjkECgiUEKhQC_SOG_Ke3fjJBOz1B-RWwNg-hrFdCzTsCPKCYEJLkHhV7y2dSGlyENAUlGlTSO9Mp9znzsYusA_j9BiD3OzG9GfTmbCpUA8CHMN1vQ_qTJDZIH5QuCZHy06TIz3LrYc7kgf-z_1c75FBPjPI1v8J-foKxfoK5foKDx7EiXzP1tPNVd7fvB2vlfSZptP2HF1DL46bFDOVx8SlhiYfpmk2FXubRknwO5z9Cj_N4O0tnC9JLpbA5RK4-hNcD_--AgAA__9hcK3z
+https://cockroachdb.github.io/distsqlplan/decode.html?eJyMjzFrAzEMhff-ivBmD7mhi6esgdKU0K14cM8iGO6sQ5KhJfi_l7OH0qGQ8b0nfU-6o3Ci17iSwn9gQnDYhGdSZdmtMXBOX_BHh1y2arsdHGYWgr_Dsi0Ej_f4udCVYiKBQyKLeenQTfIa5ftU6mqstqeXav5wmuDwktdsh2eE5sDVfvFq8UbwU3OPn3Al3bgo_en_j3xswYHSjcabylVmehOee82Ql77XjURqI52GOJcRtdCefgIAAP__lz9sqw==
 
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT y FROM NumToStr ORDER BY y LIMIT 5]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzEkz9r8zAQxvf3U4RnfVWw_KeDJq-BkpTQrXhQrSMIbJ-RZGgJ_u7F8pC6NA3Fg0fd3e-eH-Z8QceGDrolD_UKCYEUAhkEcggUqAR6xzV5z24amYG9eYdKBGzXD2EqVwI1O4K6INjQEBRe9FtDJ9KGHAQMBW2bGNI722r3UXZDG9iHqXscgtqVU_qTbW3YFahGAR7Cdb0P-kxQchQ3FK7J7Aw5MsvUUv5HNf7geeAH7pez9yTShYTc_juk2ytk2yvk2yvc-SdO5HvuPC3yb21Opmslc6b5uj0PrqZnx3WMmZ_HyMWCIR_mrpwf-y62ouBXWP4KPy7g5DucrknO1sD5Grj4E1yN_z4DAAD__zIVrfA=
+https://cockroachdb.github.io/distsqlplan/decode.html?eJyMjzFrAzEMhff-ivBmD7mhi6esgdKU0K14cM8iGO6sQ5KhJfi_l7OH0qGQ8b0nfU-6o3Ci17iSwn9gQnDYhGdSZdmtMXBOX_BHh1y2arsdHGYWgr_Dsi0Ej_f4udCVYiKBQyKLeenQTfIa5ftU6mqstqeXav5wmuDwktdsh2eE5sDVfvFq8UbwU3OPn3Al3bgo_en_j3xswYHSjcabylVmehOee82Ql77XjURqI52GOJcRtdCefgIAAP__lz9sqw==
+
+# Test that the correct node is chosen in a reverse scan with multiple spans.
+query T
+SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT y FROM NumToStr WHERE y < 1000 OR y > 9000 ORDER BY y DESC LIMIT 5]
+----
+https://cockroachdb.github.io/distsqlplan/decode.html?eJyMkLFqMzEQhPv_KczU-uHO4EaVW0Owg0kXrlBOixHcaYV2BQnm3j3oVMQOxEm5O_uNZnRFZE9HN5PAvqKHwQ6DQco8kgjnum5HB_8O2xmEmIrW9WAwcibYKzToRLA48n9OMPCkLkzr0WLARb8QUXch2O1ibmz7x7Yv7m2iMzlP-c4cKYfZ5Y99LLOyaFVPRe1mX4s8hTnoZoefIvR3EX5pdiZJHIX-VK5bBgPyF2q_J1zySM-Zx_WZNp5Wbl14Em3qtg2H2KQa8BbuH8LdN3hY_n0GAAD__0cMnlY=
 
 query I
 SELECT y FROM NumToStr ORDER BY y LIMIT 5
@@ -235,6 +241,15 @@ SELECT y FROM NumToStr ORDER BY y LIMIT 5
 3
 4
 5
+
+query I
+SELECT y FROM NumToStr WHERE y < 1000 OR y > 9000 ORDER BY y DESC LIMIT 5
+----
+10000
+9999
+9998
+9997
+9996
 
 query I
 SELECT y FROM NumToStr ORDER BY y OFFSET 5 LIMIT 2
@@ -276,15 +291,15 @@ SELECT y, str, REPEAT('test', y) FROM NumToStr ORDER BY str LIMIT 10
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT x FROM (SELECT x, 2*x, x+1 FROM NumToSquare)
 ----
-render          0  render  ·         ·                    (x)                                      x!=NULL; key(x)
- │              0  ·       render 0  x                    ·                                        ·
- └── render     1  render  ·         ·                    (x, "2 * x"[omitted], "x + 1"[omitted])  x!=NULL; key(x)
-      │         1  ·       render 0  test.numtosquare.x   ·                                        ·
-      │         1  ·       render 1  NULL                 ·                                        ·
-      │         1  ·       render 2  NULL                 ·                                        ·
-      └── scan  2  scan    ·         ·                    (x, xsquared[omitted])                   x!=NULL; key(x)
-·               2  ·       table     numtosquare@primary  ·                                        ·
-·               2  ·       spans     ALL                  ·                                        ·
+render          0  render  ·         ·                          (x)                                      x!=NULL; key(x)
+ │              0  ·       render 0  x                          ·                                        ·
+ └── render     1  render  ·         ·                          (x, "2 * x"[omitted], "x + 1"[omitted])  x!=NULL; key(x)
+      │         1  ·       render 0  test.public.numtosquare.x  ·                                        ·
+      │         1  ·       render 1  NULL                       ·                                        ·
+      │         1  ·       render 2  NULL                       ·                                        ·
+      └── scan  2  scan    ·         ·                          (x, xsquared[omitted])                   x!=NULL; key(x)
+·               2  ·       table     numtosquare@primary        ·                                        ·
+·               2  ·       spans     ALL                        ·                                        ·
 
 # Verifies that unused renders don't cause us to do rendering instead of a
 # simple projection.
@@ -297,7 +312,7 @@ https://cockroachdb.github.io/distsqlplan/decode.html?eJyMj7FqAzEQRPt8RZhaha9V5d
 query T
 SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT COUNT(*) FROM (SELECT 1 AS one FROM NumToSquare WHERE x > 10 ORDER BY xsquared LIMIT 10)]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkUFLxDAQhe_-iuWdFHPYdG85rXhakK3srniQIrEZSqBtajIBZel_lzaIWmhxj_Mm3_sCc0brDO11QwHqBRKFQOddSSE4P0Tpwc58QK0FbNtFHuJCoHSeoM5gyzVB4aTfajqQNuQhYIi1rcfSzttG-89tGxt24T1qTxDII6vVNkPRC7jIP72BdUVQshf_dx-d56l2K2-_NRB4sI3llVzP-rJLfHdV5anS7CbO-_xpf3o95M_H65tZ0-YS04FC59pAfzxzzeu-ECBTUbpccNGX9OhdOWrSmI_cGBgKnLYyDbs2rYYP_oblIpwtw9kivJnARX_1FQAA___U0tm5
+https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkcFKxDAQhu8-xTInxRw23VtOK54WpJXuigcpEpuhBNpMTSagLH13aYOohRb3OP_k-7_AnMGRwVx3GEC9gIRKQO-pxhDIj1F6cDAfoLYCrOsjj3EloCaPoM7AllsEBSf91mKJ2qAHAQZZ23Yq7b3ttP_cu9gxhfeoPYKAIrLa7DOoBgEU-ac3sG4QlBzE_91H8jzX7uXttyYnNyofbGd5I7eLzuwS513TeGw008x7Xzzlp9eyeD5e3yyadpeYSgw9uYB_PEvN26ESgKbBdL1A0df46KmeNGksJm4KDAZOW5mGg0ur8YO_YbkKZ-twtgrvZnA1XH0FAAD__6aQ20k=
 
 query I
 SELECT COUNT(*) FROM (SELECT 1 AS one FROM NumToSquare WHERE x > 10 ORDER BY xsquared LIMIT 10)

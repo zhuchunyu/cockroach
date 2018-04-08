@@ -20,6 +20,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -28,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -38,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 var (
@@ -70,93 +70,121 @@ var _ base.ModuleTestingKnobs = &MigrationManagerTestingKnobs{}
 // as completed, causing a second run.
 var backwardCompatibleMigrations = []migrationDescriptor{
 	{
-		name:   "default UniqueID to uuid_v4 in system.eventlog",
-		workFn: eventlogUniqueIDDefault,
+		// Introduced in v1.0. Baked into v2.0.
+		name: "default UniqueID to uuid_v4 in system.eventlog",
 	},
 	{
-		name:             "create system.jobs table",
-		workFn:           createJobsTable,
-		newDescriptorIDs: []sqlbase.ID{keys.JobsTableID},
+		// Introduced in v1.0. Baked into v2.0.
+		name: "create system.jobs table",
 	},
 	{
-		name:             "create system.settings table",
-		workFn:           createSettingsTable,
-		newDescriptorIDs: []sqlbase.ID{keys.SettingsTableID},
+		// Introduced in v1.0. Baked into v2.0.
+		name: "create system.settings table",
 	},
 	{
+		// Introduced in v1.0. Permanent migration.
 		name:   "enable diagnostics reporting",
 		workFn: optInToDiagnosticsStatReporting,
 	},
 	{
-		name:   "establish conservative dependencies for views #17280 #17269 #17306",
-		workFn: repopulateViewDeps,
+		// Introduced in v1.1. Baked into v2.0.
+		name: "establish conservative dependencies for views #17280 #17269 #17306",
 	},
 	{
-		name:             "create system.sessions table",
-		workFn:           createWebSessionsTable,
-		newDescriptorIDs: []sqlbase.ID{keys.WebSessionsTableID},
+		// Introduced in v1.1. Baked into v2.0.
+		name: "create system.sessions table",
 	},
 	{
+		// Introduced in v1.1. Permanent migration.
 		name:   "populate initial version cluster setting table entry",
 		workFn: populateVersionSetting,
 	},
 	{
+		// Introduced in v1.1. Permanent migration.
 		name:   "persist trace.debug.enable = 'false'",
 		workFn: disableNetTrace,
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:             "create system.table_statistics table",
 		workFn:           createTableStatisticsTable,
 		newDescriptorIDs: []sqlbase.ID{keys.TableStatisticsTableID},
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:   "add root user",
 		workFn: addRootUser,
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:             "create system.locations table",
 		workFn:           createLocationsTable,
 		newDescriptorIDs: []sqlbase.ID{keys.LocationsTableID},
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:   "add default .meta and .liveness zone configs",
 		workFn: addDefaultMetaAndLivenessZoneConfigs,
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:             "create system.role_members table",
 		workFn:           createRoleMembersTable,
 		newDescriptorIDs: []sqlbase.ID{keys.RoleMembersTableID},
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:         "add system.users isRole column and create admin role",
 		workFn:       addRoles,
 		doesBackfill: true,
 	},
 	{
-		// We keep this a separate migration as we don't want to re-run addRoles
-		// if this part fails.
-		name:   "grant superuser privileges on all objects to the admin role",
-		workFn: grantAdminPrivileges,
+		// Introduced in v2.0, replaced by "ensure admin role privileges in all descriptors"
+		name: "grant superuser privileges on all objects to the admin role",
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:   "make root a member of the admin role",
 		workFn: addRootToAdminRole,
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:   "upgrade table descs to interleaved format version",
 		workFn: upgradeTableDescsToInterleavedFormatVersion,
 	},
 	{
-		name:   "remove cluster setting `kv.gc.batch_size`",
-		workFn: purgeClusterSettingKVGCBatchSize,
+		// Introduced in v2.0 alphas then folded into `retiredSettings`.
+		name: "remove cluster setting `kv.gc.batch_size`",
 	},
 	{
-		name:   "remove cluster setting `kv.transaction.max_intents`",
-		workFn: purgeClusterSettingKVTransactionMaxIntents,
+		// Introduced in v2.0 alphas then folded into `retiredSettings`.
+		name: "remove cluster setting `kv.transaction.max_intents`",
 	},
 	{
+		// Introduced in v2.0.
+		// TODO(benesch): bake this migration into v2.1.
 		name:   "add default system.jobs zone config",
 		workFn: addDefaultSystemJobsZoneConfig,
+	},
+	{
+		// Introduced in v2.0.
+		name:   "initialize cluster.secret",
+		workFn: initializeClusterSecret,
+	},
+	{
+		// Introduced in v2.0.
+		// TODO(mberhault): bake this migration into v2.1, but create a new migration
+		// with the same function to catch any tables written in a mixed-version setting.
+		name:   "ensure admin role privileges in all descriptors",
+		workFn: ensureMaxPrivileges,
 	},
 }
 
@@ -177,6 +205,18 @@ type migrationDescriptor struct {
 	newDescriptorIDs sqlbase.IDs
 }
 
+func init() {
+	// Ensure that all migrations have unique names.
+	names := make(map[string]struct{}, len(backwardCompatibleMigrations))
+	for _, migration := range backwardCompatibleMigrations {
+		name := migration.name
+		if _, ok := names[name]; ok {
+			log.Fatalf(context.Background(), "duplicate sql migration %q", name)
+		}
+		names[name] = struct{}{}
+	}
+}
+
 type runner struct {
 	db          db
 	sqlExecutor *sql.Executor
@@ -185,7 +225,7 @@ type runner struct {
 
 func (r *runner) newRootSession(ctx context.Context) *sql.Session {
 	args := sql.SessionArgs{User: security.NodeUser}
-	s := sql.NewSession(ctx, args, r.sqlExecutor, nil /* remote */, r.memMetrics, nil /* conn */)
+	s := sql.NewSession(ctx, args, r.sqlExecutor, r.memMetrics, nil /* conn */)
 	s.StartUnlimitedMonitor()
 	return s
 }
@@ -280,6 +320,10 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 	}
 	allMigrationsCompleted := true
 	for _, migration := range backwardCompatibleMigrations {
+		if migration.workFn == nil {
+			// Migration has been baked in. Ignore it.
+			continue
+		}
 		if m.testingKnobs.DisableBackfillMigrations && migration.doesBackfill {
 			log.Infof(ctx, "ignoring migrations after (and including) %s due to testing knob",
 				migration.name)
@@ -369,6 +413,11 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 		memMetrics:  m.memMetrics,
 	}
 	for _, migration := range backwardCompatibleMigrations {
+		if migration.workFn == nil {
+			// Migration has been baked in. Ignore it.
+			continue
+		}
+
 		key := migrationKey(migration)
 		if _, ok := completedMigrations[string(key)]; ok {
 			continue
@@ -416,41 +465,6 @@ func getCompletedMigrations(ctx context.Context, db db) (map[string]struct{}, er
 
 func migrationKey(migration migrationDescriptor) roachpb.Key {
 	return append(keys.MigrationPrefix, roachpb.RKey(migration.name)...)
-}
-
-func eventlogUniqueIDDefault(ctx context.Context, r runner) error {
-	const alterStmt = `ALTER TABLE system.eventlog ALTER COLUMN "uniqueID" SET DEFAULT uuid_v4()`
-
-	// System tables can only be modified by a privileged internal user.
-	session := r.newRootSession(ctx)
-	defer session.Finish(r.sqlExecutor)
-
-	// Retry a limited number of times because returning an error and letting
-	// the node kill itself is better than holding the migration lease for an
-	// arbitrarily long time.
-	var err error
-	for retry := retry.Start(retry.Options{MaxRetries: 5}); retry.Next(); {
-		var res sql.StatementResults
-		res, err = r.sqlExecutor.ExecuteStatementsBuffered(session, alterStmt, nil /* pinfo */, 1 /* expectedNumResults */)
-		if err == nil {
-			res.Close(ctx)
-			break
-		}
-		log.Warningf(ctx, "failed attempt to update system.eventlog schema: %s", err)
-	}
-	return err
-}
-
-func createJobsTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.JobsTable)
-}
-
-func createSettingsTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.SettingsTable)
-}
-
-func createWebSessionsTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.WebSessionsTable)
 }
 
 func createTableStatisticsTable(ctx context.Context, r runner) error {
@@ -509,6 +523,15 @@ func runStmtAsRootWithRetry(ctx context.Context, r runner, stmt string) error {
 	return err
 }
 
+// SettingsDefaultOverrides documents the effect of several migrations that add
+// an explicit value for a setting, effectively changing the "default value"
+// from what was defined in code.
+var SettingsDefaultOverrides = map[string]string{
+	"diagnostics.reporting.enabled": "true",
+	"trace.debug.enable":            "false",
+	"cluster.secret":                "<random>",
+}
+
 func optInToDiagnosticsStatReporting(ctx context.Context, r runner) error {
 	// We're opting-out of the automatic opt-in. See discussion in updates.go.
 	if reportingOptOut {
@@ -519,6 +542,10 @@ func optInToDiagnosticsStatReporting(ctx context.Context, r runner) error {
 
 func disableNetTrace(ctx context.Context, r runner) error {
 	return runStmtAsRootWithRetry(ctx, r, `SET CLUSTER SETTING trace.debug.enable = false`)
+}
+
+func initializeClusterSecret(ctx context.Context, r runner) error {
+	return runStmtAsRootWithRetry(ctx, r, `SET CLUSTER SETTING cluster.secret = gen_random_uuid()::STRING`)
 }
 
 func populateVersionSetting(ctx context.Context, r runner) error {
@@ -570,15 +597,6 @@ func populateVersionSetting(ctx context.Context, r runner) error {
 		return err
 	}
 	return nil
-}
-
-// repopulateViewDeps recomputes the dependencies of all views, as
-// they might not have been computed properly previously.
-// (#17269 #17306)
-func repopulateViewDeps(ctx context.Context, r runner) error {
-	return r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		return sql.RecomputeViewDependencies(ctx, txn, r.sqlExecutor)
-	})
 }
 
 func addRootUser(ctx context.Context, r runner) error {
@@ -774,65 +792,6 @@ func addRoles(ctx context.Context, r runner) error {
 	return err
 }
 
-func grantAdminPrivileges(ctx context.Context, r runner) error {
-	// System tables can only be modified by a privileged internal user.
-	session := r.newRootSession(ctx)
-	defer session.Finish(r.sqlExecutor)
-
-	// Give the admin role permissions on all databases and tables.
-	err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		descriptors, descErr := sql.GetAllDescriptors(ctx, txn)
-		if descErr != nil {
-			return descErr
-		}
-
-		for _, desc := range descriptors {
-			// Lookup desired privileges:
-			var desiredPrivs privilege.List
-
-			descID := desc.GetID()
-			if sqlbase.IsReservedID(descID) {
-				// System databases and tables have custom maximum allowed privileges.
-				systemPrivs, ok := sqlbase.SystemAllowedPrivileges[descID]
-				if !ok || len(systemPrivs) == 0 {
-					return fmt.Errorf("no allowed privileges found for system object with ID=%d", descID)
-				}
-				desiredPrivs = systemPrivs[0]
-			} else {
-				// Non-system object: fall back on default superuser privileges.
-				desiredPrivs = sqlbase.DefaultSuperuserPrivileges
-			}
-
-			// Grant privileges to the admin role.
-			desc.GetPrivileges().Grant(sqlbase.AdminRole, desiredPrivs)
-
-			// Validate descriptors.
-			switch d := desc.(type) {
-			case *sqlbase.DatabaseDescriptor:
-				if err := d.Validate(); err != nil {
-					return err
-				}
-			case *sqlbase.TableDescriptor:
-				if err := d.Validate(ctx, txn); err != nil {
-					return err
-				}
-			}
-		}
-
-		// Now update the descriptors transactionally.
-		b := txn.NewBatch()
-		for _, descriptor := range descriptors {
-			descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
-			b.Put(descKey, sqlbase.WrapDescriptor(descriptor))
-		}
-		if err := txn.SetSystemConfigTrigger(); err != nil {
-			return err
-		}
-		return txn.Run(ctx, b)
-	})
-	return err
-}
-
 func addRootToAdminRole(ctx context.Context, r runner) error {
 	// System tables can only be modified by a privileged internal user.
 	session := r.newRootSession(ctx)
@@ -858,8 +817,6 @@ func addRootToAdminRole(ctx context.Context, r runner) error {
 	return err
 }
 
-var upgradeTableDescBatchSize int64 = 50
-
 // upgradeTableDescsToInterleavedFormatVersion ensures that the upgrade to
 // InterleavedFormatVersion is persisted to disk for all table descriptors. It
 // must otherwise be performed on-the-fly whenever a table descriptor is loaded.
@@ -869,6 +826,39 @@ var upgradeTableDescBatchSize int64 = 50
 //
 // TODO(benesch): Remove this migration in v2.1.
 func upgradeTableDescsToInterleavedFormatVersion(ctx context.Context, r runner) error {
+	tableDescFn := func(desc *sqlbase.TableDescriptor) (bool, error) {
+		return desc.MaybeFillInDescriptor(), nil
+	}
+	return upgradeDescsWithFn(ctx, r, tableDescFn, nil)
+}
+
+// ensureMaxPrivileges ensures that all descriptors have privileges
+// for the admin role, and that root and user privileges do not exceed
+// the allowed privileges.
+//
+// TODO(mberhault): Remove this migration in v2.1.
+func ensureMaxPrivileges(ctx context.Context, r runner) error {
+	tableDescFn := func(desc *sqlbase.TableDescriptor) (bool, error) {
+		return desc.Privileges.MaybeFixPrivileges(desc.ID), nil
+	}
+	databaseDescFn := func(desc *sqlbase.DatabaseDescriptor) (bool, error) {
+		return desc.Privileges.MaybeFixPrivileges(desc.ID), nil
+	}
+	return upgradeDescsWithFn(ctx, r, tableDescFn, databaseDescFn)
+}
+
+var upgradeDescBatchSize int64 = 50
+
+// upgradeTableDescsWithFn runs the provided upgrade functions on each table
+// and database descriptor, persisting any upgrades if the function indicates that the
+// descriptor was changed.
+// Upgrade functions may be nil to perform nothing for the corresponding descriptor type.
+func upgradeDescsWithFn(
+	ctx context.Context,
+	r runner,
+	upgradeTableDescFn func(desc *sqlbase.TableDescriptor) (upgraded bool, err error),
+	upgradeDatabaseDescFn func(desc *sqlbase.DatabaseDescriptor) (upgraded bool, err error),
+) error {
 	session := r.newRootSession(ctx)
 	defer session.Finish(r.sqlExecutor)
 
@@ -882,7 +872,7 @@ func upgradeTableDescsToInterleavedFormatVersion(ctx context.Context, r runner) 
 		// descriptors using InterleavedFormatVersion. We need only upgrade the
 		// ancient table descriptors written by versions before beta-20161013.
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			kvs, err := txn.Scan(ctx, startKey, endKey, upgradeTableDescBatchSize)
+			kvs, err := txn.Scan(ctx, startKey, endKey, upgradeDescBatchSize)
 			if err != nil {
 				return err
 			}
@@ -898,25 +888,49 @@ func upgradeTableDescsToInterleavedFormatVersion(ctx context.Context, r runner) 
 				if err := kv.ValueProto(&sqlDesc); err != nil {
 					return err
 				}
-				if table := sqlDesc.GetTable(); table != nil {
-					if upgraded := table.MaybeUpgradeFormatVersion(); upgraded {
-						// Though SetUpVersion typically bails out if the table is being
-						// dropped, it's safe to ignore the DROP state here and
-						// unconditionally set UpVersion. For proof, see
-						// TestDropTableWhileUpgradingFormat.
-						//
-						// In fact, it's of the utmost importance that this migration
-						// upgrades every last old-format table descriptor, including those
-						// that are dropping. Otherwise, the user could upgrade to a version
-						// without support for reading the old format before the drop
-						// completes, leaving a broken table descriptor and the table's
-						// remaining data around forever. This isn't just a theoretical
-						// concern: consider that dropping a large table can take several
-						// days, while upgrading to a new version can take as little as a
-						// few minutes.
-						table.UpVersion = true
-						b.Put(kv.Key, sqlbase.WrapDescriptor(table))
+				switch t := sqlDesc.Union.(type) {
+				case *sqlbase.Descriptor_Table:
+					if table := sqlDesc.GetTable(); table != nil && upgradeTableDescFn != nil {
+						if upgraded, err := upgradeTableDescFn(table); err != nil {
+							return err
+						} else if upgraded {
+							// Though SetUpVersion typically bails out if the table is being
+							// dropped, it's safe to ignore the DROP state here and
+							// unconditionally set UpVersion. For proof, see
+							// TestDropTableWhileUpgradingFormat.
+							//
+							// In fact, it's of the utmost importance that this migration
+							// upgrades every last old-format table descriptor, including those
+							// that are dropping. Otherwise, the user could upgrade to a version
+							// without support for reading the old format before the drop
+							// completes, leaving a broken table descriptor and the table's
+							// remaining data around forever. This isn't just a theoretical
+							// concern: consider that dropping a large table can take several
+							// days, while upgrading to a new version can take as little as a
+							// few minutes.
+							table.UpVersion = true
+							if err := table.Validate(ctx, txn, nil); err != nil {
+								return err
+							}
+
+							b.Put(kv.Key, sqlbase.WrapDescriptor(table))
+						}
 					}
+				case *sqlbase.Descriptor_Database:
+					if database := sqlDesc.GetDatabase(); database != nil && upgradeDatabaseDescFn != nil {
+						if upgraded, err := upgradeDatabaseDescFn(database); err != nil {
+							return err
+						} else if upgraded {
+							if err := database.Validate(); err != nil {
+								return err
+							}
+
+							b.Put(kv.Key, sqlbase.WrapDescriptor(database))
+						}
+					}
+
+				default:
+					return errors.Errorf("Descriptor.Union has unexpected type %T", t)
 				}
 			}
 			if err := txn.SetSystemConfigTrigger(); err != nil {
@@ -928,16 +942,6 @@ func upgradeTableDescsToInterleavedFormatVersion(ctx context.Context, r runner) 
 		}
 	}
 	return nil
-}
-
-func purgeClusterSettingKVGCBatchSize(ctx context.Context, r runner) error {
-	// This cluster setting has been removed.
-	return runStmtAsRootWithRetry(ctx, r, `DELETE FROM SYSTEM.SETTINGS WHERE name='kv.gc.batch_size'`)
-}
-
-func purgeClusterSettingKVTransactionMaxIntents(ctx context.Context, r runner) error {
-	// This cluster setting has been removed.
-	return runStmtAsRootWithRetry(ctx, r, `DELETE FROM SYSTEM.SETTINGS WHERE name='kv.transaction.max_intents'`)
 }
 
 func addDefaultSystemJobsZoneConfig(ctx context.Context, r runner) error {

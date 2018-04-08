@@ -50,12 +50,13 @@ const rangeTableDisplayList: RangeTableRow[] = [
   { variable: "raftLeader", display: "Raft Leader", compareToLeader: true },
   { variable: "vote", display: "Vote", compareToLeader: false },
   { variable: "term", display: "Term", compareToLeader: true },
+  { variable: "leadTransferee", display: "Lead Transferee", compareToLeader: false },
   { variable: "applied", display: "Applied", compareToLeader: true },
   { variable: "commit", display: "Commit", compareToLeader: true },
   { variable: "lastIndex", display: "Last Index", compareToLeader: true },
   { variable: "logSize", display: "Log Size", compareToLeader: false },
   { variable: "leaseHolderQPS", display: "Lease Holder QPS", compareToLeader: false },
-  { variable: "keysWrittenPS", display: "Keys Written Per Second", compareToLeader: false },
+  { variable: "keysWrittenPS", display: "Average Keys Written Per Second", compareToLeader: false },
   { variable: "approxProposalQuota", display: "Approx Proposal Quota", compareToLeader: false },
   { variable: "pendingCommands", display: "Pending Commands", compareToLeader: false },
   { variable: "droppedCommands", display: "Dropped Commands", compareToLeader: false },
@@ -174,7 +175,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
   ): RangeTableCellContent {
     let results: string[] = [];
     if (problems.no_lease) {
-      results = _.concat(results, "No Lease");
+      results = _.concat(results, "Invalid Lease");
     }
     if (problems.leader_not_lease_holder) {
       results = _.concat(results, "Leader is Not Lease holder");
@@ -449,6 +450,10 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
         )),
         vote: this.contentIf(!dormant, () => this.createContent(vote.greaterThan(0) ? vote : "-")),
         term: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.hard_state.term))),
+        leadTransferee: this.contentIf(!dormant, () => {
+          const leadTransferee = FixLong(info.raft_state.lead_transferee);
+          return this.createContent(leadTransferee.greaterThan(0) ? leadTransferee : "-");
+        }),
         applied: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.applied))),
         commit: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.hard_state.commit))),
         lastIndex: this.createContent(FixLong(info.state.last_index)),

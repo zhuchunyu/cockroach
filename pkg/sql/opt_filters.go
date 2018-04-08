@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // This file contains the functions that perform filter propagation.
@@ -167,7 +168,7 @@ import (
 // case perhaps propagateFilter and propagateOrWrapFilter can merge,
 // but we are not there yet.
 func (p *planner) propagateFilters(
-	ctx context.Context, plan planNode, info *dataSourceInfo, extraFilter tree.TypedExpr,
+	ctx context.Context, plan planNode, info *sqlbase.DataSourceInfo, extraFilter tree.TypedExpr,
 ) (newPlan planNode, remainingFilter tree.TypedExpr, err error) {
 	remainingFilter = extraFilter
 	switch n := plan.(type) {
@@ -253,6 +254,11 @@ func (p *planner) propagateFilters(
 			return plan, extraFilter, err
 		}
 
+	case *spoolNode:
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
+			return plan, extraFilter, err
+		}
+
 	case *createTableNode:
 		if n.n.As() {
 			if n.sourcePlan, err = p.triggerFilterPropagation(ctx, n.sourcePlan); err != nil {
@@ -266,6 +272,11 @@ func (p *planner) propagateFilters(
 		}
 
 	case *insertNode:
+		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *upsertNode:
 		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
 			return plan, extraFilter, err
 		}
@@ -319,6 +330,7 @@ func (p *planner) propagateFilters(
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
 	case *cancelQueryNode:
+	case *cancelSessionNode:
 	case *scrubNode:
 	case *controlJobNode:
 	case *createDatabaseNode:
@@ -371,7 +383,7 @@ func (p *planner) triggerFilterPropagation(ctx context.Context, plan planNode) (
 // node, and creates a new filterNode if there is any remaining filter
 // after the propagation.
 func (p *planner) propagateOrWrapFilters(
-	ctx context.Context, plan planNode, info *dataSourceInfo, filter tree.TypedExpr,
+	ctx context.Context, plan planNode, info *sqlbase.DataSourceInfo, filter tree.TypedExpr,
 ) (planNode, error) {
 	newPlan, remainingFilter, err := p.propagateFilters(ctx, plan, info, filter)
 	if err != nil {
@@ -385,12 +397,12 @@ func (p *planner) propagateOrWrapFilters(
 
 	// Otherwise, wrap it using a new filterNode.
 	if info == nil {
-		info = newSourceInfoForSingleTable(anonymousTable, planColumns(newPlan))
+		info = sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, planColumns(newPlan))
 	}
 	f := &filterNode{
 		source: planDataSource{plan: newPlan, info: info},
 	}
-	f.ivarHelper = tree.MakeIndexedVarHelper(f, len(info.sourceColumns))
+	f.ivarHelper = tree.MakeIndexedVarHelper(f, len(info.SourceColumns))
 	f.filter = f.ivarHelper.Rebind(remainingFilter,
 		false /* helper is fresh, no reset needed */, false)
 	return f, nil
@@ -400,7 +412,7 @@ func (p *planner) propagateOrWrapFilters(
 // The part of the filter that depends only on GROUP BY expressions is
 // propagated to the source.
 func (p *planner) addGroupFilter(
-	ctx context.Context, g *groupNode, info *dataSourceInfo, extraFilter tree.TypedExpr,
+	ctx context.Context, g *groupNode, info *sqlbase.DataSourceInfo, extraFilter tree.TypedExpr,
 ) (planNode, tree.TypedExpr, error) {
 	// innerFilter is the passed-through filter on the source planNode.
 	var innerFilter tree.TypedExpr = tree.DBoolTrue
@@ -413,7 +425,7 @@ func (p *planner) addGroupFilter(
 		convFunc := func(v tree.VariableExpr) (bool, tree.Expr) {
 			if iv, ok := v.(*tree.IndexedVar); ok {
 				f := g.funcs[iv.Idx]
-				if f.identAggregate {
+				if f.isIdentAggregate() {
 					return true, &tree.IndexedVar{Idx: f.argRenderIdx}
 				}
 			}
@@ -549,7 +561,7 @@ func expandOnCond(n *joinNode, cond tree.TypedExpr, evalCtx *tree.EvalContext) t
 	if isFilterTrue(cond) || len(n.pred.leftEqualityIndices) == 0 {
 		return cond
 	}
-	numLeft := len(n.left.info.sourceColumns)
+	numLeft := len(n.left.info.SourceColumns)
 
 	// We can't use splitFilter directly because that function removes all the
 	// constraints we were able to use from the expression. We could use it
@@ -733,14 +745,14 @@ func (p *planner) addJoinFilter(
 	//  3. "Expand" the remaining ON condition with new constraints inferred based
 	//     on the equality columns (see expandOnCond).
 	//  4. Propagate the filter and ON condition depending on the join type.
-	numLeft := len(n.left.info.sourceColumns)
+	numLeft := len(n.left.info.SourceColumns)
 	extraFilter = n.pred.iVarHelper.Rebind(
 		extraFilter, true /* alsoReset */, false /* normalizeToNonNil */)
 
 	onAndExprs := splitAndExpr(p.EvalContext(), n.pred.onCond, nil /* exprs */)
 
 	// Step 1: for inner joins, incorporate the filter into the ON condition.
-	if n.joinType == joinTypeInner {
+	if n.joinType == sqlbase.InnerJoin {
 		// Split the filter into conjunctions and append them to onAndExprs.
 		onAndExprs = splitAndExpr(p.EvalContext(), extraFilter, onAndExprs)
 		extraFilter = nil
@@ -758,14 +770,14 @@ func (p *planner) addJoinFilter(
 	// Step 3: expand the ON condition, in the hope that new inferred
 	// constraints can be pushed down. This is not useful for FULL OUTER
 	// joins, where nothing can be pushed down.
-	if n.joinType != joinTypeFullOuter {
+	if n.joinType != sqlbase.FullOuterJoin {
 		onCond = expandOnCond(n, onCond, p.EvalContext())
 	}
 
 	// Step 4: propagate the filter and ON conditions as allowed by the join type.
 	var propagateLeft, propagateRight, filterRemainder tree.TypedExpr
 	switch n.joinType {
-	case joinTypeInner:
+	case sqlbase.InnerJoin:
 		// We transform:
 		//   SELECT * FROM
 		//          l JOIN r ON (onLeft AND onRight AND onCombined)
@@ -778,7 +790,7 @@ func (p *planner) addJoinFilter(
 		//          ON (onCombined AND filterCombined)
 		propagateLeft, propagateRight, onCond = splitJoinFilter(n, numLeft, onCond)
 
-	case joinTypeLeftOuter:
+	case sqlbase.LeftOuterJoin:
 		// We transform:
 		//   SELECT * FROM
 		//          l LEFT OUTER JOIN r ON (onLeft AND onRight AND onCombined)
@@ -813,7 +825,7 @@ func (p *planner) addJoinFilter(
 		//   SELECT * FROM l LEFT JOIN r USING (a) WHERE a = 1
 		propagateRight = mergeConj(propagateRight, remapLeftEqColConstraints(n, propagateLeft))
 
-	case joinTypeRightOuter:
+	case sqlbase.RightOuterJoin:
 		// We transform:
 		//   SELECT * FROM
 		//          l RIGHT OUTER JOIN r ON (onLeft AND onRight AND onCombined)
@@ -839,7 +851,7 @@ func (p *planner) addJoinFilter(
 		// In this case, we can push down l.a = 1 to the left side.
 		propagateLeft = mergeConj(propagateLeft, remapRightEqColConstraints(n, propagateRight))
 
-	case joinTypeFullOuter:
+	case sqlbase.FullOuterJoin:
 		// Not much we can do for full outer joins.
 		filterRemainder = extraFilter
 	}

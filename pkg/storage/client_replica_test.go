@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -160,11 +161,12 @@ func TestRejectFutureCommand(t *testing.T) {
 // overrides an old value. The test uses a "Writer" and a "Reader"
 // to reproduce an out-of-order put.
 //
-// 1) The Writer executes a put operation and writes a write intent with
+// 1) The Writer executes a cput operation and writes a write intent with
 //    time T in a txn.
 // 2) Before the Writer's txn is committed, the Reader sends a high priority
 //    get operation with time T+100. This pushes the Writer txn timestamp to
-//    T+100 and triggers the restart of the Writer's txn. The original
+//    T+100. The Reader also writes to the same key the Writer did a cput to
+//    in order to trigger the restart of the Writer's txn. The original
 //    write intent timestamp is also updated to T+100.
 // 3) The Writer starts a new epoch of the txn, but before it writes, the
 //    Reader sends another high priority get operation with time T+200. This
@@ -185,7 +187,10 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	// key is selected to fall within the meta range in order for the later
 	// routing of requests to range 1 to work properly. Removing the routing
 	// of all requests to range 1 would allow us to make the key more normal.
-	const key = "key"
+	const (
+		key        = "key"
+		restartKey = "restart"
+	)
 	// Set up a filter to so that the get operation at Step 3 will return an error.
 	var numGets int32
 
@@ -249,8 +254,14 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 				<-waitSecondGet
 			}
 
+			// Get a key which we can write to from the Reader in order to force a restart.
+			if _, err := txn.Get(ctx, restartKey); err != nil {
+				return err
+			}
+
 			updatedVal := []byte("updatedVal")
-			if err := txn.Put(ctx, key, updatedVal); err != nil {
+			if err := txn.CPut(ctx, key, updatedVal, "initVal"); err != nil {
+				log.Errorf(context.TODO(), "failed put value: %s", err)
 				return err
 			}
 
@@ -294,11 +305,22 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	requestHeader := roachpb.Span{
 		Key: roachpb.Key(key),
 	}
-	if _, err := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
+	h := roachpb.Header{
 		Timestamp:    cfg.Clock.Now(),
 		UserPriority: priority,
-	}, &roachpb.GetRequest{Span: requestHeader}); err != nil {
+	}
+	if _, err := client.SendWrappedWith(
+		context.Background(), rg1(store), h, &roachpb.GetRequest{Span: requestHeader},
+	); err != nil {
 		t.Fatalf("failed to get: %s", err)
+	}
+	// Write to the restart key so that the Writer's txn must restart.
+	putReq := &roachpb.PutRequest{
+		Span:  roachpb.Span{Key: roachpb.Key(restartKey)},
+		Value: roachpb.MakeValueFromBytes([]byte("restart-value")),
+	}
+	if _, err := client.SendWrappedWith(context.Background(), rg1(store), h, putReq); err != nil {
+		t.Fatalf("failed to put: %s", err)
 	}
 
 	// Wait until the writer restarts the txn.
@@ -311,11 +333,14 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	// timestamp cache from being updated).
 	manual.Increment(100)
 
-	if _, err := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
-		Timestamp:    cfg.Clock.Now(),
-		UserPriority: priority,
-	}, &roachpb.GetRequest{Span: requestHeader}); err == nil {
+	h.Timestamp = cfg.Clock.Now()
+	if _, err := client.SendWrappedWith(
+		context.Background(), rg1(store), h, &roachpb.GetRequest{Span: requestHeader},
+	); err == nil {
 		t.Fatal("unexpected success of get")
+	}
+	if _, err := client.SendWrappedWith(context.Background(), rg1(store), h, putReq); err != nil {
+		t.Fatalf("failed to put: %s", err)
 	}
 
 	close(waitSecondGet)
@@ -543,6 +568,7 @@ func TestRangeTransferLease(t *testing.T) {
 	// replica. The check is executed in a retry loop because the lease may not
 	// have been applied yet.
 	checkHasLease := func(t *testing.T, sender *storage.Stores) {
+		t.Helper()
 		testutils.SucceedsSoon(t, func() error {
 			return sendRead(sender).GoError()
 		})
@@ -699,39 +725,57 @@ func TestRangeTransferLease(t *testing.T) {
 		}
 	})
 
-	// We have to ensure that replica0 is the raft leader and that replica1 has
-	// caught up to replica0 as draining code doesn't transfer leases to
-	// behind replicas.
-	testutils.SucceedsSoon(t, func() error {
-		r := mtc.getRaftLeader(rangeID)
-		if r == nil {
-			return errors.Errorf("could not find raft leader replica for range %d", rangeID)
-		}
-		desc, err := r.GetReplicaDescriptor()
+	// ensureLeaderAndRaftState is a helper function that blocks until leader is
+	// the raft leader and follower is up to date.
+	ensureLeaderAndRaftState := func(leader *storage.Replica, follower roachpb.ReplicaDescriptor) {
+		t.Helper()
+		leaderDesc, err := leader.GetReplicaDescriptor()
 		if err != nil {
-			return errors.Wrap(err, "could not get replica descriptor")
+			t.Fatal(err)
 		}
-		if desc != replica0Desc {
-			return errors.Errorf("expected replica with id %v to be raft leader, instead got id %v", replica0Desc.ReplicaID, desc.ReplicaID)
-		}
-		return nil
-	})
+		testutils.SucceedsSoon(t, func() error {
+			r := mtc.getRaftLeader(rangeID)
+			if r == nil {
+				return errors.Errorf("could not find raft leader replica for range %d", rangeID)
+			}
+			desc, err := r.GetReplicaDescriptor()
+			if err != nil {
+				return errors.Wrap(err, "could not get replica descriptor")
+			}
+			if desc != leaderDesc {
+				return errors.Errorf(
+					"expected replica with id %v to be raft leader, instead got id %v",
+					leaderDesc.ReplicaID,
+					desc.ReplicaID,
+				)
+			}
+			return nil
+		})
 
-	testutils.SucceedsSoon(t, func() error {
-		status := replica0.RaftStatus()
-		progress, ok := status.Progress[uint64(replica1Desc.ReplicaID)]
-		if !ok {
-			return errors.Errorf("replica1 progress not found in progress map: %v", status.Progress)
-		}
-		if progress.Match < status.Commit {
-			return errors.New("replica1 failed to catch up")
-		}
-		return nil
-	})
+		testutils.SucceedsSoon(t, func() error {
+			status := leader.RaftStatus()
+			progress, ok := status.Progress[uint64(follower.ReplicaID)]
+			if !ok {
+				return errors.Errorf(
+					"replica %v progress not found in progress map: %v",
+					follower.ReplicaID,
+					status.Progress,
+				)
+			}
+			if progress.Match < status.Commit {
+				return errors.Errorf("replica %v failed to catch up", follower.ReplicaID)
+			}
+			return nil
+		})
+	}
 
 	// DrainTransfer verifies that a draining store attempts to transfer away
 	// range leases owned by its replicas.
 	t.Run("DrainTransfer", func(t *testing.T) {
+		// We have to ensure that replica0 is the raft leader and that replica1 has
+		// caught up to replica0 as draining code doesn't transfer leases to
+		// behind replicas.
+		ensureLeaderAndRaftState(replica0, replica1Desc)
 		mtc.stores[0].SetDraining(true)
 
 		// Check that replica0 doesn't serve reads any more.
@@ -773,6 +817,10 @@ func TestRangeTransferLease(t *testing.T) {
 
 		// Wait for extension to be blocked.
 		<-extensionSem
+
+		// Make sure that replica 0 is up to date enough to receive the lease.
+		ensureLeaderAndRaftState(replica1, replica0Desc)
+
 		// Drain node 1 with an extension in progress.
 		go func() {
 			mtc.stores[1].SetDraining(true)
@@ -787,6 +835,82 @@ func TestRangeTransferLease(t *testing.T) {
 			t.Errorf("unexpected error from lease renewal: %s", err)
 		}
 	})
+}
+
+// TestRangeLimitTxnMaxTimestamp verifies that on lease transfer, the
+// normal limiting of a txn's max timestamp to the first observed
+// timestamp on a node is extended to include the lease start
+// timestamp. This disallows the possibility that a write to another
+// replica of the range (on node n1) happened at a later timestamp
+// than the originally observed timestamp for the node which now owns
+// the lease (n2). This can happen if the replication of the write
+// doesn't make it from n1 to n2 before the transaction observes n2's
+// clock time.
+func TestRangeLimitTxnMaxTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	cfg := storage.TestStoreConfig(nil)
+	cfg.RangeLeaseRaftElectionTimeoutMultiplier =
+		float64((9 * time.Second) / cfg.RaftElectionTimeout())
+	mtc := &multiTestContext{}
+	mtc.storeConfig = &cfg
+	keyA := roachpb.Key("a")
+	// Create a new clock for node2 to allow drift between the two wall clocks.
+	manual1 := hlc.NewManualClock(100) // node1 clock is @t=100
+	clock1 := hlc.NewClock(manual1.UnixNano, 250*time.Nanosecond)
+	manual2 := hlc.NewManualClock(98) // node2 clock is @t=98
+	clock2 := hlc.NewClock(manual2.UnixNano, 250*time.Nanosecond)
+	mtc.clocks = []*hlc.Clock{clock1, clock2}
+
+	// Start a transaction using node2 as a gateway.
+	txn := roachpb.MakeTransaction("test", keyA, 1, enginepb.SERIALIZABLE, clock2.Now(), 250 /* maxOffsetNs */)
+	// Simulate a read to another range on node2 by setting the observed timestamp.
+	txn.UpdateObservedTimestamp(2, clock2.Now())
+
+	defer mtc.Stop()
+	mtc.Start(t, 2)
+
+	// Do a write on node1 to establish a key with its timestamp @t=100.
+	if _, pErr := client.SendWrapped(
+		context.Background(), mtc.distSenders[0], putArgs(keyA, []byte("value")),
+	); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Up-replicate the data in the range to node2.
+	replica1 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA), nil)
+	mtc.replicateRange(replica1.RangeID, 1)
+
+	// Transfer the lease from node1 to node2.
+	replica2 := mtc.stores[1].LookupReplica(roachpb.RKey(keyA), nil)
+	replica2Desc, err := replica2.GetReplicaDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutils.SucceedsSoon(t, func() error {
+		if err := replica1.AdminTransferLease(context.Background(), replica2Desc.StoreID); err != nil {
+			t.Fatal(err)
+		}
+		lease, _ := replica2.GetLease()
+		if lease.Replica.NodeID != replica2.NodeID() {
+			return errors.Errorf("expected lease transfer to node2: %s", lease)
+		}
+		return nil
+	})
+	// Verify that after the lease transfer, node2's clock has advanced to at least 100.
+	if now1, now2 := clock1.Now(), clock2.Now(); now2.WallTime < now1.WallTime {
+		t.Fatalf("expected node2's clock walltime to be >= %d; got %d", now1.WallTime, now2.WallTime)
+	}
+
+	// Send a get request for keyA to node2, which is now the
+	// leaseholder. If the max timestamp were not being properly limited,
+	// we would end up incorrectly reading nothing for keyA. Instead we
+	// expect to see an uncertainty interval error.
+	h := roachpb.Header{Txn: &txn}
+	if _, pErr := client.SendWrappedWith(
+		context.Background(), mtc.distSenders[0], h, getArgs(keyA),
+	); !testutils.IsPError(pErr, "uncertainty") {
+		t.Fatalf("expected an uncertainty interval error; got %v", pErr)
+	}
 }
 
 // TestLeaseMetricsOnSplitAndTransfer verifies that lease-related metrics
@@ -895,6 +1019,8 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 // See replica.mu.minLeaseProposedTS for the reasons why this isn't allowed.
 func TestLeaseNotUsedAfterRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
 	sc := storage.TestStoreConfig(nil)
 	var leaseAcquisitionTrap atomic.Value
 	// Disable the split queue so that no ranges are split. This makes it easy
@@ -917,9 +1043,17 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 
 	// Send a read, to acquire a lease.
 	getArgs := getArgs([]byte("a"))
-	if _, err := client.SendWrapped(context.Background(), rg1(mtc.stores[0]), getArgs); err != nil {
+	if _, err := client.SendWrapped(ctx, rg1(mtc.stores[0]), getArgs); err != nil {
 		t.Fatal(err)
 	}
+
+	preRepl1, err := mtc.stores[0].GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preRestartLease, _ := preRepl1.GetLease()
+
+	mtc.manualClock.Increment(1E9)
 
 	// Restart the mtc. Before we do that, we're installing a callback used to
 	// assert that a new lease has been requested. The callback is installed
@@ -932,11 +1066,13 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 			close(leaseAcquisitionCh)
 		})
 	})
+
+	log.Info(ctx, "restarting")
 	mtc.restart()
 
 	// Send another read and check that the pre-existing lease has not been used.
 	// Concretely, we check that a new lease is requested.
-	if _, err := client.SendWrapped(context.Background(), rg1(mtc.stores[0]), getArgs); err != nil {
+	if _, err := client.SendWrapped(ctx, rg1(mtc.stores[0]), getArgs); err != nil {
 		t.Fatal(err)
 	}
 	// Check that the Send above triggered a lease acquisition.
@@ -944,6 +1080,19 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 	case <-leaseAcquisitionCh:
 	case <-time.After(time.Second):
 		t.Fatalf("read did not acquire a new lease")
+	}
+
+	postRepl1, err := mtc.stores[0].GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRestartLease, _ := postRepl1.GetLease()
+
+	// Verify that not only is a new lease requested, it also gets a new sequence
+	// number. This makes sure that previously proposed commands actually fail at
+	// apply time.
+	if preRestartLease.Sequence == postRestartLease.Sequence {
+		t.Fatalf("lease was not replaced:\nprev: %v\nnow:  %v", preRestartLease, postRestartLease)
 	}
 }
 

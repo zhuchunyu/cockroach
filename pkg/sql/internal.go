@@ -18,8 +18,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -37,7 +35,8 @@ type InternalExecutor struct {
 var _ sqlutil.InternalExecutor = &InternalExecutor{}
 
 // ExecuteStatementInTransaction executes the supplied SQL statement as part of
-// the supplied transaction. Statements are currently executed as the root user.
+// the supplied transaction. Statements are currently executed as the root user
+// with the system database as current database.
 func (ie *InternalExecutor) ExecuteStatementInTransaction(
 	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
 ) (int, error) {
@@ -60,7 +59,7 @@ func (ie *InternalExecutor) QueryRowInTransaction(
 		opName, txn, security.RootUser, ie.ExecCfg.LeaseManager.memMetrics, ie.ExecCfg)
 	defer cleanup()
 	ie.initSession(p)
-	return p.QueryRow(ctx, statement, qargs...)
+	return p.queryRow(ctx, statement, qargs...)
 }
 
 // QueryRowsInTransaction executes the supplied SQL statement as part of the
@@ -96,65 +95,22 @@ func (ie InternalExecutor) QueryRows(
 	return rows, cols, err
 }
 
-// GetTableSpan gets the key span for a SQL table, including any indices.
-func (ie *InternalExecutor) GetTableSpan(
-	ctx context.Context, user string, txn *client.Txn, dbName, tableName string,
-) (roachpb.Span, error) {
-	// Lookup the table ID.
-	p, cleanup := newInternalPlanner(
-		"get-table-span", txn, user, ie.ExecCfg.LeaseManager.memMetrics, ie.ExecCfg)
-	defer cleanup()
-	ie.initSession(p)
-
-	tn := tree.TableName{DatabaseName: tree.Name(dbName), TableName: tree.Name(tableName)}
-	tableID, err := getTableID(ctx, p, &tn)
-	if err != nil {
-		return roachpb.Span{}, err
-	}
-
-	// Determine table data span.
-	tablePrefix := keys.MakeTablePrefix(uint32(tableID))
-	tableStartKey := roachpb.Key(tablePrefix)
-	tableEndKey := tableStartKey.PrefixEnd()
-	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}, nil
+// ExecuteStatement is like ExecuteStatementInTransaction, except that it runs
+// a transaction internally.
+// Statements are currently executed as the root user with the system database as current database.
+func (ie InternalExecutor) ExecuteStatement(
+	ctx context.Context, opName string, statement string, qargs ...interface{},
+) (int, error) {
+	var numAffected int
+	err := ie.ExecCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		var err error
+		numAffected, err = ie.ExecuteStatementInTransaction(ctx, opName, txn, statement, qargs...)
+		return err
+	})
+	return numAffected, err
 }
 
 func (ie *InternalExecutor) initSession(p *planner) {
 	p.extendedEvalCtx.NodeID = ie.ExecCfg.LeaseManager.LeaseStore.execCfg.NodeID.Get()
 	p.extendedEvalCtx.Tables.leaseMgr = ie.ExecCfg.LeaseManager
-}
-
-// getTableID retrieves the table ID for the specified table.
-func getTableID(ctx context.Context, p *planner, tn *tree.TableName) (sqlbase.ID, error) {
-	if err := tn.QualifyWithDatabase(p.SessionData().Database); err != nil {
-		return 0, err
-	}
-
-	virtual, err := p.getVirtualTabler().getVirtualTableDesc(tn)
-	if err != nil {
-		return 0, err
-	}
-	if virtual != nil {
-		return virtual.GetID(), nil
-	}
-
-	txnRunner := func(ctx context.Context, retryable func(ctx context.Context, txn *client.Txn) error) error {
-		return retryable(ctx, p.txn)
-	}
-
-	dbID, err := p.Tables().databaseCache.getDatabaseID(ctx, txnRunner, p.getVirtualTabler(), tn.Database())
-	if err != nil {
-		return 0, err
-	}
-
-	nameKey := tableKey{dbID, tn.Table()}
-	key := nameKey.Key()
-	gr, err := p.txn.Get(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	if !gr.Exists() {
-		return 0, sqlbase.NewUndefinedRelationError(tn)
-	}
-	return sqlbase.ID(gr.ValueInt()), nil
 }

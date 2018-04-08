@@ -32,11 +32,12 @@ enum ReadConsistencyType {
   // CONSISTENT reads are guaranteed to read committed data; the
   // mechanism relies on clocks to determine lease expirations.
   CONSISTENT = 0;
-  // CONSENSUS requires that reads must achieve consensus. This is a
-  // stronger guarantee of consistency than CONSISTENT.
-  //
-  // TODO(spencer): current unimplemented.
-  CONSENSUS = 1;
+  // READ_UNCOMMITTED reads return both committed and uncommitted data.
+  // The consistency type is similar to INCONSISTENT in that using it
+  // can result in dirty reads. However, like the CONSISTENT type, it
+  // requires the replica performing the read to hold a valid read lease,
+  // meaning that it can't return arbitrarily stale data.
+  READ_UNCOMMITTED = 1;
   // INCONSISTENT reads return the latest available, committed values.
   // They are more efficient, but may read stale values as pending
   // intents are ignored.
@@ -81,8 +82,9 @@ message ResponseHeader {
   Span resume_span = 4;
   // When resume_span is populated, this specifies the reason why the operation
   // wasn't completed and needs to be resumed.
-  // This field appeared in v1.2. Responses from storage coming from older
-  // servers will not contain it, but the DistSender always fills it in.
+  // This field appeared in v2.0. Responses from storage coming from older
+  // servers will not contain it, but the conversion from a BatchResponse to a
+  // client.Result always fills it in.
   ResumeReason resume_reason = 7;
 
   // The number of keys operated on.
@@ -104,6 +106,9 @@ message GetRequest {
 message GetResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   Value value = 2;
+
+  // The intent seen, if any, when using the READ_UNCOMMITTED consistency level.
+  Value intent_value = 3;
 }
 
 // A PutRequest is the argument to the Put() method.
@@ -132,7 +137,7 @@ message PutResponse {
 // - Returns true and sets value if exp_value equals existing value.
 // - If key doesn't exist and exp_value is nil, sets value.
 // - If key exists, but value is empty and exp_value is not nil but empty, sets value.
-// - Otherwise, returns error and the actual value of the key in the response.
+// - Otherwise, returns an error containing the actual value of the key.
 message ConditionalPutRequest {
   option (gogoproto.equal) = true;
 
@@ -321,10 +326,8 @@ message ScanRequest {
 
   Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 
-  // Set to true if the KeyValue pairs for all intents encountered during the
-  // scan should also be returned. An error will be thrown if this is set to
-  // true for a consistent scan.
-  bool return_intents = 3;
+  // Replaced by the READ_UNCOMMITTED consistency level.
+  bool deprecated_return_intents = 3;
 }
 
 // A ScanResponse is the return value from the Scan() method.
@@ -332,8 +335,9 @@ message ScanResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // Empty if no rows were scanned.
   repeated KeyValue rows = 2 [(gogoproto.nullable) = false];
-  // Empty if return_intents was not set to true of if no intent rows were
-  // scanned. These rows do not count against the MaxSpanRequestKeys count.
+  // The intent rows seen when performing a scan at the READ_UNCOMMITTED
+  // consistency level. These rows do not count against the MaxSpanRequestKeys
+  // count.
   repeated KeyValue intent_rows = 3 [(gogoproto.nullable) = false];
 }
 
@@ -347,10 +351,8 @@ message ReverseScanRequest {
 
   Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 
-  // Set to true if the KeyValue pairs for all intents encountered during the
-  // scan should also be returned. An error will be thrown if this is set to
-  // true for a consistent scan.
-  bool return_intents = 3;
+  // Replaced by the READ_UNCOMMITTED consistency level.
+  bool deprecated_return_intents = 3;
 }
 
 // A ReverseScanResponse is the return value from the ReverseScan() method.
@@ -358,8 +360,9 @@ message ReverseScanResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // Empty if no rows were scanned.
   repeated KeyValue rows = 2 [(gogoproto.nullable) = false];
-  // Empty if return_intents was not set to true of if no intent rows were
-  // scanned. These rows do not count against the MaxSpanRequestKeys count.
+  // The intent rows seen when performing a scan at the READ_UNCOMMITTED
+  // consistency level. These rows do not count against the MaxSpanRequestKeys
+  // count.
   repeated KeyValue intent_rows = 3 [(gogoproto.nullable) = false];
 }
 
@@ -455,6 +458,17 @@ message EndTransactionRequest {
   // guarantees that all writes are to the same range and that no
   // intents are left in the event of an error.
   bool require_1pc = 6 [(gogoproto.customname) = "Require1PC"];
+  // Set to true if this transaction is serializable isolation but has
+  // accummulated no refresh spans. This allows the executing server
+  // to retry it locally on the fast path.
+  bool no_refresh_spans = 8;
+  // True to indicate that intent spans should be resolved with
+  // poison=true.  This is used when the transaction is being aborted
+  // independently of the main thread of client operation, as in the
+  // case of an asynchronous abort from the TxnCoordSender on a failed
+  // heartbeat.
+  bool poison = 9;
+  reserved 7;
 }
 
 // An EndTransactionResponse is the return value from the
@@ -492,7 +506,7 @@ message EndTransactionResponse {
 // The new range contains range replicas located on the same stores;
 // no range data is moved during this operation. The split can be
 // thought of as a mostly logical operation, though some other
-// metadata (e.g. sequence cache and range stats must be copied or
+// metadata (e.g. abort span and range stats must be copied or
 // recomputed).
 message AdminSplitRequest {
   option (gogoproto.equal) = true;
@@ -558,18 +572,21 @@ message AdminChangeReplicasResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
-// A RangeLookupRequest is arguments to the RangeLookup() method. A
-// forward lookup request returns a range containing the requested
-// key. A reverse lookup request returns a range containing the
-// previous key of the requested key (e.g., if a requested key is the
-// end key of range R, the reverse lookup request returns R).
+// A DeprecatedRangeLookupRequest is arguments to the LegacyRangeLookup()
+// method. It has been deprecated in favor of using ScanRequest to perform the
+// lookup.
 //
-// RangeLookupRequest also specifies the maximum number of range
-// descriptors that should be returned, if there are additional
-// consecutive addressable ranges. Specify max_ranges > 1 to pre-fill the
-// range descriptor cache. The additional ranges are scanned in the same
-// direction as lookup (forward v.s. reverse).
-message RangeLookupRequest {
+// A forward lookup request returns a range containing the requested key. A
+// reverse lookup request returns a range containing the previous key of the
+// requested key (e.g., if a requested key is the end key of range R, the
+// reverse lookup request returns R).
+//
+// DeprecatedRangeLookupRequest also specifies the maximum number of range
+// descriptors that should be returned, if there are additional consecutive
+// addressable ranges. Specify max_ranges > 1 to pre-fill the range descriptor
+// cache. The additional ranges are scanned in the same direction as lookup
+// (forward v.s. reverse).
+message DeprecatedRangeLookupRequest {
   option (gogoproto.equal) = true;
 
   Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
@@ -580,12 +597,11 @@ message RangeLookupRequest {
   bool reverse = 4;
 }
 
-// A RangeLookupResponse is the return value from the RangeLookup()
-// method. It returns metadata for the range containing the requested
-// key, optionally returning the metadata for additional consecutive
-// ranges beyond the requested range to pre-fill the range descriptor
-// cache.
-message RangeLookupResponse {
+// A DeprecatedRangeLookupResponse is the return value from the
+// LegacyRangeLookup() method. It returns metadata for the range containing the
+// requested key, optionally returning the metadata for additional consecutive
+// ranges beyond the requested range to pre-fill the range descriptor cache.
+message DeprecatedRangeLookupResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   repeated RangeDescriptor ranges = 2 [(gogoproto.nullable) = false];
   repeated RangeDescriptor prefetched_ranges = 3 [(gogoproto.nullable) = false];
@@ -755,7 +771,7 @@ message ResolveIntentRequest {
   storage.engine.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   TransactionStatus status = 3;
-  // Optionally poison the sequence cache for the transaction the intent's
+  // Optionally poison the abort span for the transaction the intent's
   // range.
   bool poison = 4;
 }
@@ -778,7 +794,7 @@ message ResolveIntentRangeRequest {
   storage.engine.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   TransactionStatus status = 3;
-  // Optionally poison the sequence cache for the transaction on all ranges
+  // Optionally poison the abort span for the transaction on all ranges
   // on which the intents reside.
   bool poison = 4;
   // The minimum timestamp for any intents written by this
@@ -850,6 +866,10 @@ message RequestLeaseRequest {
   // The previous lease is specified by the caller to verify
   // it has not changed when executing this command.
   Lease prev_lease = 3 [(gogoproto.nullable) = false];
+  // The MinLeaseProposedTS of the proposing replica to make sure that leases
+  // issued after a node restart receive a new sequence number (instead of
+  // counting as a lease extension). See #23204.
+  util.hlc.Timestamp min_proposed_ts = 4 [(gogoproto.customname) = "MinProposedTS"];
 }
 
 // A TransferLeaseRequest represents the arguments to the TransferLease()
@@ -1054,6 +1074,7 @@ message ExportResponse {
 
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   repeated File files = 2 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
 }
 
 // ImportRequest is the argument to the Import() method, to bulk load key/value
@@ -1139,6 +1160,46 @@ message AddSSTableResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
+// RefreshRequest is arguments to the Refresh() method, which verifies
+// that no write has occurred since the transaction's orig timestamp
+// to the specified key. Either the read or write timestamp cache is
+// updated according to the write parameter. A transaction must be
+// supplied with this request. If the key has been written more
+// recently than the original txn timestamp, an error is returned
+// and the timestamp cache is not updated.
+message RefreshRequest {
+  option (gogoproto.equal) = true;
+
+  Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // If set, indicates that the write timestamp cache should be
+  // updated. This handles the case of DeleteRange, which must set the
+  // write too old flag on transactions which attempt earlier writes.
+  bool write = 2;
+}
+
+// RefreshResponse is the response to the Udpate() operation.
+message RefreshResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// RefreshRangeRequest is arguments to the RefreshRange() method, which
+// is similar to RefreshRequest (see comments above), but operates on
+// a key span instead of a single key.
+message RefreshRangeRequest {
+  option (gogoproto.equal) = true;
+
+  Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // If set, indicates that the write timestamp cache should be
+  // updated. This handles the case of DeleteRange, which must set the
+  // write too old flag on transactions which attempt earlier writes.
+  bool write = 2;
+}
+
+// RefreshRangeResponse is the response to the Udpate() operation.
+message RefreshRangeResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
 // A RequestUnion contains exactly one of the requests.
 // The values added here must match those in ResponseUnion.
 //
@@ -1169,7 +1230,7 @@ message RequestUnion {
   HeartbeatTxnRequest heartbeat_txn = 12;
   GCRequest gc = 13;
   PushTxnRequest push_txn = 14;
-  RangeLookupRequest range_lookup = 15;
+  DeprecatedRangeLookupRequest deprecated_range_lookup = 15;
   ResolveIntentRequest resolve_intent = 16;
   ResolveIntentRangeRequest resolve_intent_range = 17;
   MergeRequest merge = 18;
@@ -1191,6 +1252,8 @@ message RequestUnion {
   AdminScatterRequest admin_scatter = 36;
   AddSSTableRequest add_sstable = 37;
   RecomputeStatsRequest recompute_stats = 39;
+  RefreshRequest refresh = 40;
+  RefreshRangeRequest refresh_range = 41;
 }
 
 // A ResponseUnion contains exactly one of the responses.
@@ -1220,7 +1283,7 @@ message ResponseUnion {
   HeartbeatTxnResponse heartbeat_txn = 12;
   GCResponse gc = 13;
   PushTxnResponse push_txn = 14;
-  RangeLookupResponse range_lookup = 15;
+  DeprecatedRangeLookupResponse deprecated_range_lookup = 15;
   ResolveIntentResponse resolve_intent = 16;
   ResolveIntentRangeResponse resolve_intent_range = 17;
   MergeResponse merge = 18;
@@ -1242,6 +1305,8 @@ message ResponseUnion {
   AdminScatterResponse admin_scatter = 36;
   AddSSTableResponse add_sstable = 37;
   RecomputeStatsResponse recompute_stats = 39;
+  RefreshResponse refresh = 40;
+  RefreshRangeResponse refresh_range = 41;
 }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary
@@ -1327,8 +1392,8 @@ message BatchResponse {
     // error is non-nil if an error occurred.
     Error error = 1;
     // timestamp is set only for non-transactional responses and denotes the
-    // highest timestamp at which a command from the batch executed. At the
-    // time of writing, it is used solely for informational purposes and tests.
+    // timestamp at which the batch executed. The timestamp cache is updated
+    // at this timestamp.
     util.hlc.Timestamp Timestamp = 2 [(gogoproto.nullable) = false];
     // txn is non-nil if the request specified a non-nil
     // transaction. The transaction timestamp and/or priority may have

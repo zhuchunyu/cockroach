@@ -21,7 +21,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -32,7 +31,7 @@ import (
 type dropDatabaseNode struct {
 	n      *tree.DropDatabase
 	dbDesc *sqlbase.DatabaseDescriptor
-	td     []*sqlbase.TableDescriptor
+	td     []toDelete
 }
 
 // DropDatabase drops a database.
@@ -48,24 +47,29 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, errEmptyDatabaseName
 	}
 
+	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("DROP DATABASE on current database")
+	}
+
 	// Check that the database exists.
-	dbDesc, err := getDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), string(n.Name))
+	var dbDesc *DatabaseDescriptor
+	var err error
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
+		dbDesc, err = ResolveDatabase(ctx, p, string(n.Name), !n.IfExists)
+	})
 	if err != nil {
 		return nil, err
 	}
 	if dbDesc == nil {
-		if n.IfExists {
-			// Noop.
-			return &zeroNode{}, nil
-		}
-		return nil, sqlbase.NewUndefinedDatabaseError(string(n.Name))
+		// IfExists was specified and database was not found.
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	if err := p.CheckPrivilege(ctx, dbDesc, privilege.DROP); err != nil {
 		return nil, err
 	}
 
-	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc, false)
+	tbNames, err := GetObjectNames(ctx, p, dbDesc, tree.PublicSchema, true /*explicitPrefix*/)
 	if err != nil {
 		return nil, err
 	}
@@ -86,16 +90,16 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		}
 	}
 
-	td := make([]*sqlbase.TableDescriptor, len(tbNames))
+	td := make([]toDelete, len(tbNames))
 	for i := range tbNames {
-		tbDesc, err := p.dropTableOrViewPrepare(ctx, &tbNames[i])
+		tbDesc, err := p.prepareDrop(ctx, &tbNames[i], true /*required*/, anyDescType)
 		if err != nil {
 			return nil, err
 		}
 		if tbDesc == nil {
 			// Database claims to have this table, but it does not exist.
 			return nil, errors.Errorf("table %q was described by database %q, but does not exist",
-				tbNames[i].String(), n.Name)
+				tree.ErrString(&tbNames[i]), n.Name)
 		}
 		// Recursively check permissions on all dependent views, since some may
 		// be in different databases.
@@ -104,7 +108,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 				return nil, err
 			}
 		}
-		td[i] = tbDesc
+		td[i] = toDelete{&tbNames[i], tbDesc}
 	}
 
 	td, err = p.filterCascadedTables(ctx, td)
@@ -119,24 +123,27 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
 	tbNameStrings := make([]string, 0, len(n.td))
-	for _, tbDesc := range n.td {
+	for _, toDel := range n.td {
+		tbDesc := toDel.desc
 		if tbDesc.IsView() {
 			cascadedViews, err := p.dropViewImpl(ctx, tbDesc, tree.DropCascade)
 			if err != nil {
 				return err
 			}
+			// TODO(knz): dependent dropped views should be qualified here.
 			tbNameStrings = append(tbNameStrings, cascadedViews...)
 		} else {
 			cascadedViews, err := p.dropTableImpl(params, tbDesc)
 			if err != nil {
 				return err
 			}
+			// TODO(knz): dependent dropped table names should be qualified here.
 			tbNameStrings = append(tbNameStrings, cascadedViews...)
 		}
-		tbNameStrings = append(tbNameStrings, tbDesc.Name)
+		tbNameStrings = append(tbNameStrings, toDel.tn.FQString())
 	}
 
-	zoneKey, nameKey, descKey := getKeysForDatabaseDescriptor(n.dbDesc)
+	_ /* zoneKey */, nameKey, descKey := getKeysForDatabaseDescriptor(n.dbDesc)
 	zoneKeyPrefix := config.MakeZoneKeyPrefix(uint32(n.dbDesc.ID))
 
 	b := &client.Batch{}
@@ -150,17 +157,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	// Delete the zone config entry for this database.
 	b.DelRange(zoneKeyPrefix, zoneKeyPrefix.PrefixEnd(), false /* returnKeys */)
 
-	params.extendedEvalCtx.TestingVerifyMetadata.setTestingVerifyMetadata(
-		func(systemConfig config.SystemConfig) error {
-			for _, key := range [...]roachpb.Key{descKey, nameKey, zoneKey} {
-				if err := expectDeleted(systemConfig, key); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-
-	p.Tables().addUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, true /*dropped*/)
+	p.Tables().addUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, dbDropped)
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
@@ -191,21 +188,20 @@ func (*dropDatabaseNode) Values() tree.Datums          { return tree.Datums{} }
 // descriptors from the list that are dependent on other descriptors in the
 // list (e.g. if view v1 depends on table t1, then v1 will be filtered from
 // the list).
-func (p *planner) filterCascadedTables(
-	ctx context.Context, tables []*sqlbase.TableDescriptor,
-) ([]*sqlbase.TableDescriptor, error) {
+func (p *planner) filterCascadedTables(ctx context.Context, tables []toDelete) ([]toDelete, error) {
 	// Accumulate the set of all tables/views that will be deleted by cascade
 	// behavior so that we can filter them out of the list.
 	cascadedTables := make(map[sqlbase.ID]bool)
-	for _, desc := range tables {
+	for _, toDel := range tables {
+		desc := toDel.desc
 		if err := p.accumulateDependentTables(ctx, cascadedTables, desc); err != nil {
 			return nil, err
 		}
 	}
-	filteredTableList := make([]*sqlbase.TableDescriptor, 0, len(tables))
-	for _, desc := range tables {
-		if !cascadedTables[desc.ID] {
-			filteredTableList = append(filteredTableList, desc)
+	filteredTableList := make([]toDelete, 0, len(tables))
+	for _, toDel := range tables {
+		if !cascadedTables[toDel.desc.ID] {
+			filteredTableList = append(filteredTableList, toDel)
 		}
 	}
 	return filteredTableList, nil

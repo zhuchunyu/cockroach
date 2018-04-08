@@ -17,7 +17,7 @@ import ClusterSummaryBar from "./summaryBar";
 import { AdminUIState } from "src/redux/state";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
 import { hoverStateSelector, HoverState, hoverOn, hoverOff } from "src/redux/hover";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
+import { nodesSummarySelector, NodesSummary, LivenessStatus } from "src/redux/nodes";
 import Alerts from "src/views/shared/containers/alerts";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 
@@ -92,19 +92,30 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
    */
   private nodeDropdownOptions = createSelector(
     (summary: NodesSummary) => summary.nodeStatuses,
-    (nodeStatuses): DropdownOption[] => {
+    (summary: NodesSummary) => summary.nodeDisplayNameByID,
+    (summary: NodesSummary) => summary.livenessStatusByNodeID,
+    (nodeStatuses, nodeDisplayNameByID, livenessStatusByNodeID): DropdownOption[] => {
       const base = [{value: "", label: "Cluster"}];
-      return base.concat(_.map(nodeStatuses, (ns) => {
-        return {
-          value: ns.desc.node_id.toString(),
-          label: ns.desc.address.address_field,
-        };
-      }));
+      return base.concat(
+        _.chain(nodeStatuses)
+          .filter(ns => livenessStatusByNodeID[ns.desc.node_id] !== LivenessStatus.DECOMMISSIONED)
+          .map(ns => ({
+            value: ns.desc.node_id.toString(),
+            label: nodeDisplayNameByID[ns.desc.node_id],
+          }))
+          .value(),
+      );
     },
   );
 
-  static title() {
-    return "Cluster Overview";
+  static title({ params }: { params: { [name: string]: any } }) {
+    const dashboard = params[dashboardNameAttr];
+
+    if (dashboard in dashboards) {
+      return dashboards[dashboard].label + " Dashboard";
+    }
+
+    return "Cluster Metrics";
   }
 
   refresh(props = this.props) {
@@ -118,9 +129,9 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
 
   setClusterPath(nodeID: string, dashboardName: string) {
     if (!_.isString(nodeID) || nodeID === "") {
-      this.context.router.push(`/cluster/all/${dashboardName}`);
+      this.context.router.push(`/metrics/${dashboardName}/cluster`);
     } else {
-      this.context.router.push(`/cluster/node/${nodeID}/${dashboardName}`);
+      this.context.router.push(`/metrics/${dashboardName}/node/${nodeID}`);
     }
   }
 

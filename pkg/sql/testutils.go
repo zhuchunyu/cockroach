@@ -33,31 +33,31 @@ func CreateTestTableDescriptor(
 	schema string,
 	privileges *sqlbase.PrivilegeDescriptor,
 ) (sqlbase.TableDescriptor, error) {
+	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
 	if err != nil {
 		return sqlbase.TableDescriptor{}, err
 	}
 	semaCtx := tree.MakeSemaContext(false /* privileged */)
-	evalCtx := tree.MakeTestingEvalContext()
+	evalCtx := tree.MakeTestingEvalContext(st)
 	return MakeTableDesc(
 		ctx,
 		nil, /* txn */
 		nil, /* vt */
-		cluster.MakeTestingClusterSettings(),
+		st,
 		stmt.(*tree.CreateTable),
 		parentID, id,
 		hlc.Timestamp{}, /* creationTime */
 		privileges,
 		nil, /* affected */
-		"",  /* sessionDB */
 		&semaCtx,
 		&evalCtx,
 	)
 }
 
-func makeTestingExtendedEvalContext() extendedEvalContext {
+func makeTestingExtendedEvalContext(st *cluster.Settings) extendedEvalContext {
 	return extendedEvalContext{
-		EvalContext: tree.MakeTestingEvalContext(),
+		EvalContext: tree.MakeTestingEvalContext(st),
 	}
 }
 
@@ -74,17 +74,17 @@ func MakeStmtBufReader(buf *StmtBuf) StmtBufReader {
 }
 
 // CurCmd returns the current command in the buffer.
-func (r StmtBufReader) CurCmd(ctx context.Context) (Command, error) {
-	cmd, _ /* pos */, err := r.buf.curCmd(ctx)
+func (r StmtBufReader) CurCmd() (Command, error) {
+	cmd, _ /* pos */, err := r.buf.curCmd()
 	return cmd, err
 }
 
 // AdvanceOne moves the cursor one position over.
-func (r *StmtBufReader) AdvanceOne(ctx context.Context) {
-	r.buf.advanceOne(ctx)
+func (r *StmtBufReader) AdvanceOne() {
+	r.buf.advanceOne()
 }
 
 // SeekToNextBatch skips to the beginning of the next batch of commands.
-func (r *StmtBufReader) SeekToNextBatch(ctx context.Context) error {
-	return r.buf.seekToNextBatch(ctx)
+func (r *StmtBufReader) SeekToNextBatch() error {
+	return r.buf.seekToNextBatch()
 }

@@ -136,7 +136,7 @@ CREATE TABLE t (
 );
 
 INSERT INTO t (i, f, s, b, d, t, ts, n, o, e, u, ip, j, ary, tz, e1, e2, s1) VALUES
-	(1, 2.3, 'striiing', '\x613162326333', '2016-03-26', '01:02:03.456', '2016-01-25 10:10:10+00:00', '2h30m30s', true, 1.2345, 'e9716c74-2638-443d-90ed-ffde7bea7d1d', '192.168.0.1', '{"a":"b"}', ARRAY['hello':::STRING,'world':::STRING], '2016-01-25 10:10:10+00:00', 3, 4.5, 's'),
+	(1, 2.3, 'striiing', '\x613162326333', '2016-03-26', '01:02:03.456', '2016-01-25 10:10:10+00:00', '2h30m30s', true, 1.2345, 'e9716c74-2638-443d-90ed-ffde7bea7d1d', '192.168.0.1', '{"a": "b"}', ARRAY['hello':::STRING,'world':::STRING], '2016-01-25 10:10:10+00:00', 3, 4.5, 's'),
 	(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 	(NULL, '+Inf', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'Infinity', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 	(NULL, '-Inf', NULL, NULL, NULL, NULL, NULL, NULL, NULL, '-Infinity', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
@@ -542,9 +542,9 @@ func TestDumpAsOf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Last line is the row count, last-before-last is the timestamp.
+	// Last line is the timestamp.
 	fs := strings.Split(strings.TrimSpace(out), "\n")
-	ts := fs[len(fs)-2]
+	ts := fs[len(fs)-1]
 
 	dump1, err := c.RunWithCaptureArgs([]string{"dump", "d", "t"})
 	if err != nil {
@@ -600,7 +600,7 @@ INSERT INTO t (i, j) VALUES
 
 	if out, err := c.RunWithCaptureArgs([]string{"dump", "d", "t", "--as-of", "2000-01-01 00:00:00"}); err != nil {
 		t.Fatal(err)
-	} else if !strings.Contains(out, "relation d.t does not exist") {
+	} else if !strings.Contains(out, `relation d.public.t does not exist`) {
 		t.Fatalf("unexpected output: %s", out)
 	}
 }
@@ -681,6 +681,11 @@ INSERT INTO f VALUES (1, 1);
 INSERT INTO e VALUES (1);
 INSERT INTO d VALUES (1, 1, 1);
 INSERT INTO c VALUES (1);
+
+-- Test a table that uses a sequence to make sure the sequence is dumped first.
+CREATE SEQUENCE s;
+CREATE TABLE s_tbl (id INT PRIMARY KEY DEFAULT nextval('s'), v INT);
+INSERT INTO s_tbl (v) VALUES (10), (11);
 `
 	if out, err := c.RunWithCaptureArgs([]string{"sql", "-e", create}); err != nil {
 		t.Fatal(err)
@@ -747,6 +752,15 @@ CREATE TABLE c (
 	FAMILY "primary" (i, rowid)
 );
 
+CREATE SEQUENCE s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1;
+
+CREATE TABLE s_tbl (
+	id INT NOT NULL DEFAULT nextval('s':::STRING),
+	v INT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (id ASC),
+	FAMILY "primary" (id, v)
+);
+
 INSERT INTO b (i) VALUES
 	(1);
 
@@ -767,6 +781,12 @@ INSERT INTO d (i, e, f) VALUES
 
 INSERT INTO c (i) VALUES
 	(1);
+
+SELECT setval('s', 3, false);
+
+INSERT INTO s_tbl (id, v) VALUES
+	(1, 10),
+	(2, 11);
 `
 
 	if out != expectDump {
@@ -798,10 +818,8 @@ SELECT * FROM c;
 
 i
 1
-# 1 row
 i
 1
-# 1 row
 `
 
 	if out != expect {
@@ -873,6 +891,158 @@ func TestDumpView(t *testing.T) {
 
 	const expect = `dump d
 CREATE VIEW bar ("1") AS SELECT 1;
+`
+
+	if out != expect {
+		t.Fatalf("expected: %s\ngot: %s", expect, out)
+	}
+}
+
+func TestDumpSequence(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+
+	conn := makeSQLConn(url.String())
+	defer conn.Close()
+
+	// Create database and sequence.
+
+	const create = `
+	CREATE DATABASE d;
+	CREATE SEQUENCE d.s1 INCREMENT 123; -- test one sequence right at its minval
+	CREATE SEQUENCE d.s2 INCREMENT 456; -- test another that's been incremented
+	SELECT nextval('d.s2'); -- 1
+	SELECT nextval('d.s2'); -- 457
+`
+	if createOut, err := c.RunWithCaptureArgs([]string{"sql", "-e", create}); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(createOut)
+	}
+
+	// Dump the database.
+
+	const expectSQL = `CREATE SEQUENCE s1 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 123 START 1;
+
+CREATE SEQUENCE s2 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 456 START 1;
+
+SELECT setval('s1', 1, false);
+
+SELECT setval('s2', 913, false);
+`
+
+	dumpOut, err := c.RunWithCaptureArgs([]string{"dump", "d"})
+	if err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(dumpOut)
+	}
+
+	outSQL := removeFirstLine(dumpOut)
+	if outSQL != expectSQL {
+		t.Fatalf("expected: %s\ngot: %s", expectSQL, outSQL)
+	}
+
+	// Round-trip: load this dump and then export it again.
+	const recreateDatabase = `
+	DROP DATABASE d CASCADE;
+	CREATE DATABASE d;
+`
+	if recreateOut, err := c.RunWithCaptureArgs([]string{"sql", "-e", recreateDatabase}); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(recreateOut)
+	}
+
+	// Use conn.Exec here because it returns errors cleanly, as opposed to mixing them with
+	// the command line input.
+	if err := conn.Exec("USE d", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(outSQL, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now, dump again.
+	dumpOut2, err := c.RunWithCaptureArgs([]string{"dump", "d"})
+	if err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(dumpOut2)
+	}
+	outSQL2 := removeFirstLine(dumpOut2)
+	if outSQL2 != expectSQL {
+		t.Fatalf("expected: %s\ngot: %s", expectSQL, outSQL2)
+	}
+
+	// Verify the next value the sequences give out.
+	incOutS1, err := c.RunWithCaptureArgs([]string{"sql", "-d", "d", "-e", "SELECT nextval('s1')"})
+	if err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(incOutS1)
+	}
+	incOutValueS1 := removeFirstLine(incOutS1)
+	const expectedOutValueS1 = `nextval
+1
+`
+	if incOutValueS1 != expectedOutValueS1 {
+		t.Fatalf("expected: %s\ngot: %s", expectedOutValueS1, incOutValueS1)
+	}
+
+	incOutS2, err := c.RunWithCaptureArgs([]string{"sql", "-d", "d", "-e", "SELECT nextval('s2')"})
+	if err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(incOutS2)
+	}
+	incOutValueS2 := removeFirstLine(incOutS2)
+	const expectedOutValueS2 = `nextval
+913
+`
+	if incOutValueS2 != expectedOutValueS2 {
+		t.Fatalf("expected: %s\ngot: %s", expectedOutValueS2, incOutValueS2)
+	}
+}
+
+func removeFirstLine(s string) string {
+	lines := strings.Split(s, "\n")
+	linesWithoutFirst := lines[1:]
+	return strings.Join(linesWithoutFirst, "\n")
+}
+
+func TestDumpSequenceEscaping(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+	CREATE DATABASE "'";
+	CREATE SEQUENCE "'"."'";
+`
+	if out, err := c.RunWithCaptureArgs([]string{"sql", "-e", create}); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(out)
+	}
+
+	out, err := c.RunWithCaptureArgs([]string{"dump", "'"})
+	if err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log(out)
+	}
+
+	const expect = `dump '
+CREATE SEQUENCE "'" MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1;
+
+SELECT setval(e'"\'"', 1, false);
 `
 
 	if out != expect {
@@ -962,6 +1132,90 @@ CREATE TABLE t (
 
 INSERT INTO t (id, next_id) VALUES
 	(1, NULL);
+`
+
+	if out != expect {
+		t.Fatalf("expected: %s\ngot: %s", expect, out)
+	}
+}
+
+func TestDumpWithInvertedIndex(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+	CREATE DATABASE d;
+	CREATE TABLE d.t (
+		a JSON,
+		b JSON,
+		INVERTED INDEX idx (a)
+	);
+
+	CREATE INVERTED INDEX idx2 ON d.t (b);
+
+	INSERT INTO d.t VALUES ('{"a": "b"}', '{"c": "d"}');
+`
+
+	c.RunWithArgs([]string{"sql", "-e", create})
+
+	out, err := c.RunWithCapture("dump d t")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const expect = `dump d t
+CREATE TABLE t (
+	a JSON NULL,
+	b JSON NULL,
+	INVERTED INDEX idx (a),
+	INVERTED INDEX idx2 (b),
+	FAMILY "primary" (a, b, rowid)
+);
+
+INSERT INTO t (a, b) VALUES
+	('{"a": "b"}', '{"c": "d"}');
+`
+
+	if out != expect {
+		t.Fatalf("expected: %s\ngot: %s", expect, out)
+	}
+}
+
+func TestDumpWithComputedColumn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+	CREATE DATABASE d;
+	CREATE TABLE d.t (
+		a INT PRIMARY KEY,
+		b INT AS (a + 1) STORED
+	);
+
+	INSERT INTO d.t VALUES (1);
+`
+
+	c.RunWithArgs([]string{"sql", "-e", create})
+
+	out, err := c.RunWithCapture("dump d t")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const expect = `dump d t
+CREATE TABLE t (
+	a INT NOT NULL,
+	b INT NULL AS (a + 1) STORED,
+	CONSTRAINT "primary" PRIMARY KEY (a ASC),
+	FAMILY "primary" (a, b)
+);
+
+INSERT INTO t (a) VALUES
+	(1);
 `
 
 	if out != expect {

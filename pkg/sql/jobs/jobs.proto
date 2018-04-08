@@ -70,6 +70,26 @@ message ImportDetails {
     repeated float sampling_progress = 5;
     repeated float read_progress = 6;
     repeated float write_progress = 7;
+    uint32 parent_id = 8 [
+      (gogoproto.customname) = "ParentID",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+    ];
+    int32 comma = 9;
+    int32 comment = 10;
+    message Nullif {
+      string nullif = 1;
+    }
+    // nullif needs to differentiate between not present and the empty string.
+    Nullif nullif = 11;
+    int64 sst_size = 12 [(gogoproto.customname) = "SSTSize"];
+    int64 walltime = 13;
+    reserved 14;
+    // samples is populated with the sampling phase's results. These must be
+    // used if a job is resumed to guarantee that AddSSTable will not attempt
+    // to add ranges with an old split point within them.
+    repeated bytes samples = 15;
+    // Skip the first N lines of the input (e.g. to ignore column headers)
+    uint32 skip = 16;
   }
   repeated Table tables = 1 [(gogoproto.nullable) = false];
 }
@@ -87,7 +107,13 @@ message SchemaChangeDetails {
   // be processed. The index represents the index of a mutation in a
   // mutation list containing mutations for the same mutationID.
   repeated ResumeSpanList resume_span_list = 2 [(gogoproto.nullable) = false];
+}
 
+message ChangefeedDetails {
+  util.hlc.Timestamp highwater = 1 [(gogoproto.nullable) = false];
+  repeated sqlbase.TableDescriptor table_descs = 2 [(gogoproto.nullable) = false];
+  string kafka_topic_prefix = 3;
+  string kafka_bootstrap_servers = 4;
 }
 
 message Payload {
@@ -112,6 +138,7 @@ message Payload {
     RestoreDetails restore = 11;
     SchemaChangeDetails schemaChange = 12;
     ImportDetails import = 13;
+    ChangefeedDetails changefeed = 14;
   }
 }
 
@@ -124,4 +151,5 @@ enum Type {
   RESTORE = 2 [(gogoproto.enumvalue_customname) = "TypeRestore"];
   SCHEMA_CHANGE = 3 [(gogoproto.enumvalue_customname) = "TypeSchemaChange"];
   IMPORT = 4 [(gogoproto.enumvalue_customname) = "TypeImport"];
+  CHANGEFEED = 5 [(gogoproto.enumvalue_customname) = "TypeChangefeed"];
 }

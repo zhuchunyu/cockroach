@@ -304,9 +304,9 @@ const (
 	IsNotDistinctFrom
 	Contains
 	ContainedBy
-	Existence
-	SomeExistence
-	AllExistence
+	JSONExists
+	JSONSomeExists
+	JSONAllExists
 
 	// The following operators will always be used with an associated SubOperator.
 	// If Go had algebraic data types they would be defined in a self-contained
@@ -324,6 +324,8 @@ const (
 	Any
 	Some
 	All
+
+	NumComparisonOperators
 )
 
 var comparisonOpName = [...]string{
@@ -349,9 +351,9 @@ var comparisonOpName = [...]string{
 	IsNotDistinctFrom: "IS NOT DISTINCT FROM",
 	Contains:          "@>",
 	ContainedBy:       "<@",
-	Existence:         "?",
-	SomeExistence:     "?|",
-	AllExistence:      "?&",
+	JSONExists:        "?",
+	JSONSomeExists:    "?|",
+	JSONAllExists:     "?&",
 	Any:               "ANY",
 	Some:              "SOME",
 	All:               "ALL",
@@ -362,6 +364,13 @@ func (i ComparisonOperator) String() string {
 		return fmt.Sprintf("ComparisonOp(%d)", i)
 	}
 	return comparisonOpName[i]
+}
+
+// Inverse returns the inverse of this comparison operator if it exists. The
+// second return value is true if it exists, and false otherwise.
+func (i ComparisonOperator) Inverse() (ComparisonOperator, bool) {
+	inverse, ok := cmpOpsInverse[i]
+	return inverse, ok
 }
 
 // hasSubOperator returns if the ComparisonOperator is used with a sub-operator.
@@ -425,9 +434,6 @@ func (node *ComparisonExpr) memoizeFn() {
 	fOp, fLeft, fRight, _, _ := foldComparisonExpr(node.Operator, node.Left, node.Right)
 	leftRet, rightRet := fLeft.(TypedExpr).ResolvedType(), fRight.(TypedExpr).ResolvedType()
 	switch node.Operator {
-	case IsDistinctFrom, IsNotDistinctFrom:
-		// Is and related operators do not memoize a CmpOp.
-		return
 	case Any, Some, All:
 		// Array operators memoize the SubOperator's CmpOp.
 		fOp, _, _, _, _ = foldComparisonExpr(node.SubOperator, nil, nil)
@@ -461,30 +467,6 @@ func (node *ComparisonExpr) TypedLeft() TypedExpr {
 // TypedRight returns the ComparisonExpr's right expression as a TypedExpr.
 func (node *ComparisonExpr) TypedRight() TypedExpr {
 	return node.Right.(TypedExpr)
-}
-
-// IsMixedTypeComparison returns true when the two sides of
-// a comparison operator have different types.
-func (node *ComparisonExpr) IsMixedTypeComparison() bool {
-	switch node.Operator {
-	case In, NotIn:
-		tuple := node.TypedRight().ResolvedType().(types.TTuple)
-		for _, typ := range tuple {
-			if !sameTypeOrNull(node.TypedLeft().ResolvedType(), typ) {
-				return true
-			}
-		}
-		return false
-	case Any, Some, All:
-		array := node.TypedRight().ResolvedType().(types.TArray)
-		return !sameTypeOrNull(node.TypedLeft().ResolvedType(), array.Typ)
-	default:
-		return !sameTypeOrNull(node.TypedLeft().ResolvedType(), node.TypedRight().ResolvedType())
-	}
-}
-
-func sameTypeOrNull(left, right types.T) bool {
-	return left == types.Null || right == types.Null || left.Equivalent(right)
 }
 
 // RangeCond represents a BETWEEN [SYMMETRIC] or a NOT BETWEEN [SYMMETRIC]
@@ -615,6 +597,31 @@ type CoalesceExpr struct {
 	Exprs Exprs
 
 	typeAnnotation
+}
+
+// NewTypedCoalesceExpr returns a CoalesceExpr that is well-typed.
+func NewTypedCoalesceExpr(typedExprs TypedExprs, typ types.T) *CoalesceExpr {
+	c := &CoalesceExpr{
+		Name:  "COALESCE",
+		Exprs: make(Exprs, len(typedExprs)),
+	}
+	for i := range typedExprs {
+		c.Exprs[i] = typedExprs[i]
+	}
+	c.typ = typ
+	return c
+}
+
+// NewTypedArray returns an Array that is well-typed.
+func NewTypedArray(typedExprs TypedExprs, typ types.T) *Array {
+	c := &Array{
+		Exprs: make(Exprs, len(typedExprs)),
+	}
+	for i := range typedExprs {
+		c.Exprs[i] = typedExprs[i]
+	}
+	c.typ = typ
+	return c
 }
 
 // TypedExprAt returns the expression at the specified index as a TypedExpr.
@@ -867,36 +874,36 @@ const (
 	Concat
 	LShift
 	RShift
-	FetchVal
-	FetchText
-	FetchValPath
-	FetchTextPath
-	RemovePath
+	JSONFetchVal
+	JSONFetchText
+	JSONFetchValPath
+	JSONFetchTextPath
+
+	NumBinaryOperators
 )
 
 var binaryOpName = [...]string{
-	Bitand:        "&",
-	Bitor:         "|",
-	Bitxor:        "#",
-	Plus:          "+",
-	Minus:         "-",
-	Mult:          "*",
-	Div:           "/",
-	FloorDiv:      "//",
-	Mod:           "%",
-	Pow:           "^",
-	Concat:        "||",
-	LShift:        "<<",
-	RShift:        ">>",
-	FetchVal:      "->",
-	FetchText:     "->>",
-	FetchValPath:  "#>",
-	FetchTextPath: "#>>",
-	RemovePath:    "#-",
+	Bitand:            "&",
+	Bitor:             "|",
+	Bitxor:            "#",
+	Plus:              "+",
+	Minus:             "-",
+	Mult:              "*",
+	Div:               "/",
+	FloorDiv:          "//",
+	Mod:               "%",
+	Pow:               "^",
+	Concat:            "||",
+	LShift:            "<<",
+	RShift:            ">>",
+	JSONFetchVal:      "->",
+	JSONFetchText:     "->>",
+	JSONFetchValPath:  "#>",
+	JSONFetchTextPath: "#>>",
 }
 
 func (i BinaryOperator) isPadded() bool {
-	return !(i == FetchVal || i == FetchText || i == FetchValPath || i == FetchTextPath)
+	return !(i == JSONFetchVal || i == JSONFetchText || i == JSONFetchValPath || i == JSONFetchTextPath)
 }
 
 func (i BinaryOperator) String() string {
@@ -979,6 +986,8 @@ const (
 	UnaryPlus UnaryOperator = iota
 	UnaryMinus
 	UnaryComplement
+
+	NumUnaryOperators
 )
 
 var unaryOpName = [...]string{
@@ -1041,19 +1050,44 @@ type FuncExpr struct {
 	WindowDef *WindowDef
 
 	typeAnnotation
-	fn Builtin
+	fn *Builtin
 }
 
-// ResolvedFunc returns the function definition; can only be called after
+// NewTypedFuncExpr returns a FuncExpr that is already well-typed and resolved.
+func NewTypedFuncExpr(
+	ref ResolvableFunctionReference,
+	aggQualifier funcType,
+	exprs TypedExprs,
+	filter TypedExpr,
+	windowDef *WindowDef,
+	typ types.T,
+	builtin *Builtin,
+) *FuncExpr {
+	f := &FuncExpr{
+		Func:           ref,
+		Type:           aggQualifier,
+		Exprs:          make(Exprs, len(exprs)),
+		Filter:         filter,
+		WindowDef:      windowDef,
+		typeAnnotation: typeAnnotation{typ: typ},
+		fn:             builtin,
+	}
+	for i, e := range exprs {
+		f.Exprs[i] = e
+	}
+	return f
+}
+
+// ResolvedBuiltin returns the builtin definition; can only be called after
 // Resolve (which happens during TypeCheck).
-func (node *FuncExpr) ResolvedFunc() *FunctionDefinition {
-	return node.Func.FunctionReference.(*FunctionDefinition)
+func (node *FuncExpr) ResolvedBuiltin() *Builtin {
+	return node.fn
 }
 
 // GetAggregateConstructor exposes the AggregateFunc field for use by
 // the group node in package sql.
 func (node *FuncExpr) GetAggregateConstructor() func(*EvalContext) AggregateFunc {
-	if node.fn.AggregateFunc == nil {
+	if node.fn == nil || node.fn.AggregateFunc == nil {
 		return nil
 	}
 	return func(evalCtx *EvalContext) AggregateFunc {
@@ -1065,7 +1099,7 @@ func (node *FuncExpr) GetAggregateConstructor() func(*EvalContext) AggregateFunc
 // GetWindowConstructor returns a window function constructor if the
 // FuncExpr is a built-in window function.
 func (node *FuncExpr) GetWindowConstructor() func(*EvalContext) WindowFunc {
-	if node.fn.WindowFunc == nil {
+	if node.fn == nil || node.fn.WindowFunc == nil {
 		return nil
 	}
 	return func(evalCtx *EvalContext) WindowFunc {
@@ -1091,12 +1125,12 @@ func (node *FuncExpr) IsWindowFunctionApplication() bool {
 // potentially returns a different value when called in the same statement with
 // the same parameters.
 func (node *FuncExpr) IsImpure() bool {
-	return node.fn.Impure
+	return node.fn != nil && node.fn.Impure
 }
 
 // IsDistSQLBlacklist returns whether the function is not supported by DistSQL.
 func (node *FuncExpr) IsDistSQLBlacklist() bool {
-	return node.fn.DistsqlBlacklist
+	return node.fn != nil && node.fn.DistsqlBlacklist
 }
 
 type funcType int
@@ -1172,6 +1206,15 @@ func (node *CaseExpr) Format(ctx *FmtCtx) {
 	ctx.WriteString("END")
 }
 
+// NewTypedCaseExpr returns a new CaseExpr that is verified to be well-typed.
+func NewTypedCaseExpr(
+	expr TypedExpr, whens []*When, elseStmt TypedExpr, typ types.T,
+) (*CaseExpr, error) {
+	node := &CaseExpr{Expr: expr, Whens: whens, Else: elseStmt}
+	node.typ = typ
+	return node, nil
+}
+
 // When represents a WHEN sub-expression.
 type When struct {
 	Cond Expr
@@ -1232,30 +1275,41 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 	}
 }
 
+// NewTypedCastExpr returns a new CastExpr that is verified to be well-typed.
+func NewTypedCastExpr(expr TypedExpr, typ types.T) (*CastExpr, error) {
+	colType, err := coltypes.DatumTypeToColumnType(typ)
+	if err != nil {
+		return nil, err
+	}
+	node := &CastExpr{Expr: expr, Type: colType, SyntaxMode: CastShort}
+	node.typ = typ
+	return node, nil
+}
+
 func (node *CastExpr) castType() types.T {
 	return coltypes.CastTargetToDatumType(node.Type)
 }
 
 var (
-	boolCastTypes = []types.T{types.Null, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString}
-	intCastTypes  = []types.T{types.Null, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
+	boolCastTypes = []types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString}
+	intCastTypes  = []types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval, types.Oid}
-	floatCastTypes = []types.T{types.Null, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
+	floatCastTypes = []types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval}
-	decimalCastTypes = []types.T{types.Null, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
+	decimalCastTypes = []types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval}
-	stringCastTypes = []types.T{types.Null, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
-		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.UUID, types.Date, types.Time, types.Oid, types.INet}
-	bytesCastTypes     = []types.T{types.Null, types.String, types.FamCollatedString, types.Bytes, types.UUID}
-	dateCastTypes      = []types.T{types.Null, types.String, types.FamCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int}
-	timeCastTypes      = []types.T{types.Null, types.String, types.FamCollatedString, types.Time, types.Timestamp, types.TimestampTZ, types.Interval}
-	timestampCastTypes = []types.T{types.Null, types.String, types.FamCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int}
-	intervalCastTypes  = []types.T{types.Null, types.String, types.FamCollatedString, types.Int, types.Time, types.Interval}
-	oidCastTypes       = []types.T{types.Null, types.String, types.FamCollatedString, types.Int, types.Oid}
-	uuidCastTypes      = []types.T{types.Null, types.String, types.FamCollatedString, types.Bytes, types.UUID}
-	inetCastTypes      = []types.T{types.Null, types.String, types.FamCollatedString, types.INet}
-	arrayCastTypes     = []types.T{types.Null, types.String}
-	jsonCastTypes      = []types.T{types.Null, types.String, types.JSON}
+	stringCastTypes = []types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.FamCollatedString,
+		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.UUID, types.Date, types.Time, types.Oid, types.INet, types.JSON}
+	bytesCastTypes     = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Bytes, types.UUID}
+	dateCastTypes      = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int}
+	timeCastTypes      = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Time, types.Timestamp, types.TimestampTZ, types.Interval}
+	timestampCastTypes = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int}
+	intervalCastTypes  = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Int, types.Time, types.Interval}
+	oidCastTypes       = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Int, types.Oid}
+	uuidCastTypes      = []types.T{types.Unknown, types.String, types.FamCollatedString, types.Bytes, types.UUID}
+	inetCastTypes      = []types.T{types.Unknown, types.String, types.FamCollatedString, types.INet}
+	arrayCastTypes     = []types.T{types.Unknown, types.String}
+	jsonCastTypes      = []types.T{types.Unknown, types.String, types.JSON}
 )
 
 // validCastTypes returns a set of types that can be cast into the provided type.
@@ -1295,9 +1349,8 @@ func validCastTypes(t types.T) []types.T {
 		if t.FamilyEqual(types.FamCollatedString) {
 			return stringCastTypes
 		} else if t.FamilyEqual(types.FamArray) {
-			ret := make([]types.T, len(arrayCastTypes)+1)
+			ret := make([]types.T, len(arrayCastTypes))
 			copy(ret, arrayCastTypes)
-			ret[len(ret)-1] = t
 			return ret
 		}
 		return nil

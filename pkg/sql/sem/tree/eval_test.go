@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -463,6 +464,24 @@ func TestEval(t *testing.T) {
 		{`0 IS NOT DISTINCT FROM NULL`, `false`},
 		{`NULL IS NOT DISTINCT FROM NULL`, `true`},
 		{`NULL IS NOT DISTINCT FROM 1`, `false`},
+		{`(1, NULL) IS NOT DISTINCT FROM (1, NULL)`, `true`},
+		{`(1, NULL) IS DISTINCT FROM (1, NULL)`, `false`},
+		{`(NULL, 1) IS NOT DISTINCT FROM (NULL, 1)`, `true`},
+		{`(NULL, 1) IS DISTINCT FROM (NULL, 1)`, `false`},
+		{`(1, NULL) IS NOT DISTINCT FROM (2, NULL)`, `false`},
+		{`(1, NULL) IS DISTINCT FROM (2, NULL)`, `true`},
+		{`(NULL, 1) IS NOT DISTINCT FROM (NULL, 2)`, `false`},
+		{`(NULL, 1) IS DISTINCT FROM (NULL, 2)`, `true`},
+		{`((NULL, NULL), (1, NULL)) IS NOT DISTINCT FROM ((NULL, NULL), (1, NULL))`, `true`},
+		{`((NULL, NULL), (1, NULL)) IS DISTINCT FROM ((NULL, NULL), (1, NULL))`, `false`},
+		{`ARRAY[1,2,3] IS DISTINCT FROM ARRAY[1,2,3]`, `false`},
+		{`ARRAY['foo','bar','baz'] IS DISTINCT FROM ARRAY['foo','bar','baz']`, `false`},
+		{`ARRAY[1,2,3] IS DISTINCT FROM ARRAY[1,2,4]`, `true`},
+		{`ARRAY[1,2,3] IS NOT DISTINCT FROM ARRAY[1,2,3]`, `true`},
+		{`ARRAY['foo','bar','baz'] IS NOT DISTINCT FROM ARRAY['foo','bar','baz']`, `true`},
+		{`ARRAY[1,2,3] IS DISTINCT FROM NULL`, `true`},
+		{`ARRAY[1,2,3] IS NOT DISTINCT FROM NULL`, `false`},
+		{`NULL::INT[] IS DISTINCT FROM NULL::INT[]`, `false`},
 		// IS expressions.
 		{`0 IS NULL`, `false`},
 		{`0 IS NOT NULL`, `true`},
@@ -626,8 +645,22 @@ func TestEval(t *testing.T) {
 		{`'12:00:00'::time IN ('12:00:00'::time)`, `true`},
 		{`'2010-09-28 12:00:00.1'::timestamp IN ('2010-09-28 12:00:00.1'::timestamp)`, `true`},
 		{`'34h'::interval IN ('34h'::interval)`, `true`},
-		{`(1,2) IN ((0+1,1+1), (3,4), (5,6))`, `true`},
+		{`(1, 2) IN ((0+1, 1+1), (3, 4), (5, 6))`, `true`},
 		{`(1, 2) IN ((2, 1), (3, 4))`, `false`},
+		{`1 IN (1, 2, NULL)`, `true`},
+		{`NULL IN (1, 2, NULL)`, `NULL`},
+		{`(1, 2) IN ((NULL, 2), (1, NULL), (1, 2))`, `true`},
+		{`(1, 2) IN ((1, NULL), (NULL, 2))`, `NULL`},
+		{`(1, NULL) IN ((1, NULL), (NULL, 2), (3, 4))`, `NULL`},
+		{`(1, NULL) IN ((NULL, 2), (3, 4))`, `NULL`},
+		{`(1, NULL) IN ((3, 4))`, `false`},
+		{`(NULL, 2) IN ((1, NULL), (NULL, 2), (3, 4))`, `NULL`},
+		{`(NULL, 2) IN ((1, NULL), (3, 4))`, `NULL`},
+		{`(NULL, 2) IN ((3, 4))`, `false`},
+		{`(NULL, NULL) IN ((NULL, NULL), (1, NULL), (NULL, 2), (3, 4))`, `NULL`},
+		{`(NULL, NULL) IN ((1, NULL), (NULL, 2), (3, 4))`, `NULL`},
+		{`(NULL, NULL) IN ((NULL, 2), (3, 4))`, `NULL`},
+		{`(NULL, NULL) IN ((3, 4))`, `NULL`},
 		// ANY, SOME, and ALL expressions.
 		{`1   = ANY ARRAY[]`, `false`},
 		{`1   = ANY (ARRAY[2, 3, 4])`, `false`},
@@ -835,11 +868,22 @@ func TestEval(t *testing.T) {
 		{`'1970-01-01 00:01:00.123456-00:00'::timestamp::float`, `60.123456`},
 		{`'1970-01-01 00:01:00.123456-00:00'::timestamptz::float`, `60.123456`},
 		{`'1970-01-10'::date::float`, `9.0`},
-		{`'3h3us'::interval::float`, `1.0800000003e+16`},
+		{`'3h3us'::interval::float`, `10800.000003`},
 		{`10::int::date`, `'1970-01-11'`},
 		{`10::int::timestamp`, `'1970-01-01 00:00:10+00:00'`},
 		{`10::int::timestamptz`, `'1970-01-01 00:00:10+00:00'`},
 		{`10123456::int::interval`, `'10s123ms456µs'`},
+		{`ARRAY[NULL]::string[]`, `ARRAY['NULL']`},
+		{`ARRAY[1,2,3]::string[]`, `ARRAY['1','2','3']`},
+		{`ARRAY['1','2','3']::int[]`, `ARRAY[1,2,3]`},
+		{`ARRAY['1','2','3']::name[]`, `ARRAY['1','2','3']`},
+		{`ARRAY[1,2,3]::decimal[]`, `ARRAY[1,2,3]`},
+		{`ARRAY[1.2,2.4,3.5]::float[]`, `ARRAY[1.2,2.4,3.5]`},
+		{`ARRAY[19620326,19931223]::timestamp[]`, `ARRAY['1970-08-16 02:05:26+00:00','1970-08-19 16:27:03+00:00']`},
+		{`ARRAY[1.2,2.4,3.5]::decimal[]::float[]`, `ARRAY[1.2,2.4,3.5]`},
+		{`ARRAY['3h3us']::interval[]::decimal[]`, `ARRAY[10800.000003]`},
+		{`ARRAY[1,NULL,3]::string[]`, `ARRAY['1','NULL','3']`},
+		{`ARRAY['hello','world']::char(2)[]`, `ARRAY['he','wo']`},
 		// Type annotation expressions.
 		{`ANNOTATE_TYPE('s', string)`, `'s'`},
 		{`ANNOTATE_TYPE('s', bytes)`, `'\x73'`},
@@ -1041,8 +1085,20 @@ func TestEval(t *testing.T) {
 		{`'NaN'::decimal >= 'NaN'::decimal`, `true`},
 		{`'NaN'::decimal::float`, `NaN`},
 		{`'NaN'::float::decimal`, `NaN`},
+		// inet operations: ~ & | + - << <<= >> >>= &&.
+		{`~'234a:3456:aaa::/12'::inet = 'dcb5:cba9:f555:ffff:ffff:ffff:ffff:ffff/12'::inet`, `true`},
+		{`'234a:3456:aaa::/12'::inet & '12aa:444f:457a:ff45:ff31::'::inet`, `'20a:446:2a::'`},
+		{`'234a:3456:aaa::/12'::inet | '12aa:444f:457a:ff45:ff31::'::inet`, `'33ea:745f:4ffa:ff45:ff31::'`},
+		{`'234a:3456:aaa::/12'::inet + 486486846846864`, `'234a:3456:aaa:0:1:ba75:bb1:b790/12'`},
+		{`486486846846864 + '234a:3456:aaa::/12'::inet `, `'234a:3456:aaa:0:1:ba75:bb1:b790/12'`},
+		{`'234a:3456:aaa::/12'::inet - 486486846846864`, `'234a:3456:aa9:ffff:fffe:458a:f44e:4870/12'`},
+		{`'192.168.200.95/17'::inet >> '192.168.162.1'::inet`, `true`},
+		{`'192.168.2.1'::inet >>= '192.168.2.1'::inet`, `true`},
+		{`'192.168.162.1'::inet << '192.168.200.95/17'::inet`, `true`},
+		{`'192.168.2.1'::inet <<= '192.168.2.1'::inet`, `true`},
+		{`'192.168.200.95'::inet && '192.168.2.1/8'::inet`, `true`},
 	}
-	ctx := tree.NewTestingEvalContext()
+	ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	// We have to manually close this account because we're doing the evaluations
 	// ourselves.
 	defer ctx.Mon.Stop(context.Background())
@@ -1058,9 +1114,11 @@ func TestEval(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
+			t.Logf("Type checked expression: %s", typedExpr)
 			if typedExpr, err = ctx.NormalizeExpr(typedExpr); err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
+			t.Logf("Normalized expression:   %s", typedExpr)
 			r, err := typedExpr.Eval(ctx)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
@@ -1149,7 +1207,7 @@ func TestTimeConversion(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		ctx := tree.NewTestingEvalContext()
+		ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer ctx.Mon.Stop(context.Background())
 		exprStr := fmt.Sprintf("experimental_strptime('%s', '%s')", test.start, test.format)
 		expr, err := parser.ParseExpr(exprStr)
@@ -1248,7 +1306,7 @@ func TestEvalError(t *testing.T) {
 			`could not parse "abcd" as type interval: interval: missing unit`},
 		{`'1- 2:3:4 9'::interval`,
 			`could not parse "1- 2:3:4 9" as type interval: invalid input syntax for type interval 1- 2:3:4 9`},
-		{`e'\\x6sdfsd36174'::BYTES`, `could not parse "\\x6sdfsd36174" as type bytes: encoding/hex: odd length hex string`},
+		{`e'\\xdedf0d36174'::BYTES`, `could not parse "\\xdedf0d36174" as type bytes: encoding/hex: odd length hex string`},
 		{`ARRAY[NULL, ARRAY[1, 2]]`, `multidimensional arrays must have array expressions with matching dimensions`},
 		{`ARRAY[ARRAY[1, 2], NULL]`, `multidimensional arrays must have array expressions with matching dimensions`},
 		{`ARRAY[ARRAY[1, 2], ARRAY[1]]`, `multidimensional arrays must have array expressions with matching dimensions`},
@@ -1291,7 +1349,7 @@ func TestEvalError(t *testing.T) {
 		}
 		typedExpr, err := tree.TypeCheck(expr, nil, types.Any)
 		if err == nil {
-			evalCtx := tree.NewTestingEvalContext()
+			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
 			_, err = typedExpr.Eval(evalCtx)
 		}

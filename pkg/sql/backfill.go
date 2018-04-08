@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -233,7 +234,8 @@ func (sc *SchemaChanger) removeIndexZoneConfigs(
 			zone.DeleteIndexSubzones(uint32(indexDesc.ID))
 		}
 
-		_, err = writeZoneConfig(ctx, txn, sc.tableID, tableDesc, zone, sc.execCfg)
+		hasNewSubzones := false
+		_, err = writeZoneConfig(ctx, txn, sc.tableID, tableDesc, zone, sc.execCfg, hasNewSubzones)
 		if sqlbase.IsCCLRequiredError(err) {
 			return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
 				"because table %q has at least one remaining index or partition with a zone config",
@@ -279,7 +281,11 @@ func (sc *SchemaChanger) truncateIndexes(
 				}
 
 				tc := &TableCollection{leaseMgr: sc.leaseMgr}
-				defer tc.releaseTables(ctx)
+				defer func() {
+					if err := tc.releaseTables(ctx, dontBlockForDBCacheUpdate); err != nil {
+						log.Warningf(ctx, "error releasing tables: %s", err)
+					}
+				}()
 				tableDesc, err := sc.getTableVersion(ctx, txn, tc, version)
 				if err != nil {
 					return err
@@ -502,7 +508,11 @@ func (sc *SchemaChanger) distBackfill(
 
 			tc := &TableCollection{leaseMgr: sc.leaseMgr}
 			// Use a leased table descriptor for the backfill.
-			defer tc.releaseTables(ctx)
+			defer func() {
+				if err := tc.releaseTables(ctx, dontBlockForDBCacheUpdate); err != nil {
+					log.Warningf(ctx, "error releasing tables: %s", err)
+				}
+			}()
 			tableDesc, err := sc.getTableVersion(ctx, txn, tc, version)
 			if err != nil {
 				return err
@@ -512,7 +522,12 @@ func (sc *SchemaChanger) distBackfill(
 			var otherTableDescs []sqlbase.TableDescriptor
 			if backfillType == columnBackfill {
 				fkTables, _ := sqlbase.TablesNeededForFKs(
-					ctx, *tableDesc, sqlbase.CheckUpdates, sqlbase.NoLookup, sqlbase.NoCheckPrivilege,
+					ctx,
+					*tableDesc,
+					sqlbase.CheckUpdates,
+					sqlbase.NoLookup,
+					sqlbase.NoCheckPrivilege,
+					nil, /* AnalyzeExprFunction */
 				)
 				for k := range fkTables {
 					table, err := tc.getTableVersionByID(ctx, txn, k)
@@ -522,9 +537,11 @@ func (sc *SchemaChanger) distBackfill(
 					otherTableDescs = append(otherTableDescs, *table)
 				}
 			}
+			rw := &errOnlyResultWriter{}
 			recv := makeDistSQLReceiver(
 				ctx,
-				nil, /* resultWriter */
+				rw,
+				tree.Rows, /* stmtType - doesn't matter here since no result are produced */
 				sc.rangeDescriptorCache,
 				sc.leaseHolderCache,
 				nil, /* txn - the flow does not run wholly in a txn */
@@ -539,13 +556,12 @@ func (sc *SchemaChanger) distBackfill(
 			if err != nil {
 				return err
 			}
-			if err := sc.distSQLPlanner.Run(
-				&planCtx, txn, &plan, recv, evalCtx,
-			); err != nil {
-				return err
-			}
-
-			return recv.err
+			sc.distSQLPlanner.Run(
+				&planCtx,
+				nil, /* txn - the processors manage their own transactions */
+				&plan, recv, evalCtx,
+			)
+			return rw.Err()
 		}); err != nil {
 			return err
 		}
@@ -564,10 +580,9 @@ func (sc *SchemaChanger) backfillIndexes(
 	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		details := *sc.job.WithTxn(txn).Payload().Details.(*jobs.Payload_SchemaChange).SchemaChange
 		if details.ReadAsOf == (hlc.Timestamp{}) {
-			details.ReadAsOf = txn.OrigTimestamp()
+			details.ReadAsOf = txn.CommitTimestamp()
 			if err := sc.job.WithTxn(txn).SetDetails(ctx, details); err != nil {
-				log.Warningf(ctx, "failed to store readAsOf on job %v after completing state machine: %v",
-					sc.job.ID(), err)
+				return errors.Wrapf(err, "failed to store readAsOf on job %d", *sc.job.ID())
 			}
 		}
 		sc.readAsOf = details.ReadAsOf

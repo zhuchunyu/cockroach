@@ -17,18 +17,15 @@ package engine
 import (
 	"C"
 	"bufio"
+	"context"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
-)
-import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 const lockFilename = `TEMP_DIR.LOCK`
@@ -104,6 +101,12 @@ func CleanupTempDirs(recordPath string) error {
 	for scanner.Scan() {
 		path := scanner.Text()
 		if path == "" {
+			continue
+		}
+
+		// Check if the temporary directory exists; if it does not, skip over it.
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			log.Warningf(context.Background(), "could not locate previous temporary directory %s, might require manual cleanup, or might have already been cleaned up.", path)
 			continue
 		}
 

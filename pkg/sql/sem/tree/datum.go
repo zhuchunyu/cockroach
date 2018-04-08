@@ -2295,7 +2295,7 @@ func (d *DJSON) Size() uintptr {
 type DTuple struct {
 	D Datums
 
-	Sorted bool
+	sorted bool
 }
 
 // NewDTuple creates a *DTuple with the provided datums. When creating a new
@@ -2480,16 +2480,26 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&d.D)
 }
 
+// Sorted returns true if the tuple is known to be sorted (and contains no
+// NULLs).
+func (d *DTuple) Sorted() bool {
+	return d.sorted
+}
+
 // SetSorted sets the sorted flag on the DTuple. This should be used when a
 // DTuple is known to be sorted based on the datums added to it.
 func (d *DTuple) SetSorted() *DTuple {
-	d.Sorted = true
+	if d.ContainsNull() {
+		// A DTuple that contains a NULL (see ContainsNull) cannot be marked as sorted.
+		return d
+	}
+	d.sorted = true
 	return d
 }
 
 // AssertSorted asserts that the DTuple is sorted.
 func (d *DTuple) AssertSorted() {
-	if !d.Sorted {
+	if !d.sorted {
 		panic(fmt.Sprintf("expected sorted tuple, found %#v", d))
 	}
 }
@@ -2497,8 +2507,18 @@ func (d *DTuple) AssertSorted() {
 // SearchSorted searches the tuple for the target Datum, returning an int with
 // the same contract as sort.Search and a boolean flag signifying whether the datum
 // was found. It assumes that the DTuple is sorted and panics if it is not.
+//
+// The target Datum cannot be NULL or a DTuple that contains NULLs (we cannot
+// binary search in this case; for example `(1, NULL) IN ((1, 2), ..)` needs to
+// be
 func (d *DTuple) SearchSorted(ctx *EvalContext, target Datum) (int, bool) {
 	d.AssertSorted()
+	if target == DNull {
+		panic(fmt.Sprintf("NULL target (d: %s)", d))
+	}
+	if t, ok := target.(*DTuple); ok && t.ContainsNull() {
+		panic(fmt.Sprintf("target containing NULLs: %#v (d: %s)", target, d))
+	}
 	i := sort.Search(len(d.D), func(i int) bool {
 		return d.D[i].Compare(ctx, target) >= 0
 	})
@@ -2513,11 +2533,11 @@ func (d *DTuple) Normalize(ctx *EvalContext) {
 }
 
 func (d *DTuple) sort(ctx *EvalContext) {
-	if !d.Sorted {
+	if !d.sorted {
 		sort.Slice(d.D, func(i, j int) bool {
 			return d.D[i].Compare(ctx, d.D[j]) < 0
 		})
-		d.Sorted = true
+		d.SetSorted()
 	}
 }
 
@@ -2542,35 +2562,30 @@ func (d *DTuple) Size() uintptr {
 	return sz
 }
 
-// SortedDifference finds the elements of d which are not in other,
-// assuming that d and other are already sorted.
-func (d *DTuple) SortedDifference(ctx *EvalContext, other *DTuple) *DTuple {
-	d.AssertSorted()
-	other.AssertSorted()
-
-	res := NewDTuple().SetSorted()
-	a := d.D
-	b := other.D
-	for len(a) > 0 && len(b) > 0 {
-		switch a[0].Compare(ctx, b[0]) {
-		case -1:
-			res.D = append(res.D, a[0])
-			a = a[1:]
-		case 0:
-			a = a[1:]
-			b = b[1:]
-		case 1:
-			b = b[1:]
+// ContainsNull returns true if the tuple contains NULL, possibly nested inside
+// other tuples. For example, all the following tuples contain NULL:
+//  (1, 2, NULL)
+//  ((1, 1), (2, NULL))
+//  (((1, 1), (2, 2)), ((3, 3), (4, NULL)))
+func (d *DTuple) ContainsNull() bool {
+	for _, r := range d.D {
+		if r == DNull {
+			return true
+		}
+		if t, ok := r.(*DTuple); ok {
+			if t.ContainsNull() {
+				return true
+			}
 		}
 	}
-	return res
+	return false
 }
 
 type dNull struct{}
 
 // ResolvedType implements the TypedExpr interface.
 func (dNull) ResolvedType() types.T {
-	return types.Null
+	return types.Unknown
 }
 
 // Compare implements the Datum interface.
@@ -3176,6 +3191,12 @@ func NewDIntVectorFromDArray(d *DArray) Datum {
 	return wrapWithOid(d, oid.T_int2vector)
 }
 
+// NewDOidVectorFromDArray is a helper routine to create a *DOidVector
+// (implemented as a *DOidWrapper) initialized from an existing *DArray.
+func NewDOidVectorFromDArray(d *DArray) Datum {
+	return wrapWithOid(d, oid.T_oidvector)
+}
+
 // DatumTypeSize returns a lower bound on the total size of a Datum
 // of the given type in bytes, including memory that is
 // pointed at (even if shared between Datum instances) but excluding
@@ -3236,7 +3257,7 @@ var baseDatumTypeSizes = map[types.T]struct {
 	sz       uintptr
 	variable bool
 }{
-	types.Null:        {unsafe.Sizeof(dNull{}), fixedSize},
+	types.Unknown:     {unsafe.Sizeof(dNull{}), fixedSize},
 	types.Bool:        {unsafe.Sizeof(DBool(false)), fixedSize},
 	types.Int:         {unsafe.Sizeof(DInt(0)), fixedSize},
 	types.Float:       {unsafe.Sizeof(DFloat(0.0)), fixedSize},

@@ -22,9 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
-	yaml "gopkg.in/yaml.v2"
 )
 
 // Several ranges outside of the SQL keyspace are given special names so they
@@ -76,7 +76,7 @@ func ZoneSpecifierFromID(
 	if err != nil {
 		return tree.ZoneSpecifier{}, err
 	}
-	tn := &tree.TableName{DatabaseName: tree.Name(db), TableName: tree.Name(name)}
+	tn := tree.NewTableName(tree.Name(db), tree.Name(name))
 	return tree.ZoneSpecifier{
 		TableOrIndex: tree.TableNameWithIndex{
 			Table: tree.NormalizableTableName{TableNameReference: tn},
@@ -105,28 +105,38 @@ func ParseCLIZoneSpecifier(s string) (tree.ZoneSpecifier, error) {
 	}
 	parsed.SearchTable = false
 	var partition tree.Name
-	if un := parsed.Table.TableNameReference.(*tree.UnresolvedName); len(*un) == 1 {
+	if un := parsed.Table.TableNameReference.(*tree.UnresolvedName); un.NumParts == 1 {
 		// Unlike in SQL, where a name with one part indicates a table in the
 		// current database, if a CLI specifier has just one name part, it indicates
 		// a database.
-		return tree.ZoneSpecifier{Database: *(*un)[0].(*tree.Name)}, nil
-	} else if len(*un) == 3 {
+		return tree.ZoneSpecifier{Database: tree.Name(un.Parts[0])}, nil
+	} else if un.NumParts == 3 {
 		// If a CLI specifier has three name parts, the last name is a partition.
 		// Pop it off so TableNameReference.Normalize sees only the table name
 		// below.
-		partition = *(*un)[2].(*tree.Name)
-		tPref := (*un)[:2]
-		parsed.Table.TableNameReference = &tPref
+		partition = tree.Name(un.Parts[0])
+		un.Parts[0], un.Parts[1], un.Parts[2] = un.Parts[1], un.Parts[2], un.Parts[3]
+		un.NumParts--
 	}
 	// We've handled the special cases for named zones, databases and partitions;
 	// have TableNameReference.Normalize tell us whether what remains is a valid
 	// table or index name.
-	if _, err = parsed.Table.Normalize(); err != nil {
+	tn, err := parsed.Table.Normalize()
+	if err != nil {
 		return tree.ZoneSpecifier{}, err
 	}
 	if parsed.Index != "" && partition != "" {
 		return tree.ZoneSpecifier{}, fmt.Errorf(
 			"index and partition cannot be specified simultaneously: %q", s)
+	}
+	// Table prefixes in CLI zone specifiers always have the form
+	// "table" or "db.table" and do not know about schemas. They never
+	// refer to virtual schemas. So migrate the db part to the catalog
+	// position.
+	if tn.ExplicitSchema {
+		tn.ExplicitCatalog = true
+		tn.CatalogName = tn.SchemaName
+		tn.SchemaName = tree.PublicSchemaName
 	}
 	return tree.ZoneSpecifier{
 		TableOrIndex: parsed,
@@ -144,12 +154,15 @@ func CLIZoneSpecifier(zs *tree.ZoneSpecifier) string {
 		return zs.Database.String()
 	}
 	ti := zs.TableOrIndex
-	if zs.Partition != "" {
-		tn := ti.Table.TableName()
-		ti.Table = tree.NormalizableTableName{
-			TableNameReference: &tree.UnresolvedName{&tn.DatabaseName, &tn.TableName, &zs.Partition},
-		}
+
+	// The table name may have a schema specifier. CLI zone specifiers
+	// do not support this, so strip it.
+	tn := ti.Table.TableName()
+	if zs.Partition == "" {
+		ti.Table.TableNameReference = tree.NewUnresolvedName(tn.Catalog(), tn.Table())
+	} else {
 		// The index is redundant when the partition is specified, so omit it.
+		ti.Table.TableNameReference = tree.NewUnresolvedName(tn.Catalog(), tn.Table(), string(zs.Partition))
 		ti.Index = ""
 	}
 	return tree.AsStringWithFlags(&ti, tree.FmtAlwaysQualifyTableNames)
@@ -158,10 +171,12 @@ func CLIZoneSpecifier(zs *tree.ZoneSpecifier) string {
 // ResolveZoneSpecifier converts a zone specifier to the ID of most specific
 // zone whose config applies.
 func ResolveZoneSpecifier(
-	zs *tree.ZoneSpecifier,
-	sessionDB string,
-	resolveName func(parentID uint32, name string) (id uint32, err error),
+	zs *tree.ZoneSpecifier, resolveName func(parentID uint32, name string) (id uint32, err error),
 ) (uint32, error) {
+	// A zone specifier has one of 3 possible structures:
+	// - a predefined named zone;
+	// - a database name;
+	// - a table or index name.
 	if zs.NamedZone != "" {
 		if zs.NamedZone == DefaultZoneName {
 			return keys.RootNamespaceID, nil
@@ -176,11 +191,17 @@ func ResolveZoneSpecifier(
 		return resolveName(keys.RootNamespaceID, string(zs.Database))
 	}
 
-	tn, err := zs.TableOrIndex.Table.NormalizeWithDatabaseName(sessionDB)
+	// Third case: a table or index name. We look up the table part here.
+
+	tn, err := zs.TableOrIndex.Table.Normalize()
 	if err != nil {
 		return 0, err
 	}
-	databaseID, err := resolveName(keys.RootNamespaceID, tn.Database())
+	if tn.SchemaName != tree.PublicSchemaName {
+		return 0, pgerror.NewErrorf(pgerror.CodeReservedNameError,
+			"only schema \"public\" is supported: %q", tree.ErrString(tn))
+	}
+	databaseID, err := resolveName(keys.RootNamespaceID, tn.Catalog())
 	if err != nil {
 		return 0, err
 	}
@@ -204,6 +225,9 @@ func (c Constraint) String() string {
 
 // FromString populates the constraint from the constraint shorthand notation.
 func (c *Constraint) FromString(short string) error {
+	if len(short) == 0 {
+		return fmt.Errorf("the empty string is not a valid constraint")
+	}
 	switch short[0] {
 	case '+':
 		c.Type = Constraint_REQUIRED
@@ -212,7 +236,7 @@ func (c *Constraint) FromString(short string) error {
 		c.Type = Constraint_PROHIBITED
 		short = short[1:]
 	default:
-		c.Type = Constraint_POSITIVE
+		c.Type = Constraint_DEPRECATED_POSITIVE
 	}
 	parts := strings.Split(short, "=")
 	if len(parts) == 1 {
@@ -223,34 +247,6 @@ func (c *Constraint) FromString(short string) error {
 	} else {
 		return errors.Errorf("constraint needs to be in the form \"(key=)value\", not %q", short)
 	}
-	return nil
-}
-
-var _ yaml.Marshaler = Constraints{}
-var _ yaml.Unmarshaler = &Constraints{}
-
-// MarshalYAML implements yaml.Marshaler.
-func (c Constraints) MarshalYAML() (interface{}, error) {
-	short := make([]string, len(c.Constraints))
-	for i, c := range c.Constraints {
-		short[i] = c.String()
-	}
-	return short, nil
-}
-
-// UnmarshalYAML implements yaml.Unmarshaler.
-func (c *Constraints) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var shortConstraints []string
-	if err := unmarshal(&shortConstraints); err != nil {
-		return err
-	}
-	constraints := make([]Constraint, len(shortConstraints))
-	for i, short := range shortConstraints {
-		if err := constraints[i].FromString(short); err != nil {
-			return err
-		}
-	}
-	c.Constraints = constraints
 	return nil
 }
 
@@ -299,33 +295,95 @@ func TestingSetDefaultZoneConfig(cfg ZoneConfig) func() {
 	}
 }
 
-// Validate returns an error if the ZoneConfig specifies a known-dangerous
-// configuration.
+// Validate returns an error if the ZoneConfig specifies a known-dangerous or
+// disallowed configuration.
 func (z *ZoneConfig) Validate() error {
 	for _, s := range z.Subzones {
 		if err := s.Config.Validate(); err != nil {
 			return err
 		}
 	}
-	switch z.NumReplicas {
-	case 0:
+
+	switch {
+	case z.NumReplicas < 0:
+		return fmt.Errorf("at least one replica is required")
+	case z.NumReplicas == 0:
 		if len(z.Subzones) > 0 {
 			// NumReplicas == 0 is allowed when this ZoneConfig is a subzone
 			// placeholder. See IsSubzonePlaceholder.
 			return nil
 		}
 		return fmt.Errorf("at least one replica is required")
-	case 2:
+	case z.NumReplicas == 2:
 		return fmt.Errorf("at least 3 replicas are required for multi-replica configurations")
 	}
+
 	if z.RangeMaxBytes < minRangeMaxBytes {
 		return fmt.Errorf("RangeMaxBytes %d less than minimum allowed %d",
 			z.RangeMaxBytes, minRangeMaxBytes)
+	}
+
+	if z.RangeMinBytes < 0 {
+		return fmt.Errorf("RangeMinBytes %d less than minimum allowed 0", z.RangeMinBytes)
 	}
 	if z.RangeMinBytes >= z.RangeMaxBytes {
 		return fmt.Errorf("RangeMinBytes %d is greater than or equal to RangeMaxBytes %d",
 			z.RangeMinBytes, z.RangeMaxBytes)
 	}
+
+	// Reserve the value 0 to potentially have some special meaning in the future,
+	// such as to disable GC.
+	if z.GC.TTLSeconds < 1 {
+		return fmt.Errorf("GC.TTLSeconds %d less than minimum allowed 1", z.GC.TTLSeconds)
+	}
+
+	for _, constraints := range z.Constraints {
+		for _, constraint := range constraints.Constraints {
+			if constraint.Type == Constraint_DEPRECATED_POSITIVE {
+				return fmt.Errorf("constraints must either be required (prefixed with a '+') or " +
+					"prohibited (prefixed with a '-')")
+			}
+		}
+	}
+
+	// We only need to further validate constraints if per-replica constraints
+	// are in use. The old style of constraints that apply to all replicas don't
+	// require validation.
+	if len(z.Constraints) > 1 || (len(z.Constraints) == 1 && z.Constraints[0].NumReplicas != 0) {
+		var numConstrainedRepls int64
+		for _, constraints := range z.Constraints {
+			if constraints.NumReplicas <= 0 {
+				return fmt.Errorf("constraints must apply to at least one replica")
+			}
+			numConstrainedRepls += int64(constraints.NumReplicas)
+			for _, constraint := range constraints.Constraints {
+				// TODO(a-robinson): Relax this constraint to allow prohibited replicas,
+				// as discussed on #23014.
+				if constraint.Type != Constraint_REQUIRED && constraints.NumReplicas != z.NumReplicas {
+					return fmt.Errorf(
+						"only required constraints (prefixed with a '+') can be applied to a subset of replicas")
+				}
+			}
+		}
+		if numConstrainedRepls > int64(z.NumReplicas) {
+			return fmt.Errorf("the number of replicas specified in constraints (%d) cannot be greater "+
+				"than the number of replicas configured for the zone (%d)",
+				numConstrainedRepls, z.NumReplicas)
+		}
+	}
+
+	for _, leasePref := range z.LeasePreferences {
+		if len(leasePref.Constraints) == 0 {
+			return fmt.Errorf("every lease preference must include at least one constraint")
+		}
+		for _, constraint := range leasePref.Constraints {
+			if constraint.Type == Constraint_DEPRECATED_POSITIVE {
+				return fmt.Errorf("lease preference constraints must either be required " +
+					"(prefixed with a '+') or prohibited (prefixed with a '-')")
+			}
+		}
+	}
+
 	return nil
 }
 

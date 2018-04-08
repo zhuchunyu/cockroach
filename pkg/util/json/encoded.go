@@ -627,10 +627,10 @@ func (j *jsonEncoded) Format(buf *bytes.Buffer) {
 }
 
 // RemoveIndex implements the JSON interface.
-func (j *jsonEncoded) RemoveIndex(idx int) (JSON, error) {
+func (j *jsonEncoded) RemoveIndex(idx int) (JSON, bool, error) {
 	decoded, err := j.shallowDecode()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return decoded.RemoveIndex(idx)
 }
@@ -645,12 +645,28 @@ func (j *jsonEncoded) Concat(other JSON) (JSON, error) {
 }
 
 // RemoveKey implements the JSON interface.
-func (j *jsonEncoded) RemoveKey(key string) (JSON, error) {
+func (j *jsonEncoded) RemoveKey(key string) (JSON, bool, error) {
 	decoded, err := j.shallowDecode()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return decoded.RemoveKey(key)
+}
+
+func (j *jsonEncoded) RemovePath(path []string) (JSON, bool, error) {
+	decoded, err := j.shallowDecode()
+	if err != nil {
+		return nil, false, err
+	}
+	return decoded.RemovePath(path)
+}
+
+func (j *jsonEncoded) doRemovePath(path []string) (JSON, bool, error) {
+	decoded, err := j.shallowDecode()
+	if err != nil {
+		return nil, false, err
+	}
+	return decoded.doRemovePath(path)
 }
 
 // Size implements the JSON interface.
@@ -677,13 +693,30 @@ func (j *jsonEncoded) Len() int {
 }
 
 // EncodeInvertedIndexKeys implements the JSON interface.
-func (j *jsonEncoded) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (j *jsonEncoded) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 	// TODO(justin): this could possibly be optimized.
 	decoded, err := j.decode()
 	if err != nil {
 		return nil, err
 	}
-	return decoded.EncodeInvertedIndexKeys(b)
+	return decoded.encodeInvertedIndexKeys(b)
+}
+
+func (j *jsonEncoded) allPaths() ([]JSON, error) {
+	decoded, err := j.decode()
+	if err != nil {
+		return nil, err
+	}
+	return decoded.allPaths()
+}
+
+// HasContainerLeaf implements the JSON interface.
+func (j *jsonEncoded) HasContainerLeaf() (bool, error) {
+	decoded, err := j.decode()
+	if err != nil {
+		return false, err
+	}
+	return decoded.HasContainerLeaf()
 }
 
 // preprocessForContains implements the JSON interface.

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -26,7 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/optbase"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -60,6 +63,13 @@ func (t TableDescriptors) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
 
 // ColumnID is a custom type for ColumnDescriptor IDs.
 type ColumnID tree.ColumnID
+
+// ColumnIDs is a slice of ColumnDescriptor IDs.
+type ColumnIDs []ColumnID
+
+func (c ColumnIDs) Len() int           { return len(c) }
+func (c ColumnIDs) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+func (c ColumnIDs) Less(i, j int) bool { return c[i] < c[j] }
 
 // FamilyID is a custom type for ColumnFamilyDescriptor IDs.
 type FamilyID uint32
@@ -283,8 +293,10 @@ func (desc *IndexDescriptor) ColNamesFormat(ctx *tree.FmtCtxWithBuf) {
 			ctx.WriteString(", ")
 		}
 		ctx.FormatNameP(&desc.ColumnNames[i])
-		ctx.WriteByte(' ')
-		ctx.WriteString(desc.ColumnDirections[i].String())
+		if desc.Type != IndexDescriptor_INVERTED {
+			ctx.WriteByte(' ')
+			ctx.WriteString(desc.ColumnDirections[i].String())
+		}
 	}
 }
 
@@ -302,6 +314,9 @@ func (desc *IndexDescriptor) SQLString(tableName string) string {
 	f := tree.NewFmtCtxWithBuf(tree.FmtSimple)
 	if desc.Unique {
 		f.WriteString("UNIQUE ")
+	}
+	if desc.Type == IndexDescriptor_INVERTED {
+		f.WriteString("INVERTED ")
 	}
 	f.WriteString("INDEX ")
 	if tableName != "" {
@@ -334,20 +349,6 @@ func (desc *TableDescriptor) SetID(id ID) {
 // TypeName returns the plain type of this descriptor.
 func (desc *TableDescriptor) TypeName() string {
 	return "relation"
-}
-
-// Kind returns what kind of database object this descriptor describes.
-func (desc *TableDescriptor) Kind() string {
-	switch {
-	case desc.IsTable():
-		return "table"
-	case desc.IsView():
-		return "view"
-	case desc.IsSequence():
-		return "sequence"
-	default:
-		panic("unknown descriptor type")
-	}
 }
 
 // SetName implements the DescriptorProto interface.
@@ -390,8 +391,10 @@ func (desc *TableDescriptor) IsVirtualTable() bool {
 // physical Table that needs to be stored in the kv layer, as opposed to a
 // different resource like a view or a virtual table. Physical tables have
 // primary keys, column families, and indexes (unlike virtual tables).
+// Sequences count as physical tables because their values are stored in
+// the KV layer.
 func (desc *TableDescriptor) IsPhysicalTable() bool {
-	return desc.IsTable() && !desc.IsVirtualTable()
+	return desc.IsSequence() || (desc.IsTable() && !desc.IsVirtualTable())
 }
 
 // KeysPerRow returns the maximum number of keys used to encode a row for the
@@ -470,10 +473,21 @@ func generatedFamilyName(familyID FamilyID, columnNames []string) string {
 	return buf.String()
 }
 
-// MaybeUpgradeFormatVersion transforms the TableDescriptor to the latest
+// MaybeFillInDescriptor performs any modifications needed to the table descriptor.
+// This includes format upgrades and optional changes that can be handled by all version
+// (for example: additional default privileges).
+// Returns true if any changes were made.
+func (desc *TableDescriptor) MaybeFillInDescriptor() bool {
+	changedVersion := desc.maybeUpgradeFormatVersion()
+	changedPrivileges := desc.Privileges.MaybeFixPrivileges(desc.ID)
+	return changedVersion || changedPrivileges
+}
+
+// maybeUpgradeFormatVersion transforms the TableDescriptor to the latest
 // FormatVersion (if it's not already there) and returns true if any changes
 // were made.
-func (desc *TableDescriptor) MaybeUpgradeFormatVersion() bool {
+// This method should be called through MaybeFillInDescriptor, not directly.
+func (desc *TableDescriptor) maybeUpgradeFormatVersion() bool {
 	if desc.FormatVersion >= InterleavedFormatVersion {
 		return false
 	}
@@ -584,7 +598,7 @@ func (desc *TableDescriptor) AllocateIDs() error {
 	if desc.ID == 0 {
 		desc.ID = keys.MaxReservedDescID + 1
 	}
-	err := desc.ValidateTable()
+	err := desc.ValidateTable(nil)
 	desc.ID = savedID
 	return err
 }
@@ -857,8 +871,10 @@ func (desc *TableDescriptor) allocateColumnFamilyIDs(columnNames map[string]Colu
 
 // Validate validates that the table descriptor is well formed. Checks include
 // both single table and cross table invariants.
-func (desc *TableDescriptor) Validate(ctx context.Context, txn *client.Txn) error {
-	err := desc.ValidateTable()
+func (desc *TableDescriptor) Validate(
+	ctx context.Context, txn *client.Txn, st *cluster.Settings,
+) error {
+	err := desc.ValidateTable(st)
 	if err != nil {
 		return err
 	}
@@ -1010,7 +1026,8 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 // names and index names are unique and verifying that column IDs and index IDs
 // are consistent. Use Validate to validate that cross-table references are
 // correct.
-func (desc *TableDescriptor) ValidateTable() error {
+// If version is supplied, the descriptor is checked for version incompatibilities.
+func (desc *TableDescriptor) ValidateTable(st *cluster.Settings) error {
 	if err := validateName(desc.Name, "table"); err != nil {
 		return err
 	}
@@ -1024,6 +1041,12 @@ func (desc *TableDescriptor) ValidateTable() error {
 	}
 
 	if desc.IsSequence() {
+		if st != nil && st.Version.HasBeenInitialized() {
+			if err := st.Version.CheckVersion(cluster.Version2_0, "sequences"); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	}
 
@@ -1035,14 +1058,14 @@ func (desc *TableDescriptor) ValidateTable() error {
 
 	// We maintain forward compatibility, so if you see this error message with a
 	// version older that what this client supports, then there's a
-	// MaybeUpgradeFormatVersion missing from some codepath.
+	// MaybeFillInDescriptor missing from some codepath.
 	if v := desc.GetFormatVersion(); v != FamilyFormatVersion && v != InterleavedFormatVersion {
 		// TODO(dan): We're currently switching from FamilyFormatVersion to
 		// InterleavedFormatVersion. After a beta is released with this dual version
 		// support, then:
 		// - Upgrade the bidirectional reference version to that beta
 		// - Start constructing all TableDescriptors with InterleavedFormatVersion
-		// - Change MaybeUpgradeFormatVersion to output InterleavedFormatVersion
+		// - Change maybeUpgradeFormatVersion to output InterleavedFormatVersion
 		// - Change this check to only allow InterleavedFormatVersion
 		return fmt.Errorf(
 			"table %q is encoded using using version %d, but this client only supports version %d and %d",
@@ -1084,8 +1107,21 @@ func (desc *TableDescriptor) ValidateTable() error {
 		columnIDs[column.ID] = column.Name
 
 		if column.ID >= desc.NextColumnID {
-			return fmt.Errorf("column %q invalid ID (%d) > next column ID (%d)",
+			return fmt.Errorf("column %q invalid ID (%d) >= next column ID (%d)",
 				column.Name, column.ID, desc.NextColumnID)
+		}
+	}
+
+	if st != nil && st.Version.HasBeenInitialized() {
+		if !st.Version.IsMinSupported(cluster.Version2_0) {
+			for _, def := range desc.Columns {
+				if def.Type.SemanticType == ColumnType_JSON {
+					return errors.New("cluster version does not support JSONB (>= 2.0 required)")
+				}
+				if def.ComputeExpr != nil {
+					return errors.New("cluster version does not support computed columns (>= 2.0 required)")
+				}
+			}
 		}
 	}
 
@@ -1124,6 +1160,11 @@ func (desc *TableDescriptor) ValidateTable() error {
 			return err
 		}
 	}
+
+	// Fill in any incorrect privileges that may have been missed due to mixed-versions.
+	// TODO(mberhault): remove this in 2.1 (maybe 2.2) when privilege-fixing migrations have been
+	// run again and mixed-version clusters always write "good" descriptors.
+	desc.Privileges.MaybeFixPrivileges(desc.GetID())
 
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
@@ -1765,7 +1806,7 @@ func (desc *TableDescriptor) FindColumnByName(name tree.Name) (ColumnDescriptor,
 			}
 		}
 	}
-	return ColumnDescriptor{}, false, fmt.Errorf("column %q does not exist", name)
+	return ColumnDescriptor{}, false, NewUndefinedColumnError(string(name))
 }
 
 // UpdateColumnDescriptor updates an existing column descriptor.
@@ -1783,7 +1824,7 @@ func (desc *TableDescriptor) UpdateColumnDescriptor(column ColumnDescriptor) {
 		}
 	}
 
-	panic(fmt.Sprintf("column %q does not exist", column.Name))
+	panic(NewUndefinedColumnError(column.Name))
 }
 
 // FindActiveColumnByName finds an active column with the specified name.
@@ -1793,7 +1834,7 @@ func (desc *TableDescriptor) FindActiveColumnByName(name string) (ColumnDescript
 			return c, nil
 		}
 	}
-	return ColumnDescriptor{}, fmt.Errorf("column %q does not exist", name)
+	return ColumnDescriptor{}, NewUndefinedColumnError(name)
 }
 
 // FindColumnByID finds the column with specified ID.
@@ -2029,9 +2070,9 @@ func (desc *TableDescriptor) Adding() bool {
 	return desc.State == TableDescriptor_ADD
 }
 
-// Renamed returns true if the table is being renamed.
-func (desc *TableDescriptor) Renamed() bool {
-	return len(desc.Renames) > 0
+// HasDrainingNames returns true if a draining name exists.
+func (desc *TableDescriptor) HasDrainingNames() bool {
+	return len(desc.DrainingNames) > 0
 }
 
 // SetUpVersion sets the up_version marker on the table descriptor (see the proto
@@ -2229,17 +2270,22 @@ func DatumTypeToColumnSemanticType(ptyp types.T) (ColumnType_SemanticType, error
 		return ColumnType_INET, nil
 	case types.Oid:
 		return ColumnType_OID, nil
-	case types.Null:
+	case types.Unknown:
 		return ColumnType_NULL, nil
 	case types.IntVector:
 		return ColumnType_INT2VECTOR, nil
+	case types.OidVector:
+		return ColumnType_OIDVECTOR, nil
 	case types.JSON:
 		return ColumnType_JSON, nil
 	default:
 		if ptyp.FamilyEqual(types.FamCollatedString) {
 			return ColumnType_COLLATEDSTRING, nil
 		}
-		return -1, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "unsupported result type: %s", ptyp)
+		if wrapper, ok := ptyp.(types.TOidWrapper); ok {
+			return DatumTypeToColumnSemanticType(wrapper.T)
+		}
+		return -1, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "unsupported result type: %s, %T, %+v", ptyp, ptyp, ptyp)
 	}
 }
 
@@ -2311,9 +2357,11 @@ func columnSemanticTypeToDatumType(c *ColumnType, k ColumnType_SemanticType) typ
 	case ColumnType_OID:
 		return types.Oid
 	case ColumnType_NULL:
-		return types.Null
+		return types.Unknown
 	case ColumnType_INT2VECTOR:
 		return types.IntVector
+	case ColumnType_OIDVECTOR:
+		return types.OidVector
 	}
 	return nil
 }
@@ -2364,6 +2412,12 @@ func (desc *DatabaseDescriptor) Validate() error {
 	if desc.ID == 0 {
 		return fmt.Errorf("invalid database ID %d", desc.ID)
 	}
+
+	// Fill in any incorrect privileges that may have been missed due to mixed-versions.
+	// TODO(mberhault): remove this in 2.1 (maybe 2.2) when privilege-fixing migrations have been
+	// run again and mixed-version clusters always write "good" descriptors.
+	desc.Privileges.MaybeFixPrivileges(desc.GetID())
+
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
 }
@@ -2468,12 +2522,75 @@ func (desc *ColumnDescriptor) SQLString() string {
 		f.WriteString(" DEFAULT ")
 		f.WriteString(*desc.DefaultExpr)
 	}
-	if desc.ComputeExpr != nil {
-		f.WriteString(" AS ")
+	if desc.IsComputed() {
+		f.WriteString(" AS (")
 		f.WriteString(*desc.ComputeExpr)
-		f.WriteString(" STORED")
+		f.WriteString(") STORED")
 	}
 	return f.CloseAndGetString()
+}
+
+// ColumnsUsed returns the IDs of the columns used in the check constraint's
+// expression. v2.0 binaries will populate this during table creation, but older
+// binaries will not, in which case this needs to be computed when requested.
+//
+// TODO(nvanbenschoten): we can remove this in v2.1 and replace it with a sql
+// migration to backfill all TableDescriptor_CheckConstraint.ColumnIDs slices.
+// See #22322.
+func (cc *TableDescriptor_CheckConstraint) ColumnsUsed(desc *TableDescriptor) ([]ColumnID, error) {
+	if len(cc.ColumnIDs) > 0 {
+		// Already populated.
+		return cc.ColumnIDs, nil
+	}
+
+	parsed, err := parser.ParseExpr(cc.Expr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not parse check constraint %s", cc.Expr)
+	}
+
+	colIDsUsed := make(map[ColumnID]struct{})
+	visitFn := func(expr tree.Expr) (err error, recurse bool, newExpr tree.Expr) {
+		if vBase, ok := expr.(tree.VarName); ok {
+			v, err := vBase.NormalizeVarName()
+			if err != nil {
+				return err, false, nil
+			}
+			if c, ok := v.(*tree.ColumnItem); ok {
+				col, err := desc.FindActiveColumnByName(string(c.ColumnName))
+				if err != nil {
+					return errors.Errorf("column %q not found for constraint %q",
+						c.ColumnName, parsed.String()), false, nil
+				}
+				colIDsUsed[col.ID] = struct{}{}
+			}
+			return nil, false, v
+		}
+		return nil, true, expr
+	}
+	if _, err := tree.SimpleVisit(parsed, visitFn); err != nil {
+		return nil, err
+	}
+
+	cc.ColumnIDs = make([]ColumnID, 0, len(colIDsUsed))
+	for colID := range colIDsUsed {
+		cc.ColumnIDs = append(cc.ColumnIDs, colID)
+	}
+	sort.Sort(ColumnIDs(cc.ColumnIDs))
+	return cc.ColumnIDs, nil
+}
+
+// UsesColumn returns whether the check constraint uses the specified column.
+func (cc *TableDescriptor_CheckConstraint) UsesColumn(
+	desc *TableDescriptor, colID ColumnID,
+) (bool, error) {
+	colsUsed, err := cc.ColumnsUsed(desc)
+	if err != nil {
+		return false, err
+	}
+	i := sort.Search(len(colsUsed), func(i int) bool {
+		return colsUsed[i] >= colID
+	})
+	return i < len(colsUsed) && colsUsed[i] == colID, nil
 }
 
 // ForeignKeyReferenceActionValue allows the conversion between a
@@ -2486,43 +2603,43 @@ var ForeignKeyReferenceActionValue = [...]ForeignKeyReference_Action{
 	tree.Cascade:    ForeignKeyReference_CASCADE,
 }
 
-var _ optbase.Column = &ColumnDescriptor{}
+var _ opt.Column = &ColumnDescriptor{}
 
-// IsNullable is part of the optbase.Column interface.
+// IsNullable is part of the opt.Column interface.
 func (desc *ColumnDescriptor) IsNullable() bool {
 	return desc.Nullable
 }
 
-// ColName is part of the optbase.Column interface.
-func (desc *ColumnDescriptor) ColName() optbase.ColumnName {
-	return optbase.ColumnName(desc.Name)
+// ColName is part of the opt.Column interface.
+func (desc *ColumnDescriptor) ColName() opt.ColumnName {
+	return opt.ColumnName(desc.Name)
 }
 
-// DatumType is part of the optbase.Column interface.
+// DatumType is part of the opt.Column interface.
 func (desc *ColumnDescriptor) DatumType() types.T {
 	return desc.Type.ToDatumType()
 }
 
-// IsHidden is part of the optbase.Column interface.
+// IsHidden is part of the opt.Column interface.
 func (desc *ColumnDescriptor) IsHidden() bool {
 	return desc.Hidden
 }
 
-var _ optbase.Table = &TableDescriptor{}
-
-// TabName is part of the optbase.Table interface.
-func (desc *TableDescriptor) TabName() optbase.TableName {
-	return optbase.TableName(desc.GetName())
+// IsComputed returns whether the given column is computed.
+func (desc *ColumnDescriptor) IsComputed() bool {
+	return desc.ComputeExpr != nil
 }
 
-// NumColumns is part of the optbase.Table interface.
-func (desc *TableDescriptor) NumColumns() int {
-	return len(desc.Columns)
-}
-
-// Column is part of the optbase.Table interface.
-func (desc *TableDescriptor) Column(i int) optbase.Column {
-	return &desc.Columns[i]
+// CheckCanBeFKRef returns whether the given column is computed.
+func (desc *ColumnDescriptor) CheckCanBeFKRef() error {
+	if desc.IsComputed() {
+		return pgerror.NewErrorf(
+			pgerror.CodeInvalidTableDefinitionError,
+			"computed column %q cannot be a foreign key reference",
+			desc.Name,
+		)
+	}
+	return nil
 }
 
 // PartitionNames returns a slice containing the name of every partition and
@@ -2547,4 +2664,25 @@ func (desc *PartitioningDescriptor) PartitionNames() []string {
 		names = append(names, r.Name)
 	}
 	return names
+}
+
+// SetAuditMode configures the audit mode on the descriptor.
+func (desc *TableDescriptor) SetAuditMode(mode tree.AuditMode) (bool, error) {
+	prev := desc.AuditMode
+	switch mode {
+	case tree.AuditModeDisable:
+		desc.AuditMode = TableDescriptor_DISABLED
+	case tree.AuditModeReadWrite:
+		desc.AuditMode = TableDescriptor_READWRITE
+	default:
+		return false, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+			"unknown audit mode: %s (%d)", mode, mode)
+	}
+	return prev != desc.AuditMode, nil
+}
+
+// GetAuditMode is part of the DescriptorProto interface.
+// This is a stub until per-database auditing is enabled.
+func (desc *DatabaseDescriptor) GetAuditMode() TableDescriptor_AuditMode {
+	return TableDescriptor_DISABLED
 }

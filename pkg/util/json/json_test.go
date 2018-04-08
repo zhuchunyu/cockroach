@@ -15,14 +15,13 @@
 package json
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
 	"testing"
-
-	"bytes"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -999,26 +998,27 @@ func TestJSONRemoveKey(t *testing.T) {
 	json := jsonTestShorthand
 	cases := map[string][]struct {
 		key      string
+		ok       bool
 		expected JSON
 		errMsg   string
 	}{
 		`{}`: {
-			{key: ``, expected: json(`{}`)},
-			{key: `foo`, expected: json(`{}`)},
+			{key: ``, ok: false, expected: json(`{}`)},
+			{key: `foo`, ok: false, expected: json(`{}`)},
 		},
 		`{"foo": 1, "bar": "baz"}`: {
-			{key: ``, expected: json(`{"foo": 1, "bar": "baz"}`)},
-			{key: `foo`, expected: json(`{"bar": "baz"}`)},
-			{key: `bar`, expected: json(`{"foo": 1}`)},
-			{key: `baz`, expected: json(`{"foo": 1, "bar": "baz"}`)},
+			{key: ``, ok: false, expected: json(`{"foo": 1, "bar": "baz"}`)},
+			{key: `foo`, ok: true, expected: json(`{"bar": "baz"}`)},
+			{key: `bar`, ok: true, expected: json(`{"foo": 1}`)},
+			{key: `baz`, ok: false, expected: json(`{"foo": 1, "bar": "baz"}`)},
 		},
 		// Deleting a string key from an array never has any effect.
 		`["a", "b", "c"]`: {
-			{key: ``, expected: json(`["a", "b", "c"]`)},
-			{key: `foo`, expected: json(`["a", "b", "c"]`)},
-			{key: `0`, expected: json(`["a", "b", "c"]`)},
-			{key: `1`, expected: json(`["a", "b", "c"]`)},
-			{key: `-1`, expected: json(`["a", "b", "c"]`)},
+			{key: ``, ok: false, expected: json(`["a", "b", "c"]`)},
+			{key: `foo`, ok: false, expected: json(`["a", "b", "c"]`)},
+			{key: `0`, ok: false, expected: json(`["a", "b", "c"]`)},
+			{key: `1`, ok: false, expected: json(`["a", "b", "c"]`)},
+			{key: `-1`, ok: false, expected: json(`["a", "b", "c"]`)},
 		},
 		`5`:     {{key: `a`, errMsg: "cannot delete from scalar"}},
 		`"b"`:   {{key: `a`, errMsg: "cannot delete from scalar"}},
@@ -1035,7 +1035,7 @@ func TestJSONRemoveKey(t *testing.T) {
 
 		for _, tc := range tests {
 			runDecodedAndEncoded(t, k+`-`+tc.key, left, func(t *testing.T, j JSON) {
-				result, err := j.RemoveKey(tc.key)
+				result, ok, err := j.RemoveKey(tc.key)
 				if tc.errMsg != "" {
 					if err == nil {
 						t.Fatal("expected error")
@@ -1046,6 +1046,9 @@ func TestJSONRemoveKey(t *testing.T) {
 				}
 				if err != nil {
 					t.Fatal(err)
+				}
+				if tc.ok != ok {
+					t.Fatalf("expected %t, got %t", tc.ok, ok)
 				}
 				c, err := result.Compare(tc.expected)
 				if err != nil {
@@ -1063,6 +1066,7 @@ func TestJSONRemoveIndex(t *testing.T) {
 	json := jsonTestShorthand
 	cases := map[string][]struct {
 		idx      int
+		ok       bool
 		expected JSON
 		errMsg   string
 	}{
@@ -1070,24 +1074,24 @@ func TestJSONRemoveIndex(t *testing.T) {
 			{idx: 0, errMsg: "cannot delete from object using integer"},
 		},
 		`["a", "b", "c"]`: {
-			{idx: -4, expected: json(`["a", "b", "c"]`)},
-			{idx: -3, expected: json(`["b", "c"]`)},
-			{idx: -2, expected: json(`["a", "c"]`)},
-			{idx: -1, expected: json(`["a", "b"]`)},
-			{idx: 0, expected: json(`["b", "c"]`)},
-			{idx: 1, expected: json(`["a", "c"]`)},
-			{idx: 2, expected: json(`["a", "b"]`)},
-			{idx: 3, expected: json(`["a", "b", "c"]`)},
+			{idx: -4, ok: false, expected: json(`["a", "b", "c"]`)},
+			{idx: -3, ok: true, expected: json(`["b", "c"]`)},
+			{idx: -2, ok: true, expected: json(`["a", "c"]`)},
+			{idx: -1, ok: true, expected: json(`["a", "b"]`)},
+			{idx: 0, ok: true, expected: json(`["b", "c"]`)},
+			{idx: 1, ok: true, expected: json(`["a", "c"]`)},
+			{idx: 2, ok: true, expected: json(`["a", "b"]`)},
+			{idx: 3, ok: false, expected: json(`["a", "b", "c"]`)},
 		},
 		`[{}, {"a":"b"}, {"c":"d"}]`: {
-			{idx: 0, expected: json(`[{"a":"b"},{"c":"d"}]`)},
-			{idx: 1, expected: json(`[{},{"c":"d"}]`)},
-			{idx: 2, expected: json(`[{},{"a":"b"}]`)},
+			{idx: 0, ok: true, expected: json(`[{"a":"b"},{"c":"d"}]`)},
+			{idx: 1, ok: true, expected: json(`[{},{"c":"d"}]`)},
+			{idx: 2, ok: true, expected: json(`[{},{"a":"b"}]`)},
 		},
 		`[]`: {
-			{idx: -1, expected: json(`[]`)},
-			{idx: 0, expected: json(`[]`)},
-			{idx: 1, expected: json(`[]`)},
+			{idx: -1, ok: false, expected: json(`[]`)},
+			{idx: 0, ok: false, expected: json(`[]`)},
+			{idx: 1, ok: false, expected: json(`[]`)},
 		},
 		`5`:     {{idx: 0, errMsg: "cannot delete from scalar"}},
 		`"b"`:   {{idx: 0, errMsg: "cannot delete from scalar"}},
@@ -1104,7 +1108,7 @@ func TestJSONRemoveIndex(t *testing.T) {
 
 		for _, tc := range tests {
 			runDecodedAndEncoded(t, fmt.Sprintf("%s-%d", k, tc.idx), left, func(t *testing.T, j JSON) {
-				result, err := j.RemoveIndex(tc.idx)
+				result, ok, err := j.RemoveIndex(tc.idx)
 				if tc.errMsg != "" {
 					if err == nil {
 						t.Fatal("expected error")
@@ -1115,6 +1119,9 @@ func TestJSONRemoveIndex(t *testing.T) {
 				}
 				if err != nil {
 					t.Fatal(err)
+				}
+				if tc.ok != ok {
+					t.Fatalf("expected %t, got %t", tc.ok, ok)
 				}
 				c, err := result.Compare(tc.expected)
 				if err != nil {
@@ -1128,72 +1135,120 @@ func TestJSONRemoveIndex(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeJSONInvertedIndex(t *testing.T) {
+	testCases := []struct {
+		value  string
+		expEnc []string
+	}{
+		{`{"a":"b"}`, []string{`/"a"/"b"`}},
+		{`null`, []string{`/NULL`}},
+		{`false`, []string{`/False`}},
+		{`true`, []string{`/True`}},
+		{`1.23`, []string{`/1.23`}},
+		{`"a"`, []string{`/"a"`}},
+		{`[]`, []string{`/[]`}},
+		{`{}`, []string{`/{}`}},
+		{`["c", {"a":"b"}]`, []string{`/Arr/"c"`, `/Arr/"a"/"b"`}},
+		{`["c", {"a":["c","d"]}]`, []string{`/Arr/"c"`,
+			`/Arr/"a"/Arr/"c"`,
+			`/Arr/"a"/Arr/"d"`}},
+		{`{"a":[]}`, []string{`/"a"/[]`}},
+		{`{"a":[{}]}`, []string{`/"a"/Arr/{}`}},
+		{`[[],{}]`, []string{`/Arr/[]`, `/Arr/{}`}},
+		{`[["a"]]`, []string{`/Arr/Arr/"a"`}},
+	}
+
+	for _, c := range testCases {
+		enc, err := EncodeInvertedIndexKeys(nil, jsonTestShorthand(c.value))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for j, path := range enc {
+			str := encoding.PrettyPrintValue(nil, path, "/")
+			if str != c.expEnc[j] {
+				t.Errorf("unexpected encoding mismatch for %v. expected [%s], got [%s]",
+					c.value, c.expEnc[j], str)
+			}
+		}
+	}
+}
+
 func getApdEncoding(num float64) *apd.Decimal {
 	dec := &apd.Decimal{}
 	dec, _ = dec.SetFloat64(num)
 	return dec
 }
 
-func arraySeparator(b []byte) []byte {
-	return encoding.EncodeArrayAscending(b)
-}
+func TestEncodeJSONInvertedIndex(t *testing.T) {
+	jsonPrefix := make([]byte, 1, 100)
+	jsonPrefix[0] = 0x37
 
-func keyPrefix(b []byte) []byte {
-	return encoding.EncodeNotNullAscending(b)
-}
+	terminator := make([]byte, 2, 100)
+	terminator[0] = 0x00
+	terminator[1] = 0x01
 
-func TestEncodeDecodeJSONInvertedIndex(t *testing.T) {
-	bytePrefix := make([]byte, 1, 100)
-	bytePrefix[0] = 0x0f
+	objectSeparator := make([]byte, 2, 100)
+	objectSeparator[0] = 0x00
+	objectSeparator[1] = 0x02
+
+	arrayPrefix := make([]byte, 2, 100)
+	arrayPrefix[0] = 0x00
+	arrayPrefix[1] = 0x03
+
+	aEncoding := make([]byte, 1, 100)
+	aEncoding[0] = 0x61
+
+	bEncoding := make([]byte, 1, 100)
+	bEncoding[0] = 0x62
+
+	emptyObjectEncoding := make([]byte, 1, 100)
+	emptyObjectEncoding[0] = 0x39
+
+	emptyArrayEncoding := make([]byte, 1, 100)
+	emptyArrayEncoding[0] = 0x38
 
 	testCases := []struct {
 		value  string
 		expEnc [][]byte
 	}{
-		{`{"a":"b"}`, [][]byte{bytes.Join([][]byte{keyPrefix(bytePrefix),
-			encoding.EncodeStringAscending(nil, "a"), encoding.EncodeStringAscending(nil, "b")}, nil)}},
-		{`["a", "b"]`, [][]byte{bytes.Join([][]byte{arraySeparator(bytePrefix),
-			encoding.EncodeStringAscending(nil, "a")}, nil),
-			bytes.Join([][]byte{arraySeparator(bytePrefix),
-				encoding.EncodeStringAscending(nil, "b")}, nil)}},
-		{`null`, [][]byte{encoding.EncodeNullAscending(bytePrefix)}},
-		{`false`, [][]byte{encoding.EncodeFalseAscending(bytePrefix)}},
-		{`true`, [][]byte{encoding.EncodeTrueAscending(bytePrefix)}},
-		{`1.23`, [][]byte{encoding.EncodeDecimalAscending(bytePrefix, getApdEncoding(1.23))}},
-		{`"a"`, [][]byte{encoding.EncodeStringAscending(bytePrefix, "a")}},
-		{`["c", {"a":"b"}]`, [][]byte{bytes.Join([][]byte{arraySeparator(bytePrefix),
-			encoding.EncodeStringAscending(nil, "c")}, nil),
-			bytes.Join([][]byte{arraySeparator(bytePrefix),
-				keyPrefix(nil),
-				encoding.EncodeStringAscending(nil, "a"),
-				encoding.EncodeStringAscending(nil, "b")}, nil)}},
-		{`["c", {"a":["c","d"]}]`, [][]byte{bytes.Join([][]byte{
-			arraySeparator(bytePrefix),
-			encoding.EncodeStringAscending(nil, "c")}, nil),
-
-			bytes.Join([][]byte{arraySeparator(bytePrefix),
-				keyPrefix(nil),
-				encoding.EncodeStringAscending(nil, "a"),
-				arraySeparator(nil),
-				encoding.EncodeStringAscending(nil, "c")}, nil),
-
-			bytes.Join([][]byte{arraySeparator(bytePrefix),
-				keyPrefix(nil),
-				encoding.EncodeStringAscending(nil, "a"),
-				arraySeparator(nil),
-				encoding.EncodeStringAscending(nil, "d")}, nil)}},
-
-		{`{"a":"b","e":"f"}`, [][]byte{
-			bytes.Join([][]byte{keyPrefix(bytePrefix),
-				encoding.EncodeStringAscending(nil, "a"), encoding.EncodeStringAscending(nil, "b")}, nil),
-
-			bytes.Join([][]byte{keyPrefix(bytePrefix),
-				encoding.EncodeStringAscending(nil, "e"), encoding.EncodeStringAscending(nil, "f")}, nil),
-		}},
+		{`{"a":"b"}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, terminator, encoding.EncodeStringAscending(nil, "b")},
+			nil)}},
+		{`{"a":{"b":"c"}}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, bEncoding, terminator, encoding.EncodeStringAscending(nil, "c")},
+			nil)}},
+		{`{"a":{"b":[]}}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, bEncoding, terminator, emptyArrayEncoding},
+			nil)}},
+		{`{"a":{"b":{}}}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, bEncoding, terminator, emptyObjectEncoding},
+			nil)}},
+		{`null`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, encoding.EncodeNullAscending(nil)},
+			nil)}},
+		{`false`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, encoding.EncodeFalseAscending(nil)},
+			nil)}},
+		{`true`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, encoding.EncodeTrueAscending(nil)},
+			nil)}},
+		{`1.23`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, encoding.EncodeDecimalAscending(nil, getApdEncoding(1.23))},
+			nil)}},
+		{`"a"`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, encoding.EncodeStringAscending(nil, "a")},
+			nil)}},
+		{`[["a"]]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "a")},
+			nil)}},
+		{`{"a":["b","c"]}]`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "b")}, nil),
+			bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "c")}, nil)}},
+		{`[]`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, emptyArrayEncoding},
+			nil)}},
+		{`{}`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, emptyObjectEncoding},
+			nil)}},
+		{`[{}, []]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, terminator, emptyObjectEncoding},
+			nil),
+			bytes.Join([][]byte{jsonPrefix, arrayPrefix, terminator, emptyArrayEncoding}, nil)}},
+		{`[[[]]]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, arrayPrefix, terminator, emptyArrayEncoding},
+			nil)}},
+		{`[[{}]]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, arrayPrefix, terminator, emptyObjectEncoding},
+			nil)}},
 	}
 
 	for _, c := range testCases {
-		enc, err := jsonTestShorthand(c.value).EncodeInvertedIndexKeys(bytePrefix)
+		enc, err := EncodeInvertedIndexKeys(nil, jsonTestShorthand(c.value))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1408,6 +1463,7 @@ func TestJSONContains(t *testing.T) {
 			{`{"a": [3], "c": {}}`, true},
 			{`{"a": [4], "c": {}}`, false},
 			{`{"a": [3], "c": {"foo": "gup"}}`, false},
+			{`{"a": 3}`, false},
 		},
 		`[{"a": 1}, {"b": 2, "c": 3}, [1], true, false, null, "hello"]`: {
 			{`[]`, true},
@@ -1428,6 +1484,13 @@ func TestJSONContains(t *testing.T) {
 			{`["hello", "hello", []]`, true},
 			{`["hello", {"a": 1}, "hello", []]`, true},
 			{`["hello", {"a": 1, "b": 2}, "hello", []]`, false},
+			{`"hello"`, true},
+			{`true`, true},
+			{`false`, true},
+			{`null`, true},
+			{`[1]`, false},
+			{`[[1]]`, true},
+			{`1`, false},
 		},
 		`[{"Ck@P":{"7RZ2\"mZBH":null,"|__v":[1.685483]},"EM%&":{"I{TH":[],"}p@]7sIKC\\$":[]},"f}?#z~":{"#e9>m\"v75'&+":false,"F;,+&r9":{}}},[{}],false,0.498401]`: {
 			{`[false,{}]`, true},
@@ -1451,7 +1514,7 @@ func TestJSONContains(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				checkResult := left.(containsTester).slowContains(other)
+				checkResult := slowContains(left, other)
 				if result != checkResult {
 					t.Fatal("mismatch between actual contains and slowContains")
 				}
@@ -1485,7 +1548,7 @@ func TestPositiveRandomJSONContains(t *testing.T) {
 		if !c {
 			t.Fatal(fmt.Sprintf("%s should contain %s", j, subdoc))
 		}
-		if !j.(containsTester).slowContains(subdoc) {
+		if !slowContains(j, subdoc) {
 			t.Fatal(fmt.Sprintf("%s should slowContains %s", j, subdoc))
 		}
 	}
@@ -1509,9 +1572,8 @@ func TestNegativeRandomJSONContains(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		slowResult := j1.(containsTester).slowContains(j2)
+		slowResult := slowContains(j1, j2)
 		if realResult != slowResult {
-			fmt.Println("realResult=", realResult)
 			t.Fatal("mismatch for document " + j1.String() + " @> " + j2.String())
 		}
 	}
@@ -1570,6 +1632,46 @@ func TestPretty(t *testing.T) {
 			}
 			if pretty != tc.expected {
 				t.Fatalf("expected:\n%s\ngot:\n%s\n", tc.expected, pretty)
+			}
+		})
+	}
+}
+
+func TestHasContainerLeaf(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected bool
+	}{
+		{`true`, false},
+		{`false`, false},
+		{`1`, false},
+		{`[]`, true},
+		{`{}`, true},
+		{`{"a": 1}`, false},
+		{`{"a": {"b": 3}, "x": "y", "c": []}`, true},
+		{`{"a": {"b": 3}, "c": [], "x": "y"}`, true},
+		{`{"a": {}}`, true},
+		{`{"a": []}`, true},
+		{`[]`, true},
+		{`[[]]`, true},
+		{`[1, 2, 3, []]`, true},
+		{`[1, 2, [], 3]`, true},
+		{`[[], 1, 2, 3]`, true},
+		{`[1, 2, 3]`, false},
+		{`[[1, 2, 3]]`, false},
+		{`[[1, 2], 3]`, false},
+		{`[1, 2, 3, [4]]`, false},
+	}
+
+	for _, tc := range cases {
+		j := jsonTestShorthand(tc.input)
+		runDecodedAndEncoded(t, tc.input, j, func(t *testing.T, j JSON) {
+			result, err := j.HasContainerLeaf()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result != tc.expected {
+				t.Fatalf("expected:\n%v\ngot:\n%v\n", tc.expected, result)
 			}
 		})
 	}
@@ -1757,5 +1859,94 @@ func BenchmarkFetchKey(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func TestJSONRemovePath(t *testing.T) {
+	queryTests := map[string][]struct {
+		path     []string
+		ok       bool
+		expected string
+		errMsg   string
+	}{
+		`{"foo": 1}`: {
+			{path: []string{"foa"}, ok: false, expected: `{"foo": 1}`},
+			{path: []string{"foo"}, ok: true, expected: `{}`},
+			{path: []string{"foz"}, ok: false, expected: `{"foo": 1}`},
+			{path: []string{}, ok: false, expected: `{"foo": 1}`},
+			{path: []string{"bar"}, ok: false, expected: `{"foo": 1}`},
+		},
+		`{"foo": {"bar": 1, "baz": 2}}}`: {
+			{path: []string{}, ok: false, expected: `{"foo": {"bar": 1, "baz": 2}}`},
+			{path: []string{"foo"}, ok: true, expected: `{}`},
+			{path: []string{"foo", "bar"}, ok: true, expected: `{"foo": {"baz": 2}}`},
+			{path: []string{"foo", "bar", "gup"}, ok: false, expected: `{"foo": {"bar": 1, "baz": 2}}`},
+			{path: []string{"foo", "baz"}, ok: true, expected: `{"foo": {"bar": 1}}`},
+		},
+		`{"foo": {"bar": 1, "baz": {"gup": 3}}}`: {
+			{path: []string{}, ok: false, expected: `{"foo": {"bar": 1, "baz": {"gup": 3}}}`},
+			{path: []string{"foo"}, ok: true, expected: `{}`},
+			{path: []string{"foo", "bar"}, ok: true, expected: `{"foo": {"baz": {"gup": 3}}}`},
+			{path: []string{"foo", "baz"}, ok: true, expected: `{"foo": {"bar": 1}}`},
+			{path: []string{"foo", "baz", "gup"}, ok: true, expected: `{"foo": {"bar": 1, "baz": {}}}`},
+		},
+		`{"foo": [1, 2, {"bar": 3}]}`: {
+			{path: []string{}, ok: false, expected: `{"foo": [1, 2, {"bar": 3}]}`},
+			{path: []string{`foo`}, ok: true, expected: `{}`},
+			{path: []string{`foo`, `0`}, ok: true, expected: `{"foo": [2, {"bar": 3}]}`},
+			{path: []string{`foo`, `1`}, ok: true, expected: `{"foo": [1, {"bar": 3}]}`},
+			{path: []string{`foo`, `2`}, ok: true, expected: `{"foo": [1, 2]}`},
+			{path: []string{`foo`, `2`, `bar`}, ok: true, expected: `{"foo": [1, 2, {}]}`},
+			{path: []string{`foo`, `-3`}, ok: true, expected: `{"foo": [2, {"bar": 3}]}`},
+			{path: []string{`foo`, `-2`}, ok: true, expected: `{"foo": [1, {"bar": 3}]}`},
+			{path: []string{`foo`, `-1`}, ok: true, expected: `{"foo": [1, 2]}`},
+			{path: []string{`foo`, `-1`, `bar`}, ok: true, expected: `{"foo": [1, 2, {}]}`},
+		},
+		`[[1]]`: {
+			{path: []string{"0", "0"}, ok: true, expected: `[[]]`},
+		},
+		`[1]`: {
+			{path: []string{"foo"}, ok: false, expected: `[1]`},
+			{path: []string{""}, ok: false, expected: `[1]`},
+			{path: []string{"0"}, ok: true, expected: `[]`},
+			{path: []string{"0", "0"}, ok: false, expected: `[1]`},
+		},
+		`1`: {
+			{path: []string{"foo"}, errMsg: "cannot delete path in scalar"},
+		},
+	}
+
+	for k, tests := range queryTests {
+		left, err := ParseJSON(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%s #- %v", k, tc.path), func(t *testing.T) {
+				result, ok, err := left.RemovePath(tc.path)
+				if tc.errMsg != "" {
+					if err == nil {
+						t.Fatal("expected error")
+					} else if !strings.Contains(err.Error(), tc.errMsg) {
+						t.Fatalf(`expected error message "%s" to contain "%s"`, err.Error(), tc.errMsg)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.ok != ok {
+					t.Fatalf("expected %t, got %t", tc.ok, ok)
+				}
+				cmp, err := result.Compare(jsonTestShorthand(tc.expected))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cmp != 0 {
+					t.Fatalf("expected %s, got %s", tc.expected, result.String())
+				}
+			})
+		}
 	}
 }

@@ -7,133 +7,97 @@
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 import React from "react";
+import moment from "moment";
+import { Link } from "react-router";
 
-import { MetricConstants } from "src/util/proto";
-import { Bytes } from "src/util/format";
+import { NodeStatus$Properties } from "src/util/proto";
+import { nodeCapacityStats, livenessNomenclature } from "src/redux/nodes";
+import { trustIcon } from "src/util/trust";
+import liveIcon from "!!raw-loader!assets/livenessIcons/live.svg";
+import suspectIcon from "!!raw-loader!assets/livenessIcons/suspect.svg";
+import deadIcon from "!!raw-loader!assets/livenessIcons/dead.svg";
+import nodeIcon from "!!raw-loader!assets/nodeIcon.svg";
+import { Labels } from "src/views/clusterviz/components/nodeOrLocality/labels";
+import { CapacityArc } from "src/views/clusterviz/components/nodeOrLocality/capacityArc";
+import { Sparklines } from "src/views/clusterviz/components/nodeOrLocality/sparklines";
+import { LongToMoment } from "src/util/convert";
+import { cockroach } from "src/js/protos";
 
-import { SimulatedNodeStatus } from "./nodeSimulator";
-import * as PathMath from "./pathmath";
+import NodeLivenessStatus = cockroach.storage.NodeLivenessStatus;
+type Liveness$Properties = cockroach.storage.Liveness$Properties;
 
 interface NodeViewProps {
-  nodeHistory: SimulatedNodeStatus;
-  maxClientActivityRate: number;
+  node: NodeStatus$Properties;
+  livenessStatus: NodeLivenessStatus;
+  liveness: Liveness$Properties;
 }
 
-export class NodeView extends React.Component<NodeViewProps, any> {
-  static radius = 42;
-  static arcWidth = NodeView.radius * 0.11111;
-  static outerRadius = NodeView.radius + NodeView.arcWidth;
-  static maxRadius = NodeView.outerRadius + NodeView.arcWidth;
+const SCALE_FACTOR = 0.8;
+const TRANSLATE_X = -90 * SCALE_FACTOR;
+const TRANSLATE_Y = -100 * SCALE_FACTOR;
 
-  renderBackground() {
-    return (
-      <path
-        className="capacity-background"
-        d={PathMath.createArcPath(
-          NodeView.radius, NodeView.outerRadius, PathMath.arcAngleFromPct(0), PathMath.arcAngleFromPct(1),
-        )}
-      />
-    );
+export class NodeView extends React.Component<NodeViewProps> {
+  getLivenessIcon(livenessStatus: NodeLivenessStatus) {
+    switch (livenessStatus) {
+      case NodeLivenessStatus.LIVE:
+        return liveIcon;
+      case NodeLivenessStatus.DEAD:
+        return deadIcon;
+      default:
+        return suspectIcon;
+    }
   }
 
-  renderCapacityArc() {
-    // Compute used percentage.
-    const { metrics } = this.props.nodeHistory.latest();
-    const used = metrics[MetricConstants.usedCapacity];
-    const capacity = metrics[MetricConstants.capacity];
-    const capacityUsedPct = (capacity) ? used / capacity : 0;
+  getUptimeText() {
+    const { node, livenessStatus, liveness } = this.props;
 
-    const usedX = Math.cos(PathMath.angleFromPct(capacityUsedPct));
-    const usedY = Math.sin(PathMath.angleFromPct(capacityUsedPct));
+    switch (livenessStatus) {
+      case NodeLivenessStatus.DEAD: {
+        if (!liveness) {
+          return "dead";
+        }
 
-    return (
-      <g>
-        <text
-          className="capacity-label"
-          x={(NodeView.outerRadius + NodeView.arcWidth) * Math.cos(0)}
-        >
-          {Bytes(capacity)}
-        </text>
-        <path
-          className="capacity-used"
-          d={PathMath.createArcPath(
-            NodeView.radius,
-            NodeView.outerRadius,
-            PathMath.arcAngleFromPct(0),
-            PathMath.arcAngleFromPct(capacityUsedPct),
-          )}
-        />
-        <text
-          className="capacity-used-label"
-          transform={`translate(${usedX * NodeView.maxRadius}, ${usedY * NodeView.maxRadius})`}
-          textAnchor={capacityUsedPct < 0.75 ? "end" : "start"}
-        >
-          {Bytes(used)}
-        </text>
-
-        <g transform={`translate(${-NodeView.outerRadius}, ${-NodeView.outerRadius})`}>
-          <svg width={NodeView.outerRadius * 2} height={NodeView.outerRadius * 2}>
-            <text className="capacity-used-pct-label" x="50%" y="40%">
-              {Math.round(100 * capacityUsedPct) + "%"}
-            </text>
-            <text className="capacity-used-text" x="50%" y="60%">
-              CAPACITY USED
-              </text>
-          </svg>
-        </g>
-      </g>
-    );
-  }
-
-  renderNetworkActivity() {
-    const barsX = NodeView.radius * Math.cos(PathMath.angleFromPct(0));
-    const barsWidth = NodeView.outerRadius - barsX - 4;
-    const labelH = 8;
-
-    const { nodeHistory, maxClientActivityRate } = this.props;
-
-    return (
-      <g transform={`translate(0,${NodeView.radius * Math.sin(PathMath.angleFromPct(0))})`} >
-        <line
-          className="client-activity"
-          x1={NodeView.outerRadius - 2}
-          y1={-labelH}
-          x2={Math.round(NodeView.outerRadius - barsWidth * nodeHistory.clientActivityRate / maxClientActivityRate)}
-          y2={-labelH}
-        />
-        <text className="client-activity-label" x={NodeView.outerRadius + NodeView.arcWidth} y={-labelH}>
-          {Math.round(nodeHistory.clientActivityRate)} qps
-          </text>
-      </g>
-    );
-  }
-
-  renderLabel() {
-    return (
-      <g transform={`translate(${-NodeView.outerRadius}, ${NodeView.outerRadius * 0.9})`}>
-        <path
-          className="locality-label-background"
-          d={PathMath.drawBox(NodeView.outerRadius * 2, 20, 0.05)}
-        />
-        <svg width={NodeView.outerRadius * 2} height="20">
-          <text className="locality-label" x="50%" y="55%">
-            {this.props.nodeHistory.latest().desc.address.address_field}
-          </text>
-        </svg>
-      </g>
-    );
+        const deadTime = liveness.expiration.wall_time;
+        const deadMoment = LongToMoment(deadTime);
+        return `dead for ${moment.duration(deadMoment.diff(moment())).humanize()}`;
+      }
+      case NodeLivenessStatus.LIVE: {
+        const startTime = LongToMoment(node.started_at);
+        return `up for ${moment.duration(startTime.diff(moment())).humanize()}`;
+      }
+      default:
+        return livenessNomenclature(livenessStatus);
+    }
   }
 
   render() {
+    const { node, livenessStatus } = this.props;
+    const { used, usable } = nodeCapacityStats(node);
+
     return (
-      <g className="locality">
-        <g className="capacity-centric">
-          {this.renderBackground()}
-          {this.renderCapacityArc()}
-          {this.renderNetworkActivity()}
-          {this.renderLabel()}
+      <Link
+        to={`/node/${node.desc.node_id}`}
+        style={{ cursor: "pointer" }}
+      >
+        <g transform={`translate(${TRANSLATE_X},${TRANSLATE_Y})scale(${SCALE_FACTOR})`}>
+          <rect width={180} height={210} opacity={0} />
+          <Labels
+            label={`Node ${node.desc.node_id}`}
+            subLabel={this.getUptimeText()}
+            tooltip={node.desc.address.address_field}
+          />
+          <g dangerouslySetInnerHTML={trustIcon(nodeIcon)} transform="translate(14 14)" />
+          <g
+            dangerouslySetInnerHTML={trustIcon(this.getLivenessIcon(livenessStatus))}
+            transform="translate(9, 9)"
+          />
+          <CapacityArc
+            usableCapacity={usable}
+            usedCapacity={used}
+          />
+          <Sparklines nodes={[`${node.desc.node_id}`]} />
         </g>
-      </g>
+      </Link>
     );
   }
 }

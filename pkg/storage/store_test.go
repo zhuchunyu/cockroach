@@ -81,6 +81,10 @@ func (f *testSenderFactory) New(typ client.TxnType) client.TxnSender {
 	return &testSender{store: f.store}
 }
 
+func (f *testSenderFactory) WrappedSender() client.Sender {
+	return f.store
+}
+
 // testSender is an implementation of the client.TxnSender interface
 // which passes all requests through to a single store.
 type testSender struct {
@@ -1381,67 +1385,6 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 	})
 }
 
-// TestStoreLongTxnStarvation sets up a test which guarantees that
-// every time a txn writes, it gets a write-too-old error by always
-// having a non-transactional write succeed before the txn can retry,
-// which would force endless retries unless batch requests are
-// allowed to go ahead and lay down intents with advanced timestamps.
-// Verifies no starvation for both serializable and snapshot txns.
-func TestStoreLongTxnStarvation(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	storeCfg := TestStoreConfig(nil)
-	storeCfg.DontRetryPushTxnFailures = true
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-	store := createTestStoreWithConfig(t, stopper, &storeCfg)
-
-	for i, iso := range []enginepb.IsolationType{enginepb.SERIALIZABLE, enginepb.SNAPSHOT} {
-		key := roachpb.Key(fmt.Sprintf("a-%d", i))
-		txn := newTransaction("test", key, 1, iso, store.cfg.Clock)
-
-		for retry := 0; ; retry++ {
-			if retry > 1 {
-				t.Fatalf("%d: too many retries", i)
-			}
-			// Always send non-transactional put to push the transaction
-			// and write a non-intent version.
-			nakedPut := putArgs(key, []byte("naked"))
-			_, pErr := client.SendWrapped(context.Background(), store.testSender(), &nakedPut)
-			if pErr != nil && retry == 0 {
-				t.Fatalf("%d: unexpected error on first put: %s", i, pErr)
-			} else if retry == 1 {
-				if _, ok := pErr.GetDetail().(*roachpb.TransactionPushError); !ok {
-					t.Fatalf("%d: expected TransactionPushError; got %s", i, pErr)
-				}
-			}
-
-			// Within the transaction, write same key.
-			txn.Sequence++
-			var ba roachpb.BatchRequest
-			bt, btH := beginTxnArgs(key, txn)
-			put := putArgs(key, []byte("value"))
-			et, _ := endTxnArgs(txn, true)
-			ba.Header = btH
-			ba.Add(&bt)
-			ba.Add(&put)
-			ba.Add(&et)
-			_, pErr = store.testSender().Send(context.Background(), ba)
-			if retry == 0 {
-				if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
-					t.Fatalf("%d: expected retry error on first txn put: %s", i, pErr)
-				}
-				txn = pErr.GetTxn()
-			} else {
-				if pErr != nil {
-					t.Fatalf("%d: unexpected error: %s", i, pErr)
-				}
-				break
-			}
-			txn.Restart(1, 1, store.cfg.Clock.Now())
-		}
-	}
-}
-
 // TestStoreResolveWriteIntent adds a write intent and then verifies
 // that a put returns success and aborts intent's txn in the event the
 // pushee has lower priority. Otherwise, verifies that the put blocks
@@ -1562,11 +1505,6 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 // TestStoreResolveWriteIntentPushOnRead verifies that resolving a write intent
 // for a read will push the timestamp. On failure to push, verify a write
 // intent error is returned with !Resolvable.
-//
-// TODO(tschottdorf): this test (but likely a lot of others) always need to
-// manually update the transaction for each received response, or they behave
-// like real clients aren't allowed to (for instance, dropping WriteTooOld
-// flags or timestamp bumps).
 func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := TestStoreConfig(nil)
@@ -1612,15 +1550,8 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 		{
 			_, btH := beginTxnArgs(key, pushee)
 			args := putArgs(key, []byte("value2"))
-			if reply, pErr := maybeWrapWithBeginTransaction(context.Background(), store.testSender(), btH, &args); pErr != nil {
+			if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.testSender(), btH, &args); pErr != nil {
 				t.Fatal(pErr)
-			} else {
-				pushee.Update(reply.(*roachpb.PutResponse).Txn)
-				if pushee.WriteTooOld {
-					// See test comment for the TODO mentioned below.
-					t.Logf("%d: unsetting WriteTooOld flag as a hack to keep this test passing; should address the TODO", i)
-					pushee.WriteTooOld = false
-				}
 			}
 		}
 
@@ -1831,115 +1762,206 @@ func setTxnAutoGC(to bool) func() {
 }
 
 // TestStoreReadInconsistent verifies that gets and scans with read
-// consistency set to INCONSISTENT either push or simply ignore extant
-// intents (if they cannot be pushed), depending on the intent priority.
+// consistency set to INCONSISTENT or READ_UNCOMMITTED either push or
+// simply ignore extant intents (if they cannot be pushed), depending
+// on the intent priority. READ_UNCOMMITTED requests will also return
+// the intents that they run into.
 func TestStoreReadInconsistent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// The test relies on being able to commit a Txn without specifying the
-	// intent, while preserving the Txn record. Turn off
-	// automatic cleanup for this to work.
-	defer setTxnAutoGC(false)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-	store, _ := createTestStore(t, stopper)
 
-	for _, canPush := range []bool{true, false} {
-		keyA := roachpb.Key(fmt.Sprintf("%t-a", canPush))
-		keyB := roachpb.Key(fmt.Sprintf("%t-b", canPush))
+	for _, rc := range []roachpb.ReadConsistencyType{
+		roachpb.READ_UNCOMMITTED,
+		roachpb.INCONSISTENT,
+	} {
+		t.Run(rc.String(), func(t *testing.T) {
+			// The test relies on being able to commit a Txn without specifying the
+			// intent, while preserving the Txn record. Turn off
+			// automatic cleanup for this to work.
+			defer setTxnAutoGC(false)()
+			stopper := stop.NewStopper()
+			defer stopper.Stop(context.TODO())
+			store, _ := createTestStore(t, stopper)
 
-		// First, write keyA.
-		args := putArgs(keyA, []byte("value1"))
-		if _, pErr := client.SendWrapped(context.Background(), store.testSender(), &args); pErr != nil {
-			t.Fatal(pErr)
-		}
+			for _, canPush := range []bool{true, false} {
+				keyA := roachpb.Key(fmt.Sprintf("%t-a", canPush))
+				keyB := roachpb.Key(fmt.Sprintf("%t-b", canPush))
 
-		// Next, write intents for keyA and keyB. Note that the
-		// transactions have unpushable priorities if canPush is true and
-		// very pushable ones otherwise.
-		priority := roachpb.UserPriority(-math.MaxInt32)
-		if canPush {
-			priority = -1
-		}
-		args.Value.SetBytes([]byte("value2"))
-		txnA := newTransaction("testA", keyA, priority, enginepb.SERIALIZABLE, store.cfg.Clock)
-		txnB := newTransaction("testB", keyB, priority, enginepb.SERIALIZABLE, store.cfg.Clock)
-		for _, txn := range []*roachpb.Transaction{txnA, txnB} {
-			args.Key = txn.Key
-			if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.testSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
-				t.Fatal(pErr)
+				// First, write keyA.
+				args := putArgs(keyA, []byte("value1"))
+				if _, pErr := client.SendWrapped(context.Background(), store.testSender(), &args); pErr != nil {
+					t.Fatal(pErr)
+				}
+
+				// Next, write intents for keyA and keyB. Note that the
+				// transactions have unpushable priorities if canPush is true and
+				// very pushable ones otherwise.
+				priority := roachpb.UserPriority(-math.MaxInt32)
+				if canPush {
+					priority = -1
+				}
+				args.Value.SetBytes([]byte("value2"))
+				txnA := newTransaction("testA", keyA, priority, enginepb.SERIALIZABLE, store.cfg.Clock)
+				txnB := newTransaction("testB", keyB, priority, enginepb.SERIALIZABLE, store.cfg.Clock)
+				for _, txn := range []*roachpb.Transaction{txnA, txnB} {
+					args.Key = txn.Key
+					if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.testSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
+						t.Fatal(pErr)
+					}
+				}
+				// End txn B, but without resolving the intent.
+				etArgs, h := endTxnArgs(txnB, true)
+				txnB.Sequence++
+				if _, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &etArgs); pErr != nil {
+					t.Fatal(pErr)
+				}
+
+				// Now, get from both keys and verify. Whether we can push or not, we
+				// will be able to read with both INCONSISTENT and READ_UNCOMMITTED.
+				// With READ_UNCOMMITTED, we'll also be able to see the intent's value.
+				gArgs := getArgs(keyA)
+				if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
+					ReadConsistency: rc,
+				}, &gArgs); pErr != nil {
+					t.Errorf("expected read to succeed: %s", pErr)
+				} else {
+					gReply := reply.(*roachpb.GetResponse)
+					if replyBytes, err := gReply.Value.GetBytes(); err != nil {
+						t.Fatal(err)
+					} else if !bytes.Equal(replyBytes, []byte("value1")) {
+						t.Errorf("expected value %q, got %+v", []byte("value1"), reply)
+					} else if rc == roachpb.READ_UNCOMMITTED {
+						// READ_UNCOMMITTED will also return the intent.
+						if replyIntentBytes, err := gReply.IntentValue.GetBytes(); err != nil {
+							t.Fatal(err)
+						} else if !bytes.Equal(replyIntentBytes, []byte("value2")) {
+							t.Errorf("expected value %q, got %+v", []byte("value2"), reply)
+						}
+					} else if rc == roachpb.INCONSISTENT {
+						if gReply.IntentValue != nil {
+							t.Errorf("expected value nil, got %+v", gReply.IntentValue)
+						}
+					}
+				}
+
+				gArgs.Key = keyB
+				if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
+					ReadConsistency: rc,
+				}, &gArgs); pErr != nil {
+					t.Errorf("expected read to succeed: %s", pErr)
+				} else {
+					gReply := reply.(*roachpb.GetResponse)
+					if gReply.Value != nil {
+						// The new value of B will not be read at first.
+						t.Errorf("expected value nil, got %+v", gReply.Value)
+					} else if rc == roachpb.READ_UNCOMMITTED {
+						// READ_UNCOMMITTED will also return the intent.
+						if replyIntentBytes, err := gReply.IntentValue.GetBytes(); err != nil {
+							t.Fatal(err)
+						} else if !bytes.Equal(replyIntentBytes, []byte("value2")) {
+							t.Errorf("expected value %q, got %+v", []byte("value2"), reply)
+						}
+					} else if rc == roachpb.INCONSISTENT {
+						if gReply.IntentValue != nil {
+							t.Errorf("expected value nil, got %+v", gReply.IntentValue)
+						}
+					}
+				}
+				// However, it will be read eventually, as B's intent can be
+				// resolved asynchronously as txn B is committed.
+				testutils.SucceedsSoon(t, func() error {
+					if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
+						ReadConsistency: rc,
+					}, &gArgs); pErr != nil {
+						return errors.Errorf("expected read to succeed: %s", pErr)
+					} else if gReply := reply.(*roachpb.GetResponse).Value; gReply == nil {
+						return errors.Errorf("value is nil")
+					} else if replyBytes, err := gReply.GetBytes(); err != nil {
+						return err
+					} else if !bytes.Equal(replyBytes, []byte("value2")) {
+						return errors.Errorf("expected value %q, got %+v", []byte("value2"), reply)
+					}
+					return nil
+				})
+
+				// Scan keys and verify results.
+				sArgs := scanArgs(keyA, keyB.Next())
+				reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
+					ReadConsistency: rc,
+				}, &sArgs)
+				if pErr != nil {
+					t.Errorf("expected scan to succeed: %s", pErr)
+				}
+				sReply := reply.(*roachpb.ScanResponse)
+				if l := len(sReply.Rows); l != 2 {
+					t.Errorf("expected 2 results; got %d", l)
+				} else if key := sReply.Rows[0].Key; !key.Equal(keyA) {
+					t.Errorf("expected key %q; got %q", keyA, key)
+				} else if key := sReply.Rows[1].Key; !key.Equal(keyB) {
+					t.Errorf("expected key %q; got %q", keyB, key)
+				} else if val1, err := sReply.Rows[0].Value.GetBytes(); err != nil {
+					t.Fatal(err)
+				} else if !bytes.Equal(val1, []byte("value1")) {
+					t.Errorf("expected value %q, got %q", []byte("value1"), val1)
+				} else if val2, err := sReply.Rows[1].Value.GetBytes(); err != nil {
+					t.Fatal(err)
+				} else if !bytes.Equal(val2, []byte("value2")) {
+					t.Errorf("expected value %q, got %q", []byte("value2"), val2)
+				} else if rc == roachpb.READ_UNCOMMITTED {
+					if l := len(sReply.IntentRows); l != 1 {
+						t.Errorf("expected 1 intent result; got %d", l)
+					} else if intentKey := sReply.IntentRows[0].Key; !intentKey.Equal(keyA) {
+						t.Errorf("expected intent key %q; got %q", keyA, intentKey)
+					} else if intentVal1, err := sReply.IntentRows[0].Value.GetBytes(); err != nil {
+						t.Fatal(err)
+					} else if !bytes.Equal(intentVal1, []byte("value2")) {
+						t.Errorf("expected intent value %q, got %q", []byte("value2"), intentVal1)
+					}
+				} else if rc == roachpb.INCONSISTENT {
+					if l := len(sReply.IntentRows); l != 0 {
+						t.Errorf("expected 0 intent result; got %d", l)
+					}
+				}
+
+				// Reverse scan keys and verify results.
+				rsArgs := reverseScanArgs(keyA, keyB.Next())
+				reply, pErr = client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
+					ReadConsistency: rc,
+				}, &rsArgs)
+				if pErr != nil {
+					t.Errorf("expected scan to succeed: %s", pErr)
+				}
+				rsReply := reply.(*roachpb.ReverseScanResponse)
+				if l := len(rsReply.Rows); l != 2 {
+					t.Errorf("expected 2 results; got %d", l)
+				} else if key := rsReply.Rows[0].Key; !key.Equal(keyB) {
+					t.Errorf("expected key %q; got %q", keyA, key)
+				} else if key := rsReply.Rows[1].Key; !key.Equal(keyA) {
+					t.Errorf("expected key %q; got %q", keyB, key)
+				} else if val1, err := rsReply.Rows[0].Value.GetBytes(); err != nil {
+					t.Fatal(err)
+				} else if !bytes.Equal(val1, []byte("value2")) {
+					t.Errorf("expected value %q, got %q", []byte("value2"), val1)
+				} else if val2, err := rsReply.Rows[1].Value.GetBytes(); err != nil {
+					t.Fatal(err)
+				} else if !bytes.Equal(val2, []byte("value1")) {
+					t.Errorf("expected value %q, got %q", []byte("value1"), val2)
+				} else if rc == roachpb.READ_UNCOMMITTED {
+					if l := len(rsReply.IntentRows); l != 1 {
+						t.Errorf("expected 1 intent result; got %d", l)
+					} else if intentKey := rsReply.IntentRows[0].Key; !intentKey.Equal(keyA) {
+						t.Errorf("expected intent key %q; got %q", keyA, intentKey)
+					} else if intentVal1, err := rsReply.IntentRows[0].Value.GetBytes(); err != nil {
+						t.Fatal(err)
+					} else if !bytes.Equal(intentVal1, []byte("value2")) {
+						t.Errorf("expected intent value %q, got %q", []byte("value2"), intentVal1)
+					}
+				} else if rc == roachpb.INCONSISTENT {
+					if l := len(rsReply.IntentRows); l != 0 {
+						t.Errorf("expected 0 intent result; got %d", l)
+					}
+				}
 			}
-		}
-		// End txn B, but without resolving the intent.
-		etArgs, h := endTxnArgs(txnB, true)
-		txnB.Sequence++
-		if _, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &etArgs); pErr != nil {
-			t.Fatal(pErr)
-		}
-
-		// Now, get from both keys and verify. Whether we can push or not, we
-		// will be able to read with INCONSISTENT.
-		gArgs := getArgs(keyA)
-
-		if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
-		}, &gArgs); pErr != nil {
-			t.Errorf("expected read to succeed: %s", pErr)
-		} else if replyBytes, err := reply.(*roachpb.GetResponse).Value.GetBytes(); err != nil {
-			t.Fatal(err)
-		} else if !bytes.Equal(replyBytes, []byte("value1")) {
-			t.Errorf("expected value %q, got %+v", []byte("value1"), reply)
-		}
-		gArgs.Key = keyB
-
-		if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
-		}, &gArgs); pErr != nil {
-			t.Errorf("expected read to succeed: %s", pErr)
-		} else if gReply := reply.(*roachpb.GetResponse); gReply.Value != nil {
-			// The new value of B will not be read at first.
-			t.Errorf("expected value nil, got %+v", gReply.Value)
-		}
-		// However, it will be read eventually, as B's intent can be
-		// resolved asynchronously as txn B is committed.
-		testutils.SucceedsSoon(t, func() error {
-			if reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
-				ReadConsistency: roachpb.INCONSISTENT,
-			}, &gArgs); pErr != nil {
-				return errors.Errorf("expected read to succeed: %s", pErr)
-			} else if gReply := reply.(*roachpb.GetResponse).Value; gReply == nil {
-				return errors.Errorf("value is nil")
-			} else if replyBytes, err := gReply.GetBytes(); err != nil {
-				return err
-			} else if !bytes.Equal(replyBytes, []byte("value2")) {
-				return errors.Errorf("expected value %q, got %+v", []byte("value2"), reply)
-			}
-			return nil
 		})
-
-		// Scan keys and verify results.
-		sArgs := scanArgs(keyA, keyB.Next())
-		reply, pErr := client.SendWrappedWith(context.Background(), store.testSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
-		}, &sArgs)
-		if pErr != nil {
-			t.Errorf("expected scan to succeed: %s", pErr)
-		}
-		sReply := reply.(*roachpb.ScanResponse)
-		if l := len(sReply.Rows); l != 2 {
-			t.Errorf("expected 2 results; got %d", l)
-		} else if key := sReply.Rows[0].Key; !key.Equal(keyA) {
-			t.Errorf("expected key %q; got %q", keyA, key)
-		} else if key := sReply.Rows[1].Key; !key.Equal(keyB) {
-			t.Errorf("expected key %q; got %q", keyB, key)
-		} else if val1, err := sReply.Rows[0].Value.GetBytes(); err != nil {
-			t.Fatal(err)
-		} else if !bytes.Equal(val1, []byte("value1")) {
-			t.Errorf("expected value %q, got %q", []byte("value1"), val1)
-		} else if val2, err := sReply.Rows[1].Value.GetBytes(); err != nil {
-			t.Fatal(err)
-		} else if !bytes.Equal(val2, []byte("value2")) {
-			t.Errorf("expected value %q, got %q", []byte("value2"), val2)
-		}
 	}
 }
 
@@ -3080,6 +3102,91 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	atomic.StoreInt32(&boom, 1)
 	cleanupNonEmpty3()
 
+	if n := s.ReservationCount(); n != 0 {
+		t.Fatalf("expected 0 reservations, but found %d", n)
+	}
+}
+
+// TestReserveSnapshotFullnessLimit verifies that snapshots are rejected when
+// the recipient store's disk is near full.
+func TestReserveSnapshotFullnessLimit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	tc := testContext{}
+	tc.Start(t, stopper)
+	s := tc.store
+
+	ctx := context.Background()
+
+	desc, err := s.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc.Capacity.Available = 1
+	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
+
+	s.cfg.StorePool.detailsMu.Lock()
+	s.cfg.StorePool.getStoreDetailLocked(desc.StoreID).desc = desc
+	s.cfg.StorePool.detailsMu.Unlock()
+
+	// A declinable snapshot to a nearly full store should be rejected.
+	cleanupRejected, rejectionMsg, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+		RangeSize:  1,
+		CanDecline: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectionMsg != snapshotStoreTooFullMsg {
+		t.Fatalf("expected rejection message %q, got %q", snapshotStoreTooFullMsg, rejectionMsg)
+	}
+	if cleanupRejected != nil {
+		t.Fatalf("got unexpected non-nil cleanup method")
+	}
+	if n := s.ReservationCount(); n != 0 {
+		t.Fatalf("expected 0 reservations, but found %d", n)
+	}
+
+	// But a non-declinable snapshot should be allowed.
+	cleanupAccepted, rejectionMsg, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+		RangeSize:  1,
+		CanDecline: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectionMsg != "" {
+		t.Fatalf("expected no rejection message, got %q", rejectionMsg)
+	}
+	if n := s.ReservationCount(); n != 1 {
+		t.Fatalf("expected 1 reservation, but found %d", n)
+	}
+	cleanupAccepted()
+
+	// Even if the store isn't mostly full, a range that's larger than the
+	// available disk space should be rejected.
+	desc.Capacity.Available = desc.Capacity.Capacity / 2
+	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
+	s.cfg.StorePool.detailsMu.Lock()
+	s.cfg.StorePool.getStoreDetailLocked(desc.StoreID).desc = desc
+	s.cfg.StorePool.detailsMu.Unlock()
+
+	// A declinable snapshot to a nearly full store should be rejected.
+	cleanupRejected2, rejectionMsg, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+		RangeSize:  desc.Capacity.Available + 1,
+		CanDecline: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectionMsg != snapshotStoreTooFullMsg {
+		t.Fatalf("expected rejection message %q, got %q", snapshotStoreTooFullMsg, rejectionMsg)
+	}
+	if cleanupRejected2 != nil {
+		t.Fatalf("got unexpected non-nil cleanup method")
+	}
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
 	}

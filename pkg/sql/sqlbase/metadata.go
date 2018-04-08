@@ -47,6 +47,7 @@ type DescriptorProto interface {
 	TypeName() string
 	GetName() string
 	SetName(string)
+	GetAuditMode() TableDescriptor_AuditMode
 }
 
 // WrapDescriptor fills in a Descriptor.
@@ -111,13 +112,6 @@ func (ms *MetadataSchema) AddConfigDescriptor(parentID ID, desc DescriptorProto)
 // this schema. This value is needed to automate certain tests.
 func (ms MetadataSchema) SystemDescriptorCount() int {
 	return len(ms.descs)
-}
-
-// SystemConfigDescriptorCount returns the number of config descriptors that
-// will be created by this schema. This value is needed to automate certain
-// tests.
-func (ms MetadataSchema) SystemConfigDescriptorCount() int {
-	return ms.configs
 }
 
 // GetInitialValues returns the set of initial K/V values which should be added to

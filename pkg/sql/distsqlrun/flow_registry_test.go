@@ -21,9 +21,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
 )
@@ -373,7 +377,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	flow := &Flow{}
 	flow.Ctx = ctx
 	id := FlowID{uuid.MakeV4()}
-	registerFlow := func(id FlowID) {
+	registerFlow := func(t *testing.T, id FlowID) {
 		t.Helper()
 		if err := reg.RegisterFlow(
 			ctx, id, flow, nil /* inboundStreams */, 0, /* timeout */
@@ -385,7 +389,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	// WaitForFlow verifies that Drain waits for a flow to finish within the
 	// timeout.
 	t.Run("WaitForFlow", func(t *testing.T) {
-		registerFlow(id)
+		registerFlow(t, id)
 		drainDone := make(chan struct{})
 		go func() {
 			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
@@ -400,7 +404,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 
 	// DrainTimeout verifies that Drain returns once the timeout expires.
 	t.Run("DrainTimeout", func(t *testing.T) {
-		registerFlow(id)
+		registerFlow(t, id)
 		reg.Drain(0 /* flowDrainWait */, 0 /* minFlowDrainWait */)
 		reg.UnregisterFlow(id)
 		reg.Undrain()
@@ -409,7 +413,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	// AcceptNewFlow verifies that a flowRegistry continues accepting flows
 	// while draining.
 	t.Run("AcceptNewFlow", func(t *testing.T) {
-		registerFlow(id)
+		registerFlow(t, id)
 		drainDone := make(chan struct{})
 		go func() {
 			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
@@ -418,7 +422,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		// Be relatively sure that the flowRegistry is draining.
 		time.Sleep(time.Microsecond)
 		newFlowID := FlowID{uuid.MakeV4()}
-		registerFlow(newFlowID)
+		registerFlow(t, newFlowID)
 		reg.UnregisterFlow(id)
 		select {
 		case <-drainDone:
@@ -439,22 +443,49 @@ func TestFlowRegistryDrain(t *testing.T) {
 	// MinFlowWait verifies that the flowRegistry waits a minimum amount of time
 	// for incoming flows to be registered.
 	t.Run("MinFlowWait", func(t *testing.T) {
-		minFlowDrainWait := 10 * time.Millisecond
 		// Case in which draining is initiated with zero running flows.
 		drainDone := make(chan struct{})
+		// Register a flow right before the flowRegistry waits for
+		// minFlowDrainWait. Use an errChan because draining is performed from
+		// another goroutine and cannot call t.Fatal.
+		errChan := make(chan error)
+		reg.testingRunBeforeDrainSleep = func() {
+			if err := reg.RegisterFlow(
+				ctx, id, flow, nil /* inboundStreams */, 0, /* timeout */
+			); err != nil {
+				errChan <- err
+			}
+			errChan <- nil
+		}
+		defer func() { reg.testingRunBeforeDrainSleep = nil }()
 		go func() {
-			reg.Drain(math.MaxInt64 /* flowDrainWait */, minFlowDrainWait)
+			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
 			drainDone <- struct{}{}
 		}()
-		// Be relatively sure that the flowRegistry is draining.
-		time.Sleep(time.Microsecond)
-		registerFlow(id)
+		if err := <-errChan; err != nil {
+			t.Fatal(err)
+		}
 		reg.UnregisterFlow(id)
 		<-drainDone
 		reg.Undrain()
 
-		// Case in which a running flow finishes before the minimum wait time.
-		registerFlow(id)
+		// Case in which a running flow finishes before the minimum wait time. We
+		// attempt to register another flow after the completion of the first flow
+		// to simulate an incoming flow that is registered during the minimum wait
+		// time. However, it is possible to unregister the first flow after the
+		// minimum wait time has passed, in which case we simply verify that the
+		// flowRegistry drain process has lasted at least the required wait time.
+		registerFlow(t, id)
+		reg.testingRunBeforeDrainSleep = func() {
+			if err := reg.RegisterFlow(
+				ctx, id, flow, nil /* inboundStreams */, 0, /* timeout */
+			); err != nil {
+				errChan <- err
+			}
+			errChan <- nil
+		}
+		minFlowDrainWait := 10 * time.Millisecond
+		start := timeutil.Now()
 		go func() {
 			reg.Drain(math.MaxInt64 /* flowDrainWait */, minFlowDrainWait)
 			drainDone <- struct{}{}
@@ -462,9 +493,69 @@ func TestFlowRegistryDrain(t *testing.T) {
 		// Be relatively sure that the flowRegistry is draining.
 		time.Sleep(time.Microsecond)
 		reg.UnregisterFlow(id)
-		registerFlow(id)
+		select {
+		case <-drainDone:
+			if timeutil.Since(start) < minFlowDrainWait {
+				t.Fatal("flow registry did not wait at least minFlowDrainWait")
+			}
+			return
+		case err := <-errChan:
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 		reg.UnregisterFlow(id)
 		<-drainDone
+
 		reg.Undrain()
 	})
+}
+
+// Test that we can register send a sync flow to the distSQLSrv after the
+// flowRegistry is draining and the we can also clean that flow up (the flow
+// will get a draining error). This used to crash.
+func TestSyncFlowAfterDrain(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.TODO()
+	// We'll create a server just so that we can extract its distsql ServerConfig,
+	// so we can use it for a manually-built DistSQL Server below. Otherwise, too
+	// much work to create that ServerConfig by hand.
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	cfg := s.DistSQLServer().(*ServerImpl).ServerConfig
+
+	distSQLSrv := NewServer(ctx, cfg)
+	distSQLSrv.flowRegistry.Drain(time.Duration(0) /* flowDrainWait */, time.Duration(0) /* minFlowDrainWait */)
+
+	// We create some flow; it doesn't matter what.
+	req := SetupFlowRequest{Version: Version}
+	req.Flow = FlowSpec{
+		Processors: []ProcessorSpec{{
+			Core: ProcessorCoreUnion{Values: &ValuesCoreSpec{}},
+			Output: []OutputRouterSpec{{
+				Type:    OutputRouterSpec_PASS_THROUGH,
+				Streams: []StreamEndpointSpec{{Type: StreamEndpointSpec_SYNC_RESPONSE}},
+			}},
+		}},
+	}
+
+	types := make([]sqlbase.ColumnType, 0)
+	rb := NewRowBuffer(types, nil /* rows */, RowBufferArgs{})
+	ctx, flow, err := distSQLSrv.SetupSyncFlow(ctx, &req, rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := flow.Start(ctx, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	flow.Wait()
+	_, meta := rb.Next()
+	if meta == nil {
+		t.Fatal("expected draining err, got no meta")
+	}
+	if !testutils.IsError(meta.Err, "the registry is draining") {
+		t.Fatalf("expected draining err, got: %v", meta.Err)
+	}
+	flow.Cleanup(ctx)
 }

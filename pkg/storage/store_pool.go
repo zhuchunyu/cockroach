@@ -77,20 +77,7 @@ func MakeStorePoolNodeLivenessFunc(nodeLiveness *NodeLiveness) NodeLivenessFunc 
 		if err != nil {
 			return NodeLivenessStatus_UNAVAILABLE
 		}
-		deadAsOf := hlc.Timestamp(liveness.Expiration).GoTime().Add(threshold)
-		if !now.Before(deadAsOf) {
-			return NodeLivenessStatus_DEAD
-		}
-		if liveness.Decommissioning {
-			return NodeLivenessStatus_DECOMMISSIONING
-		}
-		if liveness.Draining {
-			return NodeLivenessStatus_UNAVAILABLE
-		}
-		if liveness.IsLive(hlc.Timestamp{WallTime: now.UnixNano()}, nodeLiveness.clock.MaxOffset()) {
-			return NodeLivenessStatus_LIVE
-		}
-		return NodeLivenessStatus_UNAVAILABLE
+		return liveness.LivenessStatus(now, threshold, nodeLiveness.clock.MaxOffset())
 	}
 }
 
@@ -157,7 +144,7 @@ func (sd *storeDetail) status(
 	// Even if the store has been updated via gossip, we still rely on
 	// the node liveness to determine whether it is considered live.
 	switch nl(sd.desc.Node.NodeID, now, threshold) {
-	case NodeLivenessStatus_DEAD:
+	case NodeLivenessStatus_DEAD, NodeLivenessStatus_DECOMMISSIONED:
 		return storeStatusDead
 	case NodeLivenessStatus_DECOMMISSIONING:
 		return storeStatusDecommissioning
@@ -523,13 +510,13 @@ func (sl StoreList) String() string {
 
 // filter takes a store list and filters it using the passed in constraints. It
 // maintains the original order of the passed in store list.
-func (sl StoreList) filter(constraints config.Constraints) StoreList {
-	if len(constraints.Constraints) == 0 {
+func (sl StoreList) filter(constraints []config.Constraints) StoreList {
+	if len(constraints) == 0 {
 		return sl
 	}
 	var filteredDescs []roachpb.StoreDescriptor
 	for _, store := range sl.stores {
-		if ok, _ := constraintCheck(store, constraints); ok {
+		if ok := constraintsCheck(store, constraints); ok {
 			filteredDescs = append(filteredDescs, store)
 		}
 	}

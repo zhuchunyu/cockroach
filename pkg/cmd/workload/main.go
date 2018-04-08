@@ -16,9 +16,11 @@
 package main
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
 
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl/workloadccl/allccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl/allccl"
 )
 
 var rootCmd = &cobra.Command{
@@ -26,5 +28,20 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	_ = rootCmd.Execute()
+	if err := rootCmd.Execute(); err != nil {
+		// Cobra has already printed the error message.
+		os.Exit(1)
+	}
+}
+
+func handleErrs(
+	f func(cmd *cobra.Command, args []string) error,
+) func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		err := f(cmd, args)
+		if err != nil {
+			cmd.Println("Error:", err.Error())
+			os.Exit(1)
+		}
+	}
 }

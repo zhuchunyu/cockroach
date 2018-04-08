@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // analyzeExpr performs semantic analysis of an expression, including:
@@ -32,7 +33,7 @@ import (
 func (p *planner) analyzeExpr(
 	ctx context.Context,
 	raw tree.Expr,
-	sources multiSourceInfo,
+	sources sqlbase.MultiSourceInfo,
 	iVarHelper tree.IndexedVarHelper,
 	expectedType types.T,
 	requireType bool,
@@ -43,18 +44,16 @@ func (p *planner) analyzeExpr(
 	// is expected. Tell this to replaceSubqueries.  (See UPDATE for a
 	// counter-example; cases where a subquery is an operand of a
 	// comparison are handled specially in the subqueryVisitor already.)
-	replaced, err := p.analyzeSubqueries(ctx, raw, 1 /* one value expected */)
+	err := p.analyzeSubqueries(ctx, raw, 1 /* one value expected */)
 	if err != nil {
 		return nil, err
 	}
 
 	// Perform optional name resolution.
-	var resolved tree.Expr
-	if sources == nil {
-		resolved = replaced
-	} else {
+	resolved := raw
+	if sources != nil {
 		var hasStar bool
-		resolved, _, hasStar, err = p.resolveNames(replaced, sources, iVarHelper)
+		resolved, _, hasStar, err = p.resolveNames(raw, sources, iVarHelper)
 		if err != nil {
 			return nil, err
 		}
@@ -63,14 +62,14 @@ func (p *planner) analyzeExpr(
 
 	// Type check.
 	var typedExpr tree.TypedExpr
-	p.semaCtx.IVarHelper = &iVarHelper
+	p.semaCtx.IVarContainer = iVarHelper.Container()
 	if requireType {
 		typedExpr, err = tree.TypeCheckAndRequire(resolved, &p.semaCtx,
 			expectedType, typingContext)
 	} else {
 		typedExpr, err = tree.TypeCheck(resolved, &p.semaCtx, expectedType)
 	}
-	p.semaCtx.IVarHelper = nil
+	p.semaCtx.IVarContainer = nil
 	if err != nil {
 		return nil, err
 	}

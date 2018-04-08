@@ -16,15 +16,17 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
 	ops        generate operator definitions and functions
+	rulenames  generate enumeration of rule names
+
+The sources can be file names and/or filepath.Glob patterns.
 
 Flags:
   -out string
     	output file name of generated code
-  -pkg string
-    	package name used in generated files
 
 ----
 ----
@@ -46,15 +48,17 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
 	ops        generate operator definitions and functions
+	rulenames  generate enumeration of rule names
+
+The sources can be file names and/or filepath.Glob patterns.
 
 Flags:
   -out string
     	output file name of generated code
-  -pkg string
-    	package name used in generated files
 
 ERROR: invalid number of arguments
 ----
@@ -77,16 +81,32 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
 	ops        generate operator definitions and functions
+	rulenames  generate enumeration of rule names
+
+The sources can be file names and/or filepath.Glob patterns.
 
 Flags:
   -out string
     	output file name of generated code
-  -pkg string
-    	package name used in generated files
 
 ERROR: unrecognized command
 ----
 ----
+
+#
+# Test invalid source.
+#
+optgen exprs invalid-source
+----
+ERROR: invalid source
+
+#
+# Test invalid filename.
+#
+optgen exprs test.opt not-found.opt
+----
+invalid filename

@@ -342,11 +342,11 @@ func (s *Scanner) scan(lval *sqlSymType) {
 			return
 		case '|': // ?|
 			s.pos++
-			lval.id = SOME_EXISTENCE
+			lval.id = JSON_SOME_EXISTS
 			return
-		case '&': // ?|
+		case '&': // ?&
 			s.pos++
-			lval.id = ALL_EXISTENCE
+			lval.id = JSON_ALL_EXISTS
 			return
 		}
 		return
@@ -355,6 +355,12 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		switch s.peek() {
 		case '<': // <<
 			s.pos++
+			switch s.peek() {
+			case '=': // <<=
+				s.pos++
+				lval.id = INET_CONTAINED_BY_OR_EQUALS
+				return
+			}
 			lval.id = LSHIFT
 			return
 		case '>': // <>
@@ -376,6 +382,12 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		switch s.peek() {
 		case '>': // >>
 			s.pos++
+			switch s.peek() {
+			case '=': // >>=
+				s.pos++
+				lval.id = INET_CONTAINS_OR_EQUALS
+				return
+			}
 			lval.id = RSHIFT
 			return
 		case '=': // >=
@@ -432,6 +444,15 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		case '>': // @>
 			s.pos++
 			lval.id = CONTAINS
+			return
+		}
+		return
+
+	case '&':
+		switch s.peek() {
+		case '&': // &&
+			s.pos++
+			lval.id = INET_CONTAINS_OR_CONTAINED_BY
 			return
 		}
 		return

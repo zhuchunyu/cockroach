@@ -98,16 +98,31 @@ CREATE SEQUENCE limit_test MAXVALUE 10 START WITH 11
 statement error pgcode 22023 START value \(5\) cannot be less than MINVALUE \(10\)
 CREATE SEQUENCE limit_test MINVALUE 10 START WITH 5
 
+statement error pgcode 22023 CACHE \(-1\) must be greater than zero
+CREATE SEQUENCE cache_test CACHE -1
+
+statement error pgcode 22023 CACHE \(0\) must be greater than zero
+CREATE SEQUENCE cache_test CACHE 0
+
+statement error pgcode 0A000 CACHE values larger than 1 are not supported, found 5
+CREATE SEQUENCE cache_test CACHE 5
+
+statement error pgcode 0A000 CYCLE option is not supported
+CREATE SEQUENCE cycle_test CYCLE
+
+statement ok
+CREATE SEQUENCE ignored_options_test CACHE 1 NO CYCLE
+
 # Verify presence in crdb_internal.create_statements.
 
 statement ok
 CREATE SEQUENCE show_create_test
 
-query ITITTTT colnames
+query ITTITTTT colnames
 SELECT * FROM crdb_internal.create_statements WHERE descriptor_name = 'show_create_test'
 ----
-database_id database_name descriptor_id descriptor_type descriptor_name  create_statement                                                                             state
-50          test          59            sequence        show_create_test CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1 PUBLIC
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                              state
+50           test           public       64             sequence         show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC
 
 query TT colnames
 SHOW CREATE SEQUENCE show_create_test
@@ -115,18 +130,21 @@ SHOW CREATE SEQUENCE show_create_test
 Sequence         CreateSequence
 show_create_test CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
 
+statement error pq: show_create_test is not a table
+SHOW CREATE TABLE show_create_test
+
 # DML ERRORS
 
-statement error pgcode 42809 cannot run INSERT on sequence "foo" - sequences are not updateable
+statement error pgcode 42809 "foo" is not a table
 INSERT INTO foo VALUES (1, 2, 3)
 
-statement error pgcode 42809 cannot run UPDATE on sequence "foo" - sequences are not updateable
+statement error pgcode 42809 "foo" is not a table
 UPDATE foo SET value = 5
 
-statement error pgcode 42809 cannot run DELETE on sequence "foo" - sequences are not updateable
+statement error pgcode 42809 "foo" is not a table
 DELETE FROM foo
 
-statement error pgcode 42809 cannot run TRUNCATE on sequence "foo" - sequences are not updateable
+statement error pgcode 42809 "foo" is not a table
 TRUNCATE foo
 
 # Drop table on sequences doesn't work; you have to use DROP SEQUENCE.
@@ -162,12 +180,11 @@ SELECT last_value FROM select_test
 statement error pq: column name "foo" not found
 SELECT foo from select_test
 
-query TTT colnames
-EXPLAIN SELECT * FROM select_test
+query TITTTTT colnames
+EXPLAIN (PLAN, METADATA) SELECT * FROM select_test
 ----
-Tree                  Field  Description
-render                ·      ·
- └── sequence select  ·      ·
+Tree             Level  Type             Field  Description  Columns                           Ordering
+sequence select  0      sequence select  ·      ·            (last_value, log_cnt, is_called)  ·
 
 # USING THE `nextval` AND `currval` FUNCTIONS
 
@@ -305,11 +322,8 @@ CREATE SEQUENCE foo.x
 statement ok
 SET DATABASE = bar
 
-statement ok
-SET SEARCH_PATH = foo
-
 query I
-SELECT nextval('x')
+SELECT nextval('foo.x')
 ----
 1
 
@@ -779,3 +793,48 @@ DROP TABLE drop_test_tbl
 
 statement ok
 DROP SEQUENCE drop_test
+
+# Test that sequences can only be modified with the UPDATE permission
+# and read with the SELECT permission.
+
+statement ok
+CREATE SEQUENCE priv_test
+
+user testuser
+
+statement error pq: user testuser does not have SELECT privilege on relation priv_test
+SELECT * FROM priv_test
+
+statement error pq: nextval\(\): user testuser does not have UPDATE privilege on relation priv_test
+SELECT nextval('priv_test')
+
+statement error pq: setval\(\): user testuser does not have UPDATE privilege on relation priv_test
+SELECT setval('priv_test', 5)
+
+user root
+
+# Verify that the value hasn't been changed.
+query I
+SELECT last_value FROM priv_test
+----
+0
+
+statement ok
+GRANT UPDATE, SELECT ON priv_test TO testuser
+
+user testuser
+
+# After the grant, testuser can select, increment, and set.
+
+statement ok
+SELECT nextval('priv_test')
+
+statement ok
+SELECT setval('priv_test', 5)
+
+query I
+SELECT last_value FROM priv_test
+----
+5
+
+user root

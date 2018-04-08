@@ -169,6 +169,9 @@ type DBContext struct {
 	// userPriority is set to any value except 1 in call arguments, this
 	// value is ignored.
 	UserPriority roachpb.UserPriority
+	// NodeID provides the node ID for setting the gateway node and avoiding
+	// clock uncertainty for root transactions started at the gateway.
+	NodeID *base.NodeIDContainer
 }
 
 // DefaultDBContext returns (a copy of) the default options for
@@ -176,6 +179,7 @@ type DBContext struct {
 func DefaultDBContext() DBContext {
 	return DBContext{
 		UserPriority: roachpb.NormalUserPriority,
+		NodeID:       &base.NodeIDContainer{},
 	}
 }
 
@@ -192,6 +196,11 @@ type DB struct {
 // instance to start a new transaction.
 func (db *DB) GetSender() Sender {
 	return db.factory.New(RootTxn)
+}
+
+// GetFactory returns the DB's TxnSenderFactory.
+func (db *DB) GetFactory() TxnSenderFactory {
+	return db.factory
 }
 
 // NewDB returns a new DB.
@@ -497,10 +506,7 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	// (https://github.com/cockroachdb/cockroach/issues/10511).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// TODO(andrei): Plumb a gatewayNodeID here. If we pass 0, then the gateway
-	// field will be filled in by the DistSender which will assume that the
-	// current node is the gateway.
-	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(db, db.ctx.NodeID.Get(), RootTxn)
 	txn.SetDebugName("unnamed")
 	opts := TxnExecOptions{
 		AutoCommit: true,
@@ -536,19 +542,11 @@ func (db *DB) sendUsingSender(
 	if len(ba.Requests) == 0 {
 		return nil, nil
 	}
+	if err := ba.ReadConsistency.SupportsBatch(ba); err != nil {
+		return nil, roachpb.NewError(err)
+	}
 	if ba.UserPriority == 0 && db.ctx.UserPriority != 1 {
 		ba.UserPriority = db.ctx.UserPriority
-	}
-
-	if ba.ReadConsistency == roachpb.INCONSISTENT {
-		for _, ru := range ba.Requests {
-			m := ru.GetInner().Method()
-			switch m {
-			case roachpb.Get, roachpb.Scan, roachpb.ReverseScan:
-			default:
-				return nil, roachpb.NewErrorf("method %s not allowed with INCONSISTENT batch", m)
-			}
-		}
 	}
 
 	tracing.AnnotateTrace()

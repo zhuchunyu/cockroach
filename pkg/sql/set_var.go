@@ -23,6 +23,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -39,13 +40,13 @@ type setVarNode struct {
 // Privileges: None.
 //   Notes: postgres/mysql do not require privileges for session variables (some exceptions).
 func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) {
-	if n.Name == nil {
-		// A client has sent the reserved internal syntax SET ROW ...
-		// Reject it.
-		return nil, errors.New("invalid statement: SET ROW")
+	if n.Name == "" {
+		// A client has sent the reserved internal syntax SET ROW ...,
+		// or the user entered `SET "" = foo`. Reject it.
+		return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "invalid variable name: %q", n.Name)
 	}
 
-	name := strings.ToLower(tree.AsStringWithFlags(n.Name, tree.FmtBareIdentifiers))
+	name := strings.ToLower(n.Name)
 
 	var typedValues []tree.TypedExpr
 	if len(n.Values) > 0 {
@@ -138,7 +139,7 @@ func getStringVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExp
 }
 
 func setTimeZone(
-	_ context.Context, m sessionDataMutator, evalCtx *extendedEvalContext, values []tree.TypedExpr,
+	_ context.Context, m *sessionDataMutator, evalCtx *extendedEvalContext, values []tree.TypedExpr,
 ) error {
 	if len(values) != 1 {
 		return errors.New("set time zone requires a single argument")
@@ -195,4 +196,51 @@ func setTimeZone(
 	}
 	m.SetLocation(loc)
 	return nil
+}
+
+func setStmtTimeout(
+	_ context.Context, m *sessionDataMutator, evalCtx *extendedEvalContext, values []tree.TypedExpr,
+) error {
+	if len(values) != 1 {
+		return errors.New("set statement_timeout requires a single argument")
+	}
+	d, err := values[0].Eval(&evalCtx.EvalContext)
+	if err != nil {
+		return err
+	}
+
+	var timeout time.Duration
+	switch v := tree.UnwrapDatum(&evalCtx.EvalContext, d).(type) {
+	case *tree.DString:
+		interval, err := tree.ParseDInterval(string(*v))
+		if err != nil {
+			return err
+		}
+		timeout, err = intervalToDuration(interval)
+		if err != nil {
+			return err
+		}
+	case *tree.DInterval:
+		timeout, err = intervalToDuration(v)
+		if err != nil {
+			return err
+		}
+	case *tree.DInt:
+		timeout = time.Duration(*v) * time.Millisecond
+	}
+
+	if timeout < 0 {
+		return errors.New("statement_timeout cannot have a negative duration")
+	}
+	m.SetStmtTimeout(timeout)
+
+	return nil
+}
+
+func intervalToDuration(interval *tree.DInterval) (time.Duration, error) {
+	nanos, _, _, err := interval.Encode()
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(nanos), nil
 }

@@ -14,6 +14,7 @@
 
 #include "db.h"
 #include <algorithm>
+#include <rocksdb/convenience.h>
 #include <rocksdb/sst_file_writer.h>
 #include <rocksdb/table.h>
 #include <stdarg.h>
@@ -81,7 +82,22 @@ DBIterState DBIterGetState(DBIterator* iter) {
 DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   rocksdb::Options options = DBMakeOptions(db_opts);
 
-  std::string db_dir = ToString(dir);
+  const std::string additional_options = ToString(db_opts.rocksdb_options);
+  if (!additional_options.empty()) {
+    // TODO(peter): Investigate using rocksdb::LoadOptionsFromFile if
+    // "additional_options" starts with "@". The challenge is that
+    // LoadOptionsFromFile gives us a DBOptions and
+    // ColumnFamilyOptions with no ability to supply "base" options
+    // and no ability to determine what options were specified in the
+    // file which could cause "defaults" to override the options
+    // returned by DBMakeOptions. We might need to fix this upstream.
+    rocksdb::Status status = rocksdb::GetOptionsFromString(options, additional_options, &options);
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+  }
+
+  const std::string db_dir = ToString(dir);
 
   // Call hooks to handle db_opts.extra_options.
   auto hook_status = DBOpenHook(db_dir, db_opts);
@@ -109,7 +125,14 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   }
 
   rocksdb::DB* db_ptr;
-  rocksdb::Status status = rocksdb::DB::Open(options, db_dir, &db_ptr);
+
+  rocksdb::Status status;
+  if (db_opts.read_only) {
+    status = rocksdb::DB::OpenForReadOnly(options, db_dir, &db_ptr);
+  } else {
+    status = rocksdb::DB::Open(options, db_dir, &db_ptr);
+  }
+
   if (!status.ok()) {
     return ToDBStatus(status);
   }
@@ -124,7 +147,13 @@ DBStatus DBDestroy(DBSlice dir) {
   return ToDBStatus(rocksdb::DestroyDB(ToString(dir), options));
 }
 
-void DBClose(DBEngine* db) { delete db; }
+DBStatus DBClose(DBEngine* db) {
+  DBStatus status = db->AssertPreClose();
+  if (status.data == nullptr) {
+    delete db;
+  }
+  return status;
+}
 
 DBStatus DBFlush(DBEngine* db) {
   rocksdb::FlushOptions options;
@@ -495,7 +524,8 @@ DBSSTable* DBGetSSTables(DBEngine* db, int* n) { return db->GetSSTables(n); }
 
 DBString DBGetUserProperties(DBEngine* db) { return db->GetUserProperties(); }
 
-DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file) {
+DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file,
+                              bool allow_file_modification) {
   const std::vector<std::string> paths = {ToString(path)};
   rocksdb::IngestExternalFileOptions ingest_options;
   // If move_files is true and the env supports it, RocksDB will hard link.
@@ -510,7 +540,7 @@ DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file) {
   // ingest runs, then after moving/copying the file, RocksDB will edit it
   // (overwrite some of the bytes) to have a global sequence number. If this is
   // false, it will error in these cases instead.
-  ingest_options.allow_global_seqno = true;
+  ingest_options.allow_global_seqno = allow_file_modification;
   // If there are mutations in the memtable for the keyrange covered by the file
   // being ingested, this option is checked. If true, the memtable is flushed
   // and the ingest run. If false, an error is returned.
@@ -604,7 +634,8 @@ DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
     return ToDBStatus(status);
   }
   if (sst_contents.size() != file_size) {
-    return FmtStatus("expected to read %d bytes but got %d", file_size, sst_contents.size());
+    return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
+                     sst_contents.size());
   }
 
   // The contract of the SequentialFile.Read call above is that it _might_ use

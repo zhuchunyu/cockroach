@@ -44,6 +44,7 @@ import (
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
 )
 
 func entryEq(l, r raftpb.Entry) error {
@@ -87,7 +88,12 @@ func TestSideloadingSideloadedStorage(t *testing.T) {
 		testSideloadingSideloadedStorage(t, newInMemSideloadStorage)
 	})
 	t.Run("Disk", func(t *testing.T) {
-		testSideloadingSideloadedStorage(t, newDiskSideloadStorage)
+		maker := func(
+			s *cluster.Settings, rangeID roachpb.RangeID, rep roachpb.ReplicaID, name string,
+		) (sideloadStorage, error) {
+			return newDiskSideloadStorage(s, rangeID, rep, name, rate.NewLimiter(rate.Inf, math.MaxInt64))
+		}
+		testSideloadingSideloadedStorage(t, maker)
 	})
 }
 
@@ -668,6 +674,10 @@ func TestRaftSSTableSideloadingProposal(t *testing.T) {
 
 	if n := tc.store.metrics.AddSSTableApplications.Count(); n == 0 {
 		t.Fatalf("expected metric to show at least one AddSSTable application, but got %d", n)
+	}
+	// We don't count in-memory env SST writes as copies.
+	if n := tc.store.metrics.AddSSTableApplicationCopies.Count(); n != 0 {
+		t.Fatalf("expected metric to show 0 AddSSTable copy, but got %d", n)
 	}
 }
 

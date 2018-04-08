@@ -107,7 +107,7 @@ function titleTimestampValue(value: string) {
       return null;
     }
     const raw = FixLong(_.get(status, value) as Long);
-    return `${LongToMoment(raw).format(dateFormat)}\n${raw.toString}`;
+    return `${LongToMoment(raw).format(dateFormat)}\n${raw.toString()}`;
   };
 }
 
@@ -322,16 +322,16 @@ class Nodes extends React.Component<NodesProps, {}> {
 
     if (_.isEmpty(orderedNodeIDs)) {
       return (
-        <div>
+        <section className="section">
           <h1>Node Diagnostics</h1>
           <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
           <h2>No nodes match the filters</h2>
-        </div>
+        </section>
       );
     }
 
     return (
-      <div className="section">
+      <section className="section">
         <h1>Node Diagnostics</h1>
         <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
         <h2>Nodes</h2>
@@ -351,7 +351,7 @@ class Nodes extends React.Component<NodesProps, {}> {
             }
           </tbody>
         </table>
-      </div>
+      </section>
     );
   }
 }

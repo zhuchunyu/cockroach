@@ -11,6 +11,8 @@ const (
 	DefineSetOp
 	RuleSetOp
 	DefineOp
+	CommentsOp
+	CommentOp
 	TagsOp
 	TagOp
 	DefineFieldsOp
@@ -19,15 +21,19 @@ const (
 	BindOp
 	RefOp
 	MatchOp
-	OpNamesOp
-	OpNameOp
+	NamesOp
+	NameOp
 	MatchAndOp
-	MatchInvokeOp
 	MatchNotOp
 	MatchAnyOp
-	MatchListOp
+	MatchListAnyOp
+	MatchListFirstOp
+	MatchListLastOp
+	MatchListSingleOp
+	MatchListEmptyOp
 	ConstructOp
 	ConstructListOp
 	ListOp
 	StringOp
+	CustomFuncOp
 )

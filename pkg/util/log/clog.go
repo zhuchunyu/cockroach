@@ -40,9 +40,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/color"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/petermattis/goid"
 )
+
+// FatalChan is closed when Fatal is called. This can be used to make
+// the process stop handling requests while the final log messages and
+// crash report are being written.
+func FatalChan() <-chan struct{} {
+	return logging.fatalCh
+}
 
 const severityChar = "IWEF"
 
@@ -574,11 +582,23 @@ func init() {
 	logging.stderrThreshold = Severity_INFO
 	logging.fileThreshold = Severity_INFO
 
+	logging.prefix = program
 	logging.setVState(0, nil, false)
 	logging.exitFunc = os.Exit
 	logging.gcNotify = make(chan struct{}, 1)
+	logging.fatalCh = make(chan struct{})
 
-	go logging.flushDaemon()
+	go flushDaemon()
+	go signalFlusher()
+}
+
+// signalFlusher flushes the log(s) every time SIGHUP is received.
+func signalFlusher() {
+	ch := sysutil.RefreshSignaledChan()
+	for sig := range ch {
+		Infof(context.Background(), "%s received, flushing logs", sig)
+		Flush()
+	}
 }
 
 // LoggingToStderr returns true if log messages of the given severity
@@ -597,11 +617,28 @@ func StartGCDaemon() {
 // Flush flushes all pending log I/O.
 func Flush() {
 	logging.lockAndFlushAll()
+	secondaryLogRegistry.mu.Lock()
+	defer secondaryLogRegistry.mu.Unlock()
+	for _, l := range secondaryLogRegistry.mu.loggers {
+		// Some loggers (e.g. the audit log) want to keep all the files.
+		l.logger.lockAndFlushAll()
+	}
 }
 
 // SetSync configures whether logging synchronizes all writes.
 func SetSync(sync bool) {
 	logging.lockAndSetSync(sync)
+	func() {
+		secondaryLogRegistry.mu.Lock()
+		defer secondaryLogRegistry.mu.Unlock()
+		for _, l := range secondaryLogRegistry.mu.loggers {
+			if !sync && l.forceSyncWrites {
+				// We're not changing this.
+				continue
+			}
+			l.logger.lockAndSetSync(sync)
+		}
+	}()
 	if sync {
 		// There may be something in the buffers already; flush it.
 		Flush()
@@ -611,6 +648,12 @@ func SetSync(sync bool) {
 // loggingT collects all the global state of the logging setup.
 type loggingT struct {
 	noStderrRedirect bool
+
+	// Directory prefix where to store this logger's files.
+	logDir DirName
+
+	// Name prefix for log files.
+	prefix string
 
 	// Level flag for output to stderr. Handled atomically.
 	stderrThreshold Severity
@@ -629,7 +672,7 @@ type loggingT struct {
 	mu syncutil.Mutex
 	// file holds the log file writer.
 	file flushSyncWriter
-	// syncWrites if true calls file.Flush on every log write.
+	// syncWrites if true calls file.Flush and file.Sync on every log write.
 	syncWrites bool
 	// pcs is used in V to avoid an allocation when computing the caller's PC.
 	pcs [1]uintptr
@@ -650,6 +693,7 @@ type loggingT struct {
 	verbosity level         // V logging level, the value of the --verbosity flag/
 	exitFunc  func(int)     // func that will be called on fatal errors
 	gcNotify  chan struct{} // notify GC daemon that a new log file was created
+	fatalCh   chan struct{} // closed on fatal error
 
 	interceptor atomic.Value // InterceptorFn
 }
@@ -749,7 +793,16 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 	l.mu.Lock()
 
 	var stacks []byte
+	var fatalTrigger chan struct{}
 	if s == Severity_FATAL {
+		// Close l.fatalCh if it is not already closed (note that we're
+		// holding l.mu to guard against concurrent closes).
+		select {
+		case <-l.fatalCh:
+		default:
+			close(l.fatalCh)
+		}
+
 		switch traceback {
 		case tracebackSingle:
 			stacks = getStacks(false)
@@ -757,6 +810,33 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 			stacks = getStacks(true)
 		}
 		logExitFunc = func(error) {} // If we get a write error, we'll still exit.
+
+		// We don't want to hang forever writing our final log message. If
+		// things are broken (for example, if the disk fills up and there
+		// are cascading errors and our process manager has stopped
+		// reading from its side of a stderr pipe), it's more important to
+		// let the process exit than limp along.
+		//
+		// Note that we do not use os.File.SetWriteDeadline because not
+		// all files support this (for example, plain files on a network
+		// file system do not support deadlines but can block
+		// indefinitely).
+		//
+		// https://github.com/cockroachdb/cockroach/issues/23119
+		fatalTrigger = make(chan struct{})
+		exitFunc := l.exitFunc
+		exitCalled := make(chan struct{})
+		defer func() {
+			<-exitCalled
+		}()
+		go func() {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-fatalTrigger:
+			}
+			exitFunc(255) // C++ uses -1, which is silly because it's anded with 255 anyway.
+			close(exitCalled)
+		}()
 	} else if l.traceLocation.isSet() {
 		if l.traceLocation.match(file, line) {
 			stacks = getStacks(false)
@@ -768,7 +848,7 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 		// to terminate and the user will want to know why.
 		l.outputToStderr(entry, stacks)
 	}
-	if logDir.isSet() && s >= l.fileThreshold.get() {
+	if l.logDir.IsSet() && s >= l.fileThreshold.get() {
 		if err := l.ensureFile(); err != nil {
 			// Make sure the message appears somewhere.
 			l.outputToStderr(entry, stacks)
@@ -788,14 +868,12 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 
 		l.putBuffer(buf)
 	}
-	exitFunc := l.exitFunc // restore the exitFunc
-	l.mu.Unlock()
 	// Flush and exit on fatal logging.
 	if s == Severity_FATAL {
-		// If we got here via Exit rather than Fatal, print no stacks.
-		timeoutFlush(10 * time.Second)
-		exitFunc(255) // C++ uses -1, which is silly because it's anded with 255 anyway.
+		l.flushAndSync(true /*doSync*/)
+		close(fatalTrigger)
 	}
+	l.mu.Unlock()
 }
 
 // printPanicToFile copies the panic details to the log file. This is
@@ -803,7 +881,7 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 // (!stderrRedirected), as the go runtime will only print panics to
 // stderr.
 func (l *loggingT) printPanicToFile(r interface{}) {
-	if !logDir.isSet() {
+	if !l.logDir.IsSet() {
 		// There's no log file. Nothing to do.
 		return
 	}
@@ -839,23 +917,6 @@ func (l *loggingT) processForStderr(entry Entry, stacks []byte) *buffer {
 // processForFile formats a log entry for output to a file.
 func (l *loggingT) processForFile(entry Entry, stacks []byte) *buffer {
 	return formatLogEntry(entry, stacks, nil)
-}
-
-// timeoutFlush calls Flush and returns when it completes or after timeout
-// elapses, whichever happens first.  This is needed because the hooks invoked
-// by Flush may deadlock when clog.Fatal is called from a hook that holds
-// a lock.
-func timeoutFlush(timeout time.Duration) {
-	done := make(chan bool, 1)
-	go func() {
-		Flush() // calls logging.lockAndFlushAll()
-		done <- true
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		fmt.Fprintln(OrigStderr, "clog: Flush took longer than", timeout)
-	}
 }
 
 // getStacks is a wrapper for runtime.Stack that attempts to recover the data for all goroutines.
@@ -912,7 +973,7 @@ func (l *loggingT) exitLocked(err error) {
 		logExitFunc(err)
 		return
 	}
-	l.flushAll()
+	l.flushAndSync(true /*doSync*/)
 	l.exitFunc(2)
 }
 
@@ -957,7 +1018,7 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 		}
 	}
 	var err error
-	sb.file, sb.lastRotation, _, err = create(now, sb.lastRotation)
+	sb.file, sb.lastRotation, _, err = create(&sb.logger.logDir, sb.logger.prefix, now, sb.lastRotation)
 	sb.nbytes = 0
 	if err != nil {
 		return err
@@ -1045,24 +1106,53 @@ func (l *loggingT) createFile() error {
 	return nil
 }
 
-const flushInterval = 30 * time.Second
+// flushInterval is the delay between periodic flushes of the buffered log data.
+const flushInterval = time.Second
 
-// flushDaemon periodically flushes the log file buffers.
-func (l *loggingT) flushDaemon() {
-	// doesn't need to be Stop()'d as the loop never escapes
+// syncInterval is the multiple of flushInterval where the log is also synced to disk.
+const syncInterval = 30
+
+// flushDaemon periodically flushes and syncs the log file buffers.
+//
+// Flush propagates the in-memory buffer inside CockroachDB to the
+// in-memory buffer(s) of the OS. The flush is relatively frequent so
+// that a human operator can see "up to date" logging data in the log
+// file.
+//
+// Syncs ensure that the OS commits the data to disk. Syncs are less
+// frequent because they can incur more significant I/O costs.
+func flushDaemon() {
+	syncCounter := 1
+
+	// This doesn't need to be Stop()'d as the loop never escapes.
 	for range time.Tick(flushInterval) {
-		l.mu.Lock()
-		if !l.disableDaemons {
-			l.flushAll()
+		doSync := syncCounter == syncInterval
+		syncCounter = (syncCounter + 1) % syncInterval
+
+		// Flush the main log.
+		logging.mu.Lock()
+		if !logging.disableDaemons {
+			logging.flushAndSync(doSync)
 		}
-		l.mu.Unlock()
+		logging.mu.Unlock()
+
+		// Flush the secondary logs.
+		secondaryLogRegistry.mu.Lock()
+		for _, l := range secondaryLogRegistry.mu.loggers {
+			l.logger.mu.Lock()
+			if !l.logger.disableDaemons {
+				l.logger.flushAndSync(doSync)
+			}
+			l.logger.mu.Unlock()
+		}
+		secondaryLogRegistry.mu.Unlock()
 	}
 }
 
 // lockAndFlushAll is like flushAll but locks l.mu first.
 func (l *loggingT) lockAndFlushAll() {
 	l.mu.Lock()
-	l.flushAll()
+	l.flushAndSync(true /*doSync*/)
 	l.mu.Unlock()
 }
 
@@ -1073,12 +1163,15 @@ func (l *loggingT) lockAndSetSync(sync bool) {
 	l.mu.Unlock()
 }
 
-// flushAll flushes all the logs and attempts to "sync" their data to disk.
+// flushAndSync flushes the current log and, if doSync is set,
+// attempts to sync its data to disk.
 // l.mu is held.
-func (l *loggingT) flushAll() {
+func (l *loggingT) flushAndSync(doSync bool) {
 	if l.file != nil {
 		_ = l.file.Flush() // ignore error
-		_ = l.file.Sync()  // ignore error
+		if doSync {
+			_ = l.file.Sync() // ignore error
+		}
 	}
 }
 
@@ -1094,13 +1187,15 @@ func (l *loggingT) gcDaemon() {
 }
 
 func (l *loggingT) gcOldFiles() {
-	dir, err := logDir.get()
+	dir, err := l.logDir.get()
 	if err != nil {
 		// No log directory configured. Nothing to do.
 		return
 	}
 
-	allFiles, err := ListLogFiles()
+	// This only lists the log files for the current logger (sharing the
+	// prefix).
+	allFiles, err := l.listLogFiles()
 	if err != nil {
 		fmt.Fprintf(OrigStderr, "unable to GC log files: %s\n", err)
 		return
@@ -1257,14 +1352,20 @@ func VDepth(l int32, depth int) bool {
 		// is shared so we must lock before accessing it. This is fairly expensive,
 		// but if V logging is enabled we're slow anyway.
 		logging.mu.Lock()
-		defer logging.mu.Unlock()
+		// We prefer not to use a defer in this function, which can be used in hot
+		// paths, because a defer anywhere in the body of a function causes a call
+		// to runtime.deferreturn at the end of that function. This call has a
+		// measurable performance penalty when in a very hot path.
+		// defer logging.mu.Unlock()
 		if runtime.Callers(2+depth, logging.pcs[:]) == 0 {
+			logging.mu.Unlock()
 			return false
 		}
 		v, ok := logging.vmap[logging.pcs[0]]
 		if !ok {
 			v = logging.setV(logging.pcs[0])
 		}
+		logging.mu.Unlock()
 		return v >= level(l)
 	}
 	return false

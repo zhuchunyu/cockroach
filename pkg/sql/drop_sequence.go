@@ -17,7 +17,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -25,43 +24,34 @@ import (
 
 type dropSequenceNode struct {
 	n  *tree.DropSequence
-	td []*sqlbase.TableDescriptor
+	td []toDelete
 }
 
 func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planNode, error) {
-	td := make([]*sqlbase.TableDescriptor, 0, len(n.Names))
-	for _, name := range n.Names {
-		tn, err := name.NormalizeTableName()
+	td := make([]toDelete, 0, len(n.Names))
+	for i := range n.Names {
+		tn, err := n.Names[i].Normalize()
 		if err != nil {
 			return nil, err
 		}
-		if err := tn.QualifyWithDatabase(p.SessionData().Database); err != nil {
-			return nil, err
-		}
-
-		droppedDesc, err := p.dropTableOrViewPrepare(ctx, tn)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, requireSequenceDesc)
 		if err != nil {
 			return nil, err
 		}
 		if droppedDesc == nil {
-			if n.IfExists {
-				continue
-			}
-			// Sequence does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedRelationError(tn)
+			// IfExists specified and descriptor does not exist.
+			continue
 		}
-		if !droppedDesc.IsSequence() {
-			return nil, sqlbase.NewWrongObjectTypeError(tn, "sequence")
-		}
+
 		if depErr := p.sequenceDependencyError(ctx, droppedDesc); depErr != nil {
 			return nil, depErr
 		}
 
-		td = append(td, droppedDesc)
+		td = append(td, toDelete{tn, droppedDesc})
 	}
 
 	if len(td) == 0 {
-		return &zeroNode{}, nil
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	return &dropSequenceNode{
@@ -72,10 +62,8 @@ func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planN
 
 func (n *dropSequenceNode) startExec(params runParams) error {
 	ctx := params.ctx
-	for _, droppedDesc := range n.td {
-		if droppedDesc == nil {
-			continue
-		}
+	for _, toDel := range n.td {
+		droppedDesc := toDel.desc
 		err := params.p.dropSequenceImpl(ctx, droppedDesc, n.n.DropBehavior)
 		if err != nil {
 			return err
@@ -93,7 +81,7 @@ func (n *dropSequenceNode) startExec(params runParams) error {
 				SequenceName string
 				Statement    string
 				User         string
-			}{droppedDesc.Name, n.n.String(), params.SessionData().User},
+			}{toDel.tn.FQString(), n.n.String(), params.SessionData().User},
 		); err != nil {
 			return err
 		}
@@ -108,17 +96,7 @@ func (*dropSequenceNode) Close(context.Context)        {}
 func (p *planner) dropSequenceImpl(
 	ctx context.Context, seqDesc *sqlbase.TableDescriptor, behavior tree.DropBehavior,
 ) error {
-	err := p.initiateDropTable(ctx, seqDesc)
-	if err != nil {
-		return err
-	}
-
-	p.testingVerifyMetadata().setTestingVerifyMetadata(
-		func(systemConfig config.SystemConfig) error {
-			return verifyDropTableMetadata(systemConfig, seqDesc.ID, "sequence")
-		})
-
-	return nil
+	return p.initiateDropTable(ctx, seqDesc, true /* drainName */)
 }
 
 // sequenceDependency error returns an error if the given sequence cannot be dropped because

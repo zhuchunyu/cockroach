@@ -30,12 +30,15 @@ type createSequenceNode struct {
 }
 
 func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (planNode, error) {
-	name, err := n.Name.NormalizeWithDatabaseName(p.SessionData().Database)
+	name, err := n.Name.Normalize()
 	if err != nil {
 		return nil, err
 	}
 
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), name.Database())
+	var dbDesc *DatabaseDescriptor
+	p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+		dbDesc, err = ResolveTargetObject(ctx, p, name)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +80,7 @@ func (n *createSequenceNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err = desc.ValidateTable(); err != nil {
+	if err = desc.ValidateTable(params.EvalContext().Settings); err != nil {
 		return err
 	}
 
@@ -96,7 +99,7 @@ func (n *createSequenceNode) startExec(params runParams) error {
 	if desc.Adding() {
 		params.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
 	}
-	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn, params.extendedEvalCtx.Settings); err != nil {
 		return err
 	}
 
@@ -112,13 +115,18 @@ func (n *createSequenceNode) startExec(params runParams) error {
 			SequenceName string
 			Statement    string
 			User         string
-		}{n.n.Name.String(), n.n.String(), params.SessionData().User},
+		}{n.n.Name.TableName().FQString(), n.n.String(), params.SessionData().User},
 	)
 }
 
 func (*createSequenceNode) Next(runParams) (bool, error) { return false, nil }
 func (*createSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createSequenceNode) Close(context.Context)        {}
+
+const (
+	sequenceColumnID   = 1
+	sequenceColumnName = "value"
+)
 
 func (n *createSequenceNode) makeSequenceTableDesc(
 	params runParams,
@@ -127,10 +135,37 @@ func (n *createSequenceNode) makeSequenceTableDesc(
 	id sqlbase.ID,
 	privileges *sqlbase.PrivilegeDescriptor,
 ) (sqlbase.TableDescriptor, error) {
-	desc := initTableDescriptor(id, parentID, sequenceName, params.p.txn.OrigTimestamp(), privileges)
+	desc := initTableDescriptor(id, parentID, sequenceName,
+		params.p.txn.CommitTimestamp(), privileges)
+
+	// Mimic a table with one column, "value".
+	desc.Columns = []sqlbase.ColumnDescriptor{
+		{
+			ID:   1,
+			Name: sequenceColumnName,
+			Type: sqlbase.ColumnType{
+				SemanticType: sqlbase.ColumnType_INT,
+			},
+		},
+	}
+	desc.PrimaryIndex = sqlbase.IndexDescriptor{
+		ID:               keys.SequenceIndexID,
+		Name:             sqlbase.PrimaryKeyIndexName,
+		ColumnIDs:        []sqlbase.ColumnID{sqlbase.ColumnID(1)},
+		ColumnNames:      []string{sequenceColumnName},
+		ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+	}
+	desc.Families = []sqlbase.ColumnFamilyDescriptor{
+		{
+			ID:              keys.SequenceColumnFamilyID,
+			ColumnIDs:       []sqlbase.ColumnID{1},
+			ColumnNames:     []string{sequenceColumnName},
+			Name:            "primary",
+			DefaultColumnID: sequenceColumnID,
+		},
+	}
 
 	// Fill in options, starting with defaults then overriding.
-
 	opts := &sqlbase.TableDescriptor_SequenceOpts{
 		Increment: 1,
 	}
@@ -140,5 +175,5 @@ func (n *createSequenceNode) makeSequenceTableDesc(
 	}
 	desc.SequenceOpts = opts
 
-	return desc, desc.AllocateIDs()
+	return desc, desc.ValidateTable(params.EvalContext().Settings)
 }

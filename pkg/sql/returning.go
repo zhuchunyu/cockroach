@@ -34,7 +34,7 @@ type returningHelper struct {
 	// Processed copies of expressions from ReturningExprs.
 	exprs        []tree.TypedExpr
 	rowCount     int
-	source       *dataSourceInfo
+	source       *sqlbase.DataSourceInfo
 	curSourceRow tree.Datums
 
 	// This struct must be allocated on the heap and its location stay
@@ -42,8 +42,6 @@ type returningHelper struct {
 	// IndexedVarContainer and the IndexedVar objects in sub-expressions
 	// will link to it by reference after checkRenderStar / analyzeExpr.
 	// Enforce this using NoCopy.
-	//
-	//lint:ignore U1000 this marker prevents by-value copies.
 	noCopy util.NoCopy
 }
 
@@ -78,14 +76,14 @@ func (p *planner) newReturningHelper(
 	}
 
 	rh.columns = make(sqlbase.ResultColumns, 0, len(rExprs))
-	rh.source = newSourceInfoForSingleTable(
+	rh.source = sqlbase.NewSourceInfoForSingleTable(
 		*tn, sqlbase.ResultColumnsFromColDescs(tablecols),
 	)
 	rh.exprs = make([]tree.TypedExpr, 0, len(rExprs))
 	ivarHelper := tree.MakeIndexedVarHelper(rh, len(tablecols))
 	for _, target := range rExprs {
 		cols, typedExprs, _, err := p.computeRenderAllowingStars(
-			ctx, target, types.Any, multiSourceInfo{rh.source}, ivarHelper,
+			ctx, target, types.Any, sqlbase.MakeMultiSourceInfo(rh.source), ivarHelper,
 			autoGenerateRenderOutputName)
 		if err != nil {
 			return nil, err
@@ -107,7 +105,7 @@ func (rh *returningHelper) cookResultRow(rowVals tree.Datums) (tree.Datums, erro
 	rh.curSourceRow = rowVals
 	resRow := make(tree.Datums, len(rh.exprs))
 	for i, e := range rh.exprs {
-		rh.p.extendedEvalCtx.IVarHelper = &rh.ivarHelper
+		rh.p.extendedEvalCtx.IVarContainer = rh
 		d, err := e.Eval(rh.p.EvalContext())
 		if err != nil {
 			return nil, err
@@ -124,7 +122,7 @@ func (rh *returningHelper) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
 func (rh *returningHelper) IndexedVarResolvedType(idx int) types.T {
-	return rh.source.sourceColumns[idx].Typ
+	return rh.source.SourceColumns[idx].Typ
 }
 
 // IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.

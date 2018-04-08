@@ -150,7 +150,7 @@ func TestAdminDebugPprof(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 
-	body, err := getText(s, debugURL(s)+"pprof/block")
+	body, err := getText(s, debugURL(s)+"pprof/block?debug=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
@@ -238,17 +238,10 @@ func TestAdminAPIDatabases(t *testing.T) {
 
 	// Test databases endpoint.
 	const testdb = "test"
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	query := "CREATE DATABASE " + testdb
-	createRes, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	defer createRes.Close(ctx)
 
 	var resp serverpb.DatabasesResponse
 	if err := getAdminJSONProto(s, "databases", &resp); err != nil {
@@ -271,18 +264,14 @@ func TestAdminAPIDatabases(t *testing.T) {
 	privileges := []string{"SELECT", "UPDATE"}
 	testuser := "testuser"
 	createUserQuery := "CREATE USER " + testuser
-	createUserRes, err := s.(*TestServer).sqlExecutor.ExecuteStatementsBuffered(session, createUserQuery, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(createUserQuery); err != nil {
 		t.Fatal(err)
 	}
-	defer createUserRes.Close(ctx)
 
 	grantQuery := "GRANT " + strings.Join(privileges, ", ") + " ON DATABASE " + testdb + " TO " + testuser
-	grantRes, err := s.(*TestServer).sqlExecutor.ExecuteStatementsBuffered(session, grantQuery, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(grantQuery); err != nil {
 		t.Fatal(err)
 	}
-	defer grantRes.Close(ctx)
 
 	var details serverpb.DatabaseDetailsResponse
 	if err := getAdminJSONProto(s, "databases/"+testdb, &details); err != nil {
@@ -322,6 +311,12 @@ func TestAdminAPIDatabases(t *testing.T) {
 		}
 	}
 
+	session := sql.NewSession(
+		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
+		&sql.MemoryMetrics{}, nil /* conn */)
+	session.StartUnlimitedMonitor()
+	defer session.Finish(ts.sqlExecutor)
+
 	// Verify Descriptor ID.
 	path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{testdb})
 	if err != nil {
@@ -339,17 +334,6 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 
 	const errPattern = "database.+does not exist"
 	if err := getAdminJSONProto(s, "databases/i_do_not_exist", nil); !testutils.IsError(err, errPattern) {
-		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
-	}
-}
-
-func TestAdminAPIDatabaseVirtual(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	const errPattern = `\\"information_schema\\" is a virtual schema`
-	if err := getAdminJSONProto(s, "databases/information_schema", nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
 }
@@ -374,7 +358,7 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 
 	const fakename = "i_do_not_exist"
 	const badDBPath = "databases/" + fakename + "/tables/foo"
-	const dbErrPattern = `database \\"` + fakename + `\\" does not exist`
+	const dbErrPattern = `relation \\"` + fakename + `.foo\\" does not exist`
 	if err := getAdminJSONProto(s, badDBPath, nil); !testutils.IsError(err, dbErrPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, dbErrPattern)
 	}
@@ -383,19 +367,6 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 	const tableErrPattern = `relation \\"system.` + fakename + `\\" does not exist`
 	if err := getAdminJSONProto(s, badTablePath, nil); !testutils.IsError(err, tableErrPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, tableErrPattern)
-	}
-}
-
-func TestAdminAPITableVirtual(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	const virtual = "information_schema"
-	const badDBPath = "databases/" + virtual + "/tables/tables"
-	const dbErrPattern = `\\"` + virtual + `\\" is a virtual schema`
-	if err := getAdminJSONProto(s, badDBPath, nil); !testutils.IsError(err, dbErrPattern) {
-		t.Fatalf("unexpected error: %v\nexpected: %s", err, dbErrPattern)
 	}
 }
 
@@ -423,7 +394,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 		{name: "upper", dbName: "TEST", tblName: "TBL"}, // Regression test for issue #14056
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 			defer s.Stopper().Stop(context.TODO())
 			ts := s.(*TestServer)
 
@@ -434,11 +405,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 			defer span.Finish()
 
-			session := sql.NewSession(
-				ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-				nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-			session.StartUnlimitedMonitor()
-			defer session.Finish(ts.sqlExecutor)
 			setupQueries := []string{
 				fmt.Sprintf("CREATE DATABASE %s", escDBName),
 				fmt.Sprintf(`CREATE TABLE %s.%s (
@@ -455,11 +421,9 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			for _, q := range setupQueries {
-				res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-				if err != nil {
-					t.Fatalf("error executing '%s': %s", q, err)
+				if _, err := db.Exec(q); err != nil {
+					t.Fatal(err)
 				}
-				res.Close(ctx)
 			}
 
 			// Perform API call.
@@ -534,19 +498,11 @@ func TestAdminAPITableDetails(t *testing.T) {
 			// Verify Create Table Statement.
 			{
 
-				const createTableCol = "CreateTable"
 				showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s.%s", escDBName, escTblName)
 
-				resSet, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, showCreateTableQuery, nil, 1)
-				if err != nil {
-					t.Fatalf("error executing '%s': %s", showCreateTableQuery, err)
-				}
-				defer resSet.Close(ctx)
-
-				res := resSet.ResultList[0]
-				scanner := makeResultScanner(res.Columns)
-				var createStmt string
-				if err := scanner.Scan(res.Rows.At(0), createTableCol, &createStmt); err != nil {
+				row := db.QueryRow(showCreateTableQuery)
+				var createStmt, tableName string
+				if err := row.Scan(&tableName, &createStmt); err != nil {
 					t.Fatal(err)
 				}
 
@@ -554,6 +510,12 @@ func TestAdminAPITableDetails(t *testing.T) {
 					t.Fatalf("mismatched create table statement; expected %s, got %s", e, a)
 				}
 			}
+
+			session := sql.NewSession(
+				ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
+				&sql.MemoryMetrics{}, nil /* conn */)
+			session.StartUnlimitedMonitor()
+			defer session.Finish(ts.sqlExecutor)
 
 			// Verify Descriptor ID.
 			path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{tc.dbName, tc.tblName})
@@ -571,7 +533,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 // for both DatabaseDetailsResponse AND TableDetailsResponse.
 func TestAdminAPIZoneDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
@@ -579,20 +541,14 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
 	setupQueries := []string{
 		"CREATE DATABASE test",
 		"CREATE TABLE test.tbl (val STRING)",
 	}
 	for _, q := range setupQueries {
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-		if err != nil {
+		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("error executing '%s': %s", q, err)
 		}
-		res.Close(ctx)
 	}
 
 	// Function to verify the zone for table "test.tbl" as returned by the Admin
@@ -642,19 +598,19 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 		const query = `INSERT INTO system.zones VALUES($1, $2)`
-		params := tree.MakePlaceholderInfo()
-		params.SetValue(`1`, tree.NewDInt(tree.DInt(id)))
-		params.SetValue(`2`, tree.NewDBytes(tree.DBytes(zoneBytes)))
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, &params, 1)
-		if err != nil {
+		if _, err := db.Exec(query, id, zoneBytes); err != nil {
 			t.Fatalf("error executing '%s': %s", query, err)
 		}
-		res.Close(ctx)
 	}
 
 	// Verify zone matches cluster default.
 	verifyDbZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
 	verifyTblZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
+
+	session := sql.NewSession(
+		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
+		&sql.MemoryMetrics{}, nil /* conn */)
+	session.StartUnlimitedMonitor()
 
 	// Get ID path for table. This will be an array of three IDs, containing the ID of the root namespace,
 	// the database, and the table (in that order).
@@ -682,27 +638,16 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 func TestAdminAPIUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	ts := s.(*TestServer)
 
 	// Create sample users.
-	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	query := `
 INSERT INTO system.users (username, "hashedPassword")
 VALUES ('adminUser', 'abc'), ('bob', 'xyz')`
-	res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	defer res.Close(ctx)
 
 	// Query the API for users.
 	var resp serverpb.UsersResponse
@@ -728,18 +673,9 @@ VALUES ('adminUser', 'abc'), ('bob', 'xyz')`
 
 func TestAdminAPIEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	ts := s.(*TestServer)
 
-	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	setupQueries := []string{
 		"CREATE DATABASE api_test",
 		"CREATE TABLE api_test.tbl1 (a INT)",
@@ -747,14 +683,12 @@ func TestAdminAPIEvents(t *testing.T) {
 		"CREATE TABLE api_test.tbl3 (a INT)",
 		"DROP TABLE api_test.tbl1",
 		"DROP TABLE api_test.tbl2",
-		"SET CLUSTER SETTING kv.allocator.load_based_lease_rebalancing.enabled = false;",
+		"SET CLUSTER SETTING cluster.organization = 'somestring';",
 	}
 	for _, q := range setupQueries {
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-		if err != nil {
+		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("error executing '%s': %s", q, err)
 		}
-		res.Close(ctx)
 	}
 
 	const allEvents = ""
@@ -771,7 +705,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		{sql.EventLogCreateDatabase, false, 0, 1},
 		{sql.EventLogDropTable, false, 0, 2},
 		{sql.EventLogCreateTable, false, 0, 3},
-		{sql.EventLogSetClusterSetting, false, 0, 4},
+		{sql.EventLogSetClusterSetting, false, 0, 5},
 		{sql.EventLogCreateTable, true, 0, 3},
 		{sql.EventLogCreateTable, true, -1, 3},
 		{sql.EventLogCreateTable, true, 2, 2},
@@ -827,7 +761,9 @@ func TestAdminAPIEvents(t *testing.T) {
 					}
 				}
 
-				if e.TargetID == 0 && e.EventType != string(sql.EventLogSetClusterSetting) {
+				isSettingChange := e.EventType == string(sql.EventLogSetClusterSetting)
+
+				if e.TargetID == 0 && !isSettingChange {
 					t.Errorf("%d: missing/empty TargetID", i)
 				}
 				if e.ReportingID == 0 {
@@ -835,6 +771,9 @@ func TestAdminAPIEvents(t *testing.T) {
 				}
 				if len(e.Info) == 0 {
 					t.Errorf("%d: missing/empty Info", i)
+				}
+				if isSettingChange && strings.Contains(e.Info, "somestring") {
+					t.Errorf("%d: un-redacted 'somestring' in Info", i)
 				}
 				if len(e.UniqueID) == 0 {
 					t.Errorf("%d: missing/empty UniqueID", i)
@@ -854,7 +793,7 @@ func TestAdminAPISettings(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 
 	// Any bool that defaults to true will work here.
-	const settingKey = "diagnostics.reporting.report_metrics"
+	const settingKey = "sql.metrics.statement_details.enabled"
 	st := s.ClusterSettings()
 	allKeys := settings.Keys()
 
@@ -865,8 +804,14 @@ func TestAdminAPISettings(t *testing.T) {
 		}
 		typ := ref.Typ()
 
-		if ref.String(&st.SV) != v.Value {
-			t.Errorf("%s: expected value %s, got %s", k, ref, v.Value)
+		if typ == "s" && k != "version" {
+			if v.Value != "<redacted>" && v.Value != "" {
+				t.Errorf("%s: expected redacted value for %v, got %s", k, ref, v.Value)
+			}
+		} else {
+			if ref.String(&st.SV) != v.Value {
+				t.Errorf("%s: expected value %v, got %s", k, ref, v.Value)
+			}
 		}
 
 		if desc := ref.Description(); desc != v.Description {
@@ -1050,13 +995,11 @@ func TestClusterAPI(t *testing.T) {
 		testutils.RunTrueAndFalse(t, "enterpriseOn", func(t *testing.T, enterpriseOn bool) {
 			// Override server license check.
 			if enterpriseOn {
-				oldLicenseCheck := LicenseCheckFn
-				LicenseCheckFn = func(_ *cluster.Settings, _ uuid.UUID, _, _ string) error {
+				old := base.CheckEnterpriseEnabled
+				base.CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, _, _ string) error {
 					return nil
 				}
-				defer func() {
-					LicenseCheckFn = oldLicenseCheck
-				}()
+				defer func() { base.CheckEnterpriseEnabled = old }()
 			}
 
 			if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = $1`, reportingOn); err != nil {

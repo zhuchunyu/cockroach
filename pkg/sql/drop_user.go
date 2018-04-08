@@ -47,7 +47,7 @@ func (p *planner) DropUser(ctx context.Context, n *tree.DropUser) (planNode, err
 func (p *planner) DropUserNode(
 	ctx context.Context, namesE tree.Exprs, ifExists bool, isRole bool, opName string,
 ) (*DropUserNode, error) {
-	tDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), &tree.TableName{DatabaseName: "system", TableName: "users"})
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,10 @@ func (n *DropUserNode) startExec(params runParams) error {
 	f := tree.NewFmtCtxWithBuf(tree.FmtSimple)
 	defer f.Close()
 
-	if err := forEachDatabaseDesc(params.ctx, params.p,
+	// Now check whether the user still has permission on any object in the database.
+
+	// First check all the databases.
+	if err := forEachDatabaseDesc(params.ctx, params.p, nil, /*nil prefix = all databases*/
 		func(db *sqlbase.DatabaseDescriptor) error {
 			for _, u := range db.GetPrivileges().Users {
 				if _, ok := userNames[u.User]; ok {
@@ -107,30 +110,44 @@ func (n *DropUserNode) startExec(params runParams) error {
 						f.WriteString(", ")
 					}
 					f.FormatNameP(&db.Name)
+					break
 				}
 			}
 			return nil
 		}); err != nil {
 		return err
 	}
-	if err := forEachTableDescAll(params.ctx, params.p, "",
-		func(db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor) error {
-			for _, u := range table.GetPrivileges().Users {
-				if _, ok := userNames[u.User]; ok {
-					tn := tree.TableName{
-						DatabaseName: tree.Name(db.Name),
-						TableName:    tree.Name(table.Name),
-					}
-					if f.Len() > 0 {
-						f.WriteString(", ")
-					}
-					f.FormatNode(&tn)
-				}
-			}
-			return nil
-		}); err != nil {
+
+	// Then check all the tables.
+	//
+	// We need something like forEachTableAll here, however we can't use
+	// the predefined forEachTableAll() function because we need to look
+	// at all _visible_ descriptors, not just those on which the current
+	// user has permission.
+	descs, err := params.p.Tables().getAllDescriptors(params.ctx, params.p.txn)
+	if err != nil {
 		return err
 	}
+	lCtx := newInternalLookupCtx(descs, nil /*prefix - we want all descriptors */)
+	for _, tbID := range lCtx.tbIDs {
+		table := lCtx.tbDescs[tbID]
+		if !tableIsVisible(table, true /*allowAdding*/) {
+			continue
+		}
+		for _, u := range table.GetPrivileges().Users {
+			if _, ok := userNames[u.User]; ok {
+				if f.Len() > 0 {
+					f.WriteString(", ")
+				}
+				parentName := lCtx.getParentName(table)
+				tn := tree.MakeTableName(tree.Name(parentName), tree.Name(table.Name))
+				f.FormatNode(&tn)
+				break
+			}
+		}
+	}
+
+	// Was there any object dependin on that user?
 	if f.Len() > 0 {
 		fnl := tree.NewFmtCtxWithBuf(tree.FmtSimple)
 		defer fnl.Close()
@@ -147,7 +164,8 @@ func (n *DropUserNode) startExec(params runParams) error {
 		)
 	}
 
-	numDeleted := 0
+	// All safe - do the work.
+	var numUsersDeleted, numRoleMembershipsDeleted int
 	for normalizedUsername := range userNames {
 		// We don't specifically check whether it's a user or role, we should never reach
 		// this point anyway, the "privileges exist" check will fail first.
@@ -174,10 +192,10 @@ func (n *DropUserNode) startExec(params runParams) error {
 		if rowsAffected == 0 && !n.ifExists {
 			return errors.Errorf("%s %s does not exist", entryType, normalizedUsername)
 		}
-		numDeleted += rowsAffected
+		numUsersDeleted += rowsAffected
 
 		// Drop all role memberships involving the user/role.
-		_, err = internalExecutor.ExecuteStatementInTransaction(
+		rowsAffected, err = internalExecutor.ExecuteStatementInTransaction(
 			params.ctx,
 			"drop-role-membership",
 			params.p.txn,
@@ -187,9 +205,19 @@ func (n *DropUserNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
+
+		numRoleMembershipsDeleted += rowsAffected
 	}
 
-	n.run.numDeleted = numDeleted
+	if numRoleMembershipsDeleted > 0 {
+		// Some role memberships have been deleted, bump role_members table version to
+		// force a refresh of role membership.
+		if err := params.p.BumpRoleMembershipTableVersion(params.ctx); err != nil {
+			return err
+		}
+	}
+
+	n.run.numDeleted = numUsersDeleted
 
 	return nil
 }

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // FileResolver is used by the parser to abstract the opening and reading of
@@ -30,12 +31,19 @@ type FileResolver func(name string) (io.Reader, error)
 // performs semantic checks on the resulting AST. For more details on the
 // Optgen language syntax, see the Syntax section of docs.go.
 type Parser struct {
-	files  []string
-	file   int
-	r      io.Reader
-	s      *Scanner
-	src    SourceLoc
-	errors []error
+	files   []string
+	file    int
+	r       io.Reader
+	s       *Scanner
+	src     SourceLoc
+	saveSrc SourceLoc
+	errors  []error
+
+	// comments accumulates contiguous comments as they are scanned, as long as
+	// it has been initialized to a non-nil array. Parser functions initialize
+	// it when they want to remember comments. For example, the parser tags
+	// each define and rule with any comments that preceded it.
+	comments CommentsExpr
 
 	// resolver is invoked to open the input files provided to the parser.
 	resolver FileResolver
@@ -104,7 +112,11 @@ func (p *Parser) parseRoot() *RootExpr {
 	}
 
 	for {
+		var comments CommentsExpr
 		var tags TagsExpr
+
+		// Remember any comments at the top-level by initializing p.comments.
+		p.comments = make(CommentsExpr, 0)
 
 		tok := p.scan()
 		src := p.src
@@ -116,6 +128,10 @@ func (p *Parser) parseRoot() *RootExpr {
 		case LBRACKET:
 			p.unscan()
 
+			// Get any comments that have accumulated.
+			comments = p.comments
+			p.comments = nil
+
 			tags = p.parseTags()
 			if tags == nil {
 				p.tryRecover()
@@ -125,7 +141,7 @@ func (p *Parser) parseRoot() *RootExpr {
 			if p.scan() != IDENT {
 				p.unscan()
 
-				rule := p.parseRule(tags, src)
+				rule := p.parseRule(comments, tags, src)
 				if rule == nil {
 					p.tryRecover()
 					break
@@ -138,6 +154,12 @@ func (p *Parser) parseRoot() *RootExpr {
 			fallthrough
 
 		case IDENT:
+			// Get any comments that have accumulated.
+			if comments == nil {
+				comments = p.comments
+				p.comments = nil
+			}
+
 			// Only define identifier is allowed at the top level.
 			if !p.isDefineIdent() {
 				p.addExpectedTokenErr("define statement")
@@ -147,7 +169,7 @@ func (p *Parser) parseRoot() *RootExpr {
 
 			p.unscan()
 
-			define := p.parseDefine(tags, src)
+			define := p.parseDefine(comments, tags, src)
 			if define == nil {
 				p.tryRecover()
 				break
@@ -163,7 +185,7 @@ func (p *Parser) parseRoot() *RootExpr {
 }
 
 // define = 'define' define-name '{' define-field* '}'
-func (p *Parser) parseDefine(tags TagsExpr, src SourceLoc) *DefineExpr {
+func (p *Parser) parseDefine(comments CommentsExpr, tags TagsExpr, src SourceLoc) *DefineExpr {
 	if !p.scanToken(IDENT, "define statement") || p.s.Literal() != "define" {
 		return nil
 	}
@@ -173,7 +195,7 @@ func (p *Parser) parseDefine(tags TagsExpr, src SourceLoc) *DefineExpr {
 	}
 
 	name := p.s.Literal()
-	define := &DefineExpr{Src: &src, Name: StringExpr(name), Tags: tags}
+	define := &DefineExpr{Src: &src, Comments: comments, Name: StringExpr(name), Tags: tags}
 
 	if !p.scanToken(LBRACE, "'{'") {
 		return nil
@@ -213,7 +235,7 @@ func (p *Parser) parseDefineField() *DefineFieldExpr {
 }
 
 // rule = match '=>' replace
-func (p *Parser) parseRule(tags TagsExpr, src SourceLoc) *RuleExpr {
+func (p *Parser) parseRule(comments CommentsExpr, tags TagsExpr, src SourceLoc) *RuleExpr {
 	match := p.parseMatch()
 	if match == nil {
 		return nil
@@ -229,27 +251,28 @@ func (p *Parser) parseRule(tags TagsExpr, src SourceLoc) *RuleExpr {
 	}
 
 	return &RuleExpr{
-		Src:     &src,
-		Name:    StringExpr(tags[0]),
-		Tags:    tags[1:],
-		Match:   match,
-		Replace: replace,
+		Src:      &src,
+		Name:     StringExpr(tags[0]),
+		Comments: comments,
+		Tags:     tags[1:],
+		Match:    match.(*MatchExpr),
+		Replace:  replace,
 	}
 }
 
-// match = '(' match-opnames match-child* ')'
-func (p *Parser) parseMatch() *MatchExpr {
+// match = '(' match-names match-child* ')'
+func (p *Parser) parseMatch() Expr {
 	if !p.scanToken(LPAREN, "match pattern") {
 		return nil
 	}
 
 	src := p.src
-	opNames := p.parseOpNames()
-	if opNames == nil {
+	names := p.parseMatchNames()
+	if names == nil {
 		return nil
 	}
 
-	match := &MatchExpr{Src: &src, Names: opNames}
+	match := &MatchExpr{Src: &src, Names: names}
 	for {
 		if p.scan() == RPAREN {
 			return match
@@ -265,15 +288,15 @@ func (p *Parser) parseMatch() *MatchExpr {
 	}
 }
 
-// match-opnames = match-opname ('|' match-opname)
-func (p *Parser) parseOpNames() OpNamesExpr {
-	var names OpNamesExpr
+// match-names = name ('|' name)*
+func (p *Parser) parseMatchNames() NamesExpr {
+	var names NamesExpr
 	for {
-		if !p.scanToken(IDENT, "operator name") {
+		if !p.scanToken(IDENT, "name") {
 			return nil
 		}
 
-		names = append(names, OpNameExpr(p.s.Literal()))
+		names = append(names, NameExpr(p.s.Literal()))
 
 		if p.scan() != PIPE {
 			p.unscan()
@@ -282,122 +305,52 @@ func (p *Parser) parseOpNames() OpNamesExpr {
 	}
 }
 
-// match-child = (bind-child | match-unbound-child) ('&' match-and)?
+// match-child = bind | ref | match-and
 func (p *Parser) parseMatchChild() Expr {
 	tok := p.scan()
-	src := p.src
 	p.unscan()
 
-	var match Expr
 	if tok == DOLLAR {
-		bind := p.parseBindChild()
-		if bind == nil {
-			return nil
-		}
-		match = bind
-	} else {
-		match = p.parseMatchUnboundChild()
+		return p.parseBindOrRef()
 	}
 
-	if match == nil {
-		return nil
-	}
-
-	if p.scan() != AMPERSAND {
-		p.unscan()
-		return match
-	}
-
-	and := p.parseMatchAnd()
-	if and == nil {
-		return nil
-	}
-
-	return &MatchAndExpr{Src: &src, Left: match, Right: and}
+	return p.parseMatchAnd()
 }
 
-// bind-child = '$' label ':' match-unbound-child
-func (p *Parser) parseBindChild() *BindExpr {
-	if !p.scanToken(DOLLAR, "'$'") {
-		return nil
+// bind = '$' label ':' match-and
+// ref  = '$' label
+func (p *Parser) parseBindOrRef() Expr {
+	if p.scan() != DOLLAR {
+		panic("caller should have checked for dollar")
 	}
 
 	src := p.src
 
-	if !p.scanToken(IDENT, "bind label") {
+	if !p.scanToken(IDENT, "label") {
 		return nil
 	}
 
-	label := p.s.Literal()
+	label := StringExpr(p.s.Literal())
 
-	if !p.scanToken(COLON, "':'") {
-		return nil
+	if p.scan() != COLON {
+		p.unscan()
+		return &RefExpr{Src: &src, Label: label}
 	}
 
-	target := p.parseMatchUnboundChild()
+	target := p.parseMatchAnd()
 	if target == nil {
 		return nil
 	}
-
-	return &BindExpr{Src: &src, Label: StringExpr(label), Target: target}
+	return &BindExpr{Src: &src, Label: label, Target: target}
 }
 
-// match-unbound-child = match | STRING | '^' match-unbound-child | match-any |
-//                       match-list
-func (p *Parser) parseMatchUnboundChild() Expr {
-	switch p.scan() {
-	case LPAREN:
-		p.unscan()
-		match := p.parseMatch()
-		if match == nil {
-			return nil
-		}
-		return match
-
-	case STRING:
-		p.unscan()
-		return p.parseString()
-
-	case CARET:
-		src := p.src
-		input := p.parseMatchUnboundChild()
-		if input == nil {
-			return nil
-		}
-		return &MatchNotExpr{Src: &src, Input: input}
-
-	case ASTERISK:
-		return &MatchAnyExpr{}
-
-	case LBRACKET:
-		p.unscan()
-		list := p.parseMatchList()
-		if list == nil {
-			return nil
-		}
-		return list
-
-	default:
-		p.addExpectedTokenErr("match pattern")
-		return nil
-	}
-}
-
-// match-and = match-custom ('&' match-and)?
+// match-and = match-item ('&' match-and)
 func (p *Parser) parseMatchAnd() Expr {
-	left := p.parseMatchCustom()
+	src := p.peekNextSource()
+
+	left := p.parseMatchItem()
 	if left == nil {
 		return nil
-	}
-
-	// Use source location from left operand, unless it's not available, in
-	// which case use the location of the last token.
-	src := left.Source()
-	if src == nil {
-		// Don't directly take address of p.src, or the parser won't be
-		// eligible for GC due to that reference.
-		lastSrc := p.src
-		src = &lastSrc
 	}
 
 	if p.scan() != AMPERSAND {
@@ -412,84 +365,79 @@ func (p *Parser) parseMatchAnd() Expr {
 	return &MatchAndExpr{Src: src, Left: left, Right: right}
 }
 
-// match-custom = match-invoke | '^' match-custom
-func (p *Parser) parseMatchCustom() Expr {
+// match-item = match | match-not | match-list | match-any | name | STRING
+func (p *Parser) parseMatchItem() Expr {
 	switch p.scan() {
 	case LPAREN:
 		p.unscan()
-		invoke := p.parseMatchInvoke()
-		if invoke == nil {
-			return nil
-		}
-		return invoke
+		return p.parseMatch()
 
 	case CARET:
-		src := p.src
-		input := p.parseMatchCustom()
-		if input == nil {
-			return nil
-		}
-		return &MatchNotExpr{Src: &src, Input: input}
+		p.unscan()
+		return p.parseMatchNot()
+
+	case LBRACKET:
+		p.unscan()
+		return p.parseMatchList()
+
+	case ASTERISK:
+		return &MatchAnyExpr{}
+
+	case IDENT:
+		name := NameExpr(p.s.Literal())
+		return &name
+
+	case STRING:
+		p.unscan()
+		return p.parseString()
 
 	default:
-		p.addExpectedTokenErr("custom function call")
+		p.addExpectedTokenErr("match pattern")
 		return nil
 	}
 }
 
-// match-invoke = '(' invoke-name ref* ')'
-func (p *Parser) parseMatchInvoke() *MatchInvokeExpr {
-	if !p.scanToken(LPAREN, "'('") {
-		return nil
+// match-not = '^' match-item
+func (p *Parser) parseMatchNot() Expr {
+	if p.scan() != CARET {
+		panic("caller should have checked for caret")
 	}
 
 	src := p.src
 
-	if !p.scanToken(IDENT, "custom function name") {
+	input := p.parseMatchItem()
+	if input == nil {
 		return nil
 	}
-
-	matchInvoke := &MatchInvokeExpr{Src: &src, FuncName: StringExpr(p.s.Literal())}
-
-	for {
-		switch p.scan() {
-		case RPAREN:
-			return matchInvoke
-
-		case DOLLAR:
-			p.unscan()
-			ref := p.parseRef()
-			if ref == nil {
-				return nil
-			}
-			matchInvoke.Args = append(matchInvoke.Args, ref)
-
-			// Improve error message in case where attempt is made to bind one
-			// of the function call arguments. Example:
-			//   (Op * & (Func $bind:(Func2))) => (Op)
-			if p.scan() == COLON {
-				p.addErr(fmt.Sprintf("cannot bind custom function call arguments"))
-				return nil
-			}
-			p.unscan()
-
-		default:
-			p.addExpectedTokenErr("variable reference")
-			return nil
-		}
-	}
+	return &MatchNotExpr{Src: &src, Input: input}
 }
 
-// match-list = '[' '...' match-child '...' ']'
+// match-list        = match-list-any | match-list-first | match-list-last |
+//                     match-list-single | match-list-empty
+// match-list-any    = '[' '...' match-child '...' ']'
+// match-list-first  = '[' match-child '...' ']'
+// match-list-last   = '[' '...' match-child ']'
+// match-list-single = '[' match-child ']'
+// match-list-empty  = '[' ']'
 func (p *Parser) parseMatchList() Expr {
-	if !p.scanToken(LBRACKET, "'['") {
-		return nil
+	if p.scan() != LBRACKET {
+		panic("caller should have checked for left bracket")
 	}
 
 	src := p.src
 
-	if !p.scanToken(ELLIPSES, "'...'") {
-		return nil
+	var hasStartEllipses, hasEndEllipses bool
+
+	switch p.scan() {
+	case ELLIPSES:
+		hasStartEllipses = true
+
+	case RBRACKET:
+		// Empty list case.
+		return &MatchListEmptyExpr{}
+
+	default:
+		p.unscan()
 	}
 
 	matchItem := p.parseMatchChild()
@@ -497,35 +445,52 @@ func (p *Parser) parseMatchList() Expr {
 		return nil
 	}
 
-	if !p.scanToken(ELLIPSES, "'...'") {
-		return nil
+	switch p.scan() {
+	case ELLIPSES:
+		hasEndEllipses = true
+
+	default:
+		p.unscan()
 	}
 
 	if !p.scanToken(RBRACKET, "']'") {
 		return nil
 	}
 
-	return &MatchListExpr{Src: &src, MatchItem: matchItem}
+	// Handle various combinations of start and end ellipses.
+	if hasStartEllipses {
+		if hasEndEllipses {
+			return &MatchListAnyExpr{Src: &src, MatchItem: matchItem}
+		}
+		return &MatchListLastExpr{Src: &src, MatchItem: matchItem}
+	} else if hasEndEllipses {
+		return &MatchListFirstExpr{Src: &src, MatchItem: matchItem}
+	}
+	return &MatchListSingleExpr{Src: &src, MatchItem: matchItem}
 }
 
-// replace = construct | STRING | ref
+// replace = construct | construct-list | ref | name | STRING
 func (p *Parser) parseReplace() Expr {
 	switch p.scan() {
 	case LPAREN:
 		p.unscan()
-		construct := p.parseConstruct()
-		if construct == nil {
-			return nil
-		}
-		return construct
+		return p.parseConstruct()
 
-	case STRING:
+	case LBRACKET:
 		p.unscan()
-		return p.parseString()
+		return p.parseConstructList()
 
 	case DOLLAR:
 		p.unscan()
 		return p.parseRef()
+
+	case IDENT:
+		name := NameExpr(p.s.Literal())
+		return &name
+
+	case STRING:
+		p.unscan()
+		return p.parseString()
 
 	default:
 		p.addExpectedTokenErr("replace pattern")
@@ -534,22 +499,46 @@ func (p *Parser) parseReplace() Expr {
 }
 
 // construct = '(' construct-name replace* ')'
-func (p *Parser) parseConstruct() *ConstructExpr {
-	if !p.scanToken(LPAREN, "'('") {
-		return nil
+func (p *Parser) parseConstruct() Expr {
+	if p.scan() != LPAREN {
+		panic("caller should have checked for left paren")
 	}
 
 	src := p.src
 
-	opName := p.parseConstructName()
-	if opName == nil {
+	name := p.parseConstructName()
+	if name == nil {
 		return nil
 	}
 
-	construct := &ConstructExpr{Src: &src, OpName: opName}
+	construct := &ConstructExpr{Src: &src, Name: name}
 	for {
 		if p.scan() == RPAREN {
 			return construct
+		}
+
+		p.unscan()
+		arg := p.parseReplace()
+		if arg == nil {
+			return nil
+		}
+
+		construct.Args = append(construct.Args, arg)
+	}
+}
+
+// construct-list = '[' replace* ']'
+func (p *Parser) parseConstructList() Expr {
+	if p.scan() != LBRACKET {
+		panic("caller should have checked for left bracket")
+	}
+
+	src := p.src
+
+	list := &ConstructListExpr{Src: &src}
+	for {
+		if p.scan() == RBRACKET {
+			return list
 		}
 
 		p.unscan()
@@ -558,25 +547,21 @@ func (p *Parser) parseConstruct() *ConstructExpr {
 			return nil
 		}
 
-		construct.Args = append(construct.Args, item)
+		list.Items = append(list.Items, item)
 	}
 }
 
-// construct-name = IDENT | construct
+// construct-name = name | construct
 func (p *Parser) parseConstructName() Expr {
 	switch p.scan() {
 	case IDENT:
-		s := StringExpr(p.s.Literal())
-		return &s
+		name := NameExpr(p.s.Literal())
+		return &name
 
 	case LPAREN:
 		// Constructed name.
 		p.unscan()
-		construct := p.parseConstruct()
-		if construct == nil {
-			return nil
-		}
-		return construct
+		return p.parseConstruct()
 	}
 
 	p.addExpectedTokenErr("construct name")
@@ -585,8 +570,8 @@ func (p *Parser) parseConstructName() Expr {
 
 // ref = '$' label
 func (p *Parser) parseRef() *RefExpr {
-	if !p.scanToken(DOLLAR, "'$'") {
-		return nil
+	if p.scan() != DOLLAR {
+		panic("caller should have checked for dollar")
 	}
 
 	src := p.src
@@ -602,8 +587,8 @@ func (p *Parser) parseRef() *RefExpr {
 func (p *Parser) parseTags() TagsExpr {
 	var tags TagsExpr
 
-	if !p.scanToken(LBRACKET, "'['") {
-		return nil
+	if p.scan() != LBRACKET {
+		panic("caller should have checked for left bracket")
 	}
 
 	for {
@@ -625,8 +610,8 @@ func (p *Parser) parseTags() TagsExpr {
 }
 
 func (p *Parser) parseString() *StringExpr {
-	if !p.scanToken(STRING, "literal string") {
-		return nil
+	if p.scan() != STRING {
+		panic("caller should have checked for literal string")
 	}
 
 	// Strip quotes.
@@ -635,6 +620,18 @@ func (p *Parser) parseString() *StringExpr {
 
 	e := StringExpr(s)
 	return &e
+}
+
+// peekNextSource returns the source information for the next token, but
+// without actually consuming that token.
+func (p *Parser) peekNextSource() *SourceLoc {
+	p.scan()
+	src := p.src
+	p.unscan()
+
+	// Don't directly take address of p.src, or the parser won't be
+	// eligible for GC due to that reference.
+	return &src
 }
 
 // scanToken scans the next token. If it does not have the expected token type,
@@ -654,13 +651,17 @@ func (p *Parser) scanToken(expected Token, desc string) bool {
 func (p *Parser) scan() Token {
 	// If we have a token in the buffer, then return it.
 	if p.unscanned {
+		// Restore saved current token, and save previous token.
+		p.src, p.saveSrc = p.saveSrc, p.src
 		p.unscanned = false
 		return p.s.Token()
 	}
 
 	// Read the next token from the scanner.
 	for {
-		// Set source location of current token.
+		// Set source location of current token and save previous in case
+		// unscan is called.
+		p.saveSrc = p.src
 		p.src.Line, p.src.Pos = p.s.LineLoc()
 
 		tok := p.s.Scan()
@@ -674,8 +675,8 @@ func (p *Parser) scan() Token {
 			p.file++
 
 			if !p.openScanner() {
-				// Error opening file.
-				return ERROR
+				// Error opening file, don't try to recover.
+				return EOF
 			}
 
 		case ERROR:
@@ -683,8 +684,19 @@ func (p *Parser) scan() Token {
 			p.addErr(p.s.Literal())
 			return ERROR
 
-		case WHITESPACE, COMMENT:
-			// Skip whitespace and comments.
+		case COMMENT:
+			// Remember contiguous comments if p.comments is initialized, else
+			// skip.
+			if p.comments != nil {
+				p.comments = append(p.comments, CommentExpr(p.s.Literal()))
+			}
+
+		case WHITESPACE:
+			// A blank line resets any accumulating comments, since they have
+			// to be contiguous.
+			if p.comments != nil && strings.Count(p.s.Literal(), "\n") > 1 {
+				p.comments = p.comments[:0]
+			}
 
 		default:
 			return tok
@@ -698,6 +710,8 @@ func (p *Parser) unscan() {
 		panic("unscan was already called")
 	}
 
+	// Save current token and make previous token the current token.
+	p.src, p.saveSrc = p.saveSrc, p.src
 	p.unscanned = true
 }
 

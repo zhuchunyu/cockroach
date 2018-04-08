@@ -82,7 +82,12 @@ func (p *planner) Delete(
 	}
 
 	fkTables, err := sqlbase.TablesNeededForFKs(
-		ctx, *en.tableDesc, sqlbase.CheckDeletes, p.lookupFKTable, p.CheckPrivilege,
+		ctx,
+		*en.tableDesc,
+		sqlbase.CheckDeletes,
+		p.lookupFKTable,
+		p.CheckPrivilege,
+		p.analyzeExpr,
 	)
 	if err != nil {
 		return nil, err
@@ -190,6 +195,9 @@ func (d *deleteNode) Next(params runParams) (bool, error) {
 func (d *deleteNode) Values() tree.Datums {
 	return d.run.resultRow
 }
+
+// requireSpool implements the planNodeRequireSpool interface.
+func (d *deleteNode) requireSpool() {}
 
 func (d *deleteNode) Close(ctx context.Context) {
 	d.run.rows.Close(ctx)

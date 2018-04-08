@@ -18,6 +18,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -26,11 +27,13 @@ import (
 
 func TestNormalizeExpr(t *testing.T) {
 	defer tree.MockNameTypes(map[string]types.T{
-		"a": types.Int,
-		"b": types.Int,
-		"c": types.Int,
-		"d": types.Bool,
-		"s": types.String,
+		"a":  types.Int,
+		"b":  types.Int,
+		"c":  types.Int,
+		"d":  types.Bool,
+		"s":  types.String,
+		"j":  types.JSON,
+		"jv": types.JSON,
 	})()
 	testData := []struct {
 		expr     string
@@ -168,14 +171,10 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL IS NOT TRUE`, `true`},
 		{`false IS TRUE`, `false`},
 		{`false IS NOT TRUE`, `true`},
-		{`d IS TRUE`, `(d = true) AND (d IS NOT NULL)`},
-		{`d IS NOT TRUE`, `(d != true) OR (d IS NULL)`},
 		{`NULL IS FALSE`, `false`},
 		{`NULL IS NOT FALSE`, `true`},
 		{`false IS FALSE`, `true`},
 		{`false IS NOT FALSE`, `false`},
-		{`d IS FALSE`, `(d = false) AND (d IS NOT NULL)`},
-		{`d IS NOT FALSE`, `(d != false) OR (d IS NULL)`},
 		{`NULL IS DISTINCT FROM NULL`, `false`},
 		{`1 IS NOT DISTINCT FROM NULL`, `false`},
 		{`1 IS DISTINCT FROM NULL`, `true`},
@@ -185,14 +184,10 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL IS DISTINCT FROM TRUE`, `true`},
 		{`false IS NOT DISTINCT FROM TRUE`, `false`},
 		{`false IS DISTINCT FROM TRUE`, `true`},
-		{`d IS NOT DISTINCT FROM TRUE`, `(d = true) AND (d IS NOT NULL)`},
-		{`d IS DISTINCT FROM TRUE`, `(d != true) OR (d IS NULL)`},
 		{`NULL IS NOT DISTINCT FROM FALSE`, `false`},
 		{`NULL IS DISTINCT FROM FALSE`, `true`},
 		{`false IS NOT DISTINCT FROM FALSE`, `true`},
 		{`false IS DISTINCT FROM FALSE`, `false`},
-		{`d IS NOT DISTINCT FROM FALSE`, `(d = false) AND (d IS NOT NULL)`},
-		{`d IS DISTINCT FROM FALSE`, `(d != false) OR (d IS NULL)`},
 		{`NULL IS NOT DISTINCT FROM 1`, `false`},
 		{`NULL IS DISTINCT FROM 1`, `true`},
 		{`NULL IS NOT DISTINCT FROM d`, `d IS NULL`},
@@ -216,38 +211,45 @@ func TestNormalizeExpr(t *testing.T) {
 		{`a - 1 < 9223372036854775806`, `a < 9223372036854775807`},
 		{`-1 + a < 9223372036854775807`, `(-1 + a) < 9223372036854775807`},
 		{`-1 + a < 9223372036854775806`, `a < 9223372036854775807`},
+		{`j->'s' = '"jv"'::JSONB`, `j @> '{"s": "jv"}'`},
+		{`'"jv"'::JSONB = j->'s'`, `j @> '{"s": "jv"}'`},
+		{`j->'s' = jv`, `(j->'s') = jv`},
+		{`j->s = jv`, `(j->s) = jv`},
+		{`j->2 = '"jv"'::JSONB`, `(j->2) = '"jv"'`},
 	}
 	for _, d := range testData {
-		expr, err := parser.ParseExpr(d.expr)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		typedExpr, err := expr.TypeCheck(nil, types.Any)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		rOrig := typedExpr.String()
-		ctx := tree.NewTestingEvalContext()
-		defer ctx.Mon.Stop(context.Background())
-		defer ctx.ActiveMemAcc.Close(context.Background())
-		r, err := ctx.NormalizeExpr(typedExpr)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		if s := r.String(); d.expected != s {
-			t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
-		}
-		// Normalizing again should be a no-op.
-		r2, err := ctx.NormalizeExpr(r)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		if s := r2.String(); d.expected != s {
-			t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
-		}
-		// The original expression should be unchanged.
-		if rStr := typedExpr.String(); rOrig != rStr {
-			t.Fatalf("Original expression `%s` changed to `%s`", rOrig, rStr)
-		}
+		t.Run(d.expr, func(t *testing.T) {
+			expr, err := parser.ParseExpr(d.expr)
+			if err != nil {
+				t.Fatalf("%s: %v", d.expr, err)
+			}
+			typedExpr, err := expr.TypeCheck(nil, types.Any)
+			if err != nil {
+				t.Fatalf("%s: %v", d.expr, err)
+			}
+			rOrig := typedExpr.String()
+			ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			defer ctx.Mon.Stop(context.Background())
+			defer ctx.ActiveMemAcc.Close(context.Background())
+			r, err := ctx.NormalizeExpr(typedExpr)
+			if err != nil {
+				t.Fatalf("%s: %v", d.expr, err)
+			}
+			if s := r.String(); d.expected != s {
+				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
+			}
+			// Normalizing again should be a no-op.
+			r2, err := ctx.NormalizeExpr(r)
+			if err != nil {
+				t.Fatalf("%s: %v", d.expr, err)
+			}
+			if s := r2.String(); d.expected != s {
+				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
+			}
+			// The original expression should be unchanged.
+			if rStr := typedExpr.String(); rOrig != rStr {
+				t.Fatalf("Original expression `%s` changed to `%s`", rOrig, rStr)
+			}
+		})
 	}
 }

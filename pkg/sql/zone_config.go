@@ -21,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
 )
 
@@ -137,26 +139,16 @@ func GetZoneConfigInTxn(
 	)
 }
 
-// GetTableDesc returns the table descriptor for the table with 'id'.
-// Returns nil if the descriptor is not present, or is present but is not a
-// table.
-func GetTableDesc(cfg config.SystemConfig, id sqlbase.ID) (*sqlbase.TableDescriptor, error) {
-	if descVal := cfg.GetValue(sqlbase.MakeDescMetadataKey(id)); descVal != nil {
-		desc := &sqlbase.Descriptor{}
-		if err := descVal.GetProto(desc); err != nil {
-			return nil, err
-		}
-		return desc.GetTable(), nil
-	}
-	return nil, nil
-}
-
 // GenerateSubzoneSpans is a hook point for a CCL function that constructs from
 // a TableDescriptor the entries mapping zone config spans to subzones for use
 // in the SubzonzeSpans field of config.ZoneConfig. If no CCL hook is installed,
 // it returns an error that directs users to use a CCL binary.
 var GenerateSubzoneSpans = func(
-	*sqlbase.TableDescriptor, []config.Subzone,
+	st *cluster.Settings,
+	clusterID uuid.UUID,
+	tableDesc *sqlbase.TableDescriptor,
+	subzones []config.Subzone,
+	newSubzones bool,
 ) ([]config.SubzoneSpan, error) {
 	return nil, sqlbase.NewCCLRequiredError(errors.New(
 		"setting zone configs on indexes or partitions requires a CCL binary"))
@@ -173,11 +165,36 @@ func zoneSpecifierNotFoundError(zs tree.ZoneSpecifier) error {
 	}
 }
 
-func resolveZone(
-	ctx context.Context, txn *client.Txn, zs *tree.ZoneSpecifier, sessionDB string,
-) (sqlbase.ID, error) {
+// resolveTableForZone ensures that the table part of the zone
+// specifier is resolved (or resolvable) and, if the zone specifier
+// points to an index, that the index name is expanded to a valid
+// table.
+// Returns res = nil if the zone specifier is not for a table or index.
+func (p *planner) resolveTableForZone(
+	ctx context.Context, zs *tree.ZoneSpecifier,
+) (res *sqlbase.TableDescriptor, err error) {
+	if zs.TargetsIndex() {
+		_, res, err = expandIndexName(ctx, p, &zs.TableOrIndex, true /* requireTable */)
+	} else if zs.TargetsTable() {
+		tn, err := zs.TableOrIndex.Table.Normalize()
+		if err != nil {
+			return nil, err
+		}
+		res, err = ResolveExistingObject(ctx, p, tn, true /*required*/, anyDescType)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return res, err
+}
+
+// resolveZone resolves a zone specifier to a zone ID.  If the zone
+// specifier points to a table, index or partition, the table part
+// must be properly normalized already. It is the caller's
+// responsibility to do this using e.g .resolveTableForZone().
+func resolveZone(ctx context.Context, txn *client.Txn, zs *tree.ZoneSpecifier) (sqlbase.ID, error) {
 	errMissingKey := errors.New("missing key")
-	id, err := config.ResolveZoneSpecifier(zs, sessionDB,
+	id, err := config.ResolveZoneSpecifier(zs,
 		func(parentID uint32, name string) (uint32, error) {
 			kv, err := txn.Get(ctx, sqlbase.MakeNameMetadataKey(sqlbase.ID(parentID), name))
 			if err != nil {
@@ -203,30 +220,30 @@ func resolveZone(
 }
 
 func resolveSubzone(
-	ctx context.Context, txn *client.Txn, zs *tree.ZoneSpecifier, targetID sqlbase.ID,
-) (*sqlbase.TableDescriptor, *sqlbase.IndexDescriptor, string, error) {
+	ctx context.Context,
+	txn *client.Txn,
+	zs *tree.ZoneSpecifier,
+	targetID sqlbase.ID,
+	table *sqlbase.TableDescriptor,
+) (*sqlbase.IndexDescriptor, string, error) {
 	if !zs.TargetsTable() {
-		return nil, nil, "", nil
-	}
-	table, err := sqlbase.GetTableDescFromID(ctx, txn, targetID)
-	if err != nil {
-		return nil, nil, "", err
+		return nil, "", nil
 	}
 	if indexName := string(zs.TableOrIndex.Index); indexName != "" {
 		index, _, err := table.FindIndexByName(indexName)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, "", err
 		}
-		return table, &index, "", nil
+		return &index, "", nil
 	} else if partitionName := string(zs.Partition); partitionName != "" {
 		_, index, err := table.FindNonDropPartitionByName(partitionName)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, "", err
 		}
 		zs.TableOrIndex.Index = tree.UnrestrictedName(index.Name)
-		return table, index, partitionName, nil
+		return index, partitionName, nil
 	}
-	return table, nil, "", nil
+	return nil, "", nil
 }
 
 func deleteRemovedPartitionZoneConfigs(
@@ -258,6 +275,7 @@ func deleteRemovedPartitionZoneConfigs(
 	for _, n := range removedNames {
 		zone.DeleteSubzone(uint32(idxDesc.ID), n)
 	}
-	_, err = writeZoneConfig(ctx, txn, tableDesc.ID, tableDesc, zone, execCfg)
+	hasNewSubzones := false
+	_, err = writeZoneConfig(ctx, txn, tableDesc.ID, tableDesc, zone, execCfg, hasNewSubzones)
 	return err
 }

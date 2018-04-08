@@ -3,17 +3,20 @@
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
 system
 test
 
-query TTT
+query TTTT
 SHOW GRANTS ON DATABASE test
 ----
-test  admin  ALL
-test  root   ALL
+test  crdb_internal       admin  ALL
+test  crdb_internal       root   ALL
+test  information_schema  admin  ALL
+test  information_schema  root   ALL
+test  pg_catalog          admin  ALL
+test  pg_catalog          root   ALL
+test  public              admin  ALL
+test  public              root   ALL
 
 statement ok
 CREATE TABLE kv (
@@ -33,9 +36,16 @@ SELECT * FROM kv
 7 8
 
 statement ok
+SET sql_safe_updates = TRUE;
+
+statement error RENAME DATABASE on current database
 ALTER DATABASE test RENAME TO u
 
-statement error relation "kv" does not exist
+statement ok
+SET sql_safe_updates = FALSE;
+ ALTER DATABASE test RENAME TO u
+
+statement error pgcode 42P01 relation "kv" does not exist
 SELECT * FROM kv
 
 statement error database "test" does not exist
@@ -44,18 +54,21 @@ SHOW GRANTS ON DATABASE test
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
 system
 u
 
 # check the name in descriptor is also changed
-query TTT
+query TTTT
 SHOW GRANTS ON DATABASE u
 ----
-u  admin  ALL
-u  root   ALL
+u  crdb_internal       admin  ALL
+u  crdb_internal       root   ALL
+u  information_schema  admin  ALL
+u  information_schema  root   ALL
+u  pg_catalog          admin  ALL
+u  pg_catalog          root   ALL
+u  public              admin  ALL
+u  public              root   ALL
 
 statement ok
 SET DATABASE = u
@@ -94,9 +107,6 @@ ALTER DATABASE t RENAME TO v
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
 t
 
 user root
@@ -112,7 +122,7 @@ SHOW TABLES FROM u
 ----
 kv
 
-statement error cannot rename database because view "t.v" depends on table "kv"
+statement error cannot rename database because view "t.public.v" depends on table "kv"
 ALTER DATABASE u RENAME TO v
 
 statement ok

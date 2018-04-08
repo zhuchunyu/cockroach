@@ -59,6 +59,7 @@ var sqlShellCmd = &cobra.Command{
 	Long: `
 Open a sql shell running against a cockroach database.
 `,
+	Args: cobra.NoArgs,
 	RunE: MaybeDecorateGRPCError(runTerm),
 }
 
@@ -560,23 +561,29 @@ func (c *cliState) refreshDatabaseName() (string, bool) {
 // preparePrompts computes a full and short prompt for the interactive
 // CLI.
 func preparePrompts(dbURL string) (promptPrefix, fullPrompt, continuePrompt string) {
-	// Default prompt is part of the connection URL. eg: "marc@localhost>"
-	// continued statement prompt is: "        -> "
+	// If parsing fails, we'll keep the entire URL. The Open call succeeded, and that
+	// is the important part.
 	promptPrefix = dbURL
 	if parsedURL, err := url.Parse(dbURL); err == nil {
 		username := ""
 		if parsedURL.User != nil {
 			username = parsedURL.User.Username()
 		}
-		// If parsing fails, we keep the entire URL. The Open call succeeded, and that
-		// is the important part.
 		promptPrefix = fmt.Sprintf("%s@%s", username, parsedURL.Host)
+
+		if parsedURL.Path == "" {
+			// Attempt to be helpful to new users.
+			fmt.Fprintln(stderr, "warning: no current database set."+
+				" Use SET database = <dbname> to change, CREATE DATABASE to make a new database.")
+		}
 	}
 
 	if len(promptPrefix) == 0 {
 		promptPrefix = " "
 	}
 
+	// Default prompt is part of the connection URL. eg: "marc@localhost>"
+	// continued statement prompt is: "        -> "
 	continuePrompt = strings.Repeat(" ", len(promptPrefix)-1) + "-> "
 	fullPrompt = promptPrefix + "> "
 
@@ -1041,9 +1048,9 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 		}
 		switch state {
 		case cliStart:
-			// If results are shown on a terminal and the table display
-			// format is "pretty", also enable printing of times.
-			if cliCtx.terminalOutput && cliCtx.tableDisplayFormat == tableDisplayPretty {
+			if cliCtx.terminalOutput {
+				// If results are shown on a terminal also enable printing of
+				// times by default.
 				cliCtx.showTimes = true
 			}
 
@@ -1134,10 +1141,6 @@ func runStatements(conn *sqlConn, stmts []string) error {
 }
 
 func runTerm(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-
 	// We don't consider sessions interactives unless we have a
 	// serious hunch they are. For now, only `cockroach sql` *without*
 	// `-e` has the ability to input from a (presumably) human user,
@@ -1151,7 +1154,7 @@ func runTerm(cmd *cobra.Command, args []string) error {
 		fmt.Print(infoMessage)
 	}
 
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach sql")
 	if err != nil {
 		return err
 	}
@@ -1232,13 +1235,13 @@ func (c *cliState) serverSideParse(sql string) (stmts []string, pgErr *pgerror.E
 		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "%v", err)
 	}
 
-	if len(rows) == 0 || len(cols) < 2 {
+	if len(cols) < 2 {
 		return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
 			"invalid results for SHOW SYNTAX: %q %q", cols, rows)
 	}
 
 	// If SHOW SYNTAX reports an error, then it does so on the first row.
-	if rows[0][0] == "error" {
+	if len(rows) >= 1 && rows[0][0] == "error" {
 		var message, code, detail, hint string
 		for _, row := range rows {
 			switch row[0] {

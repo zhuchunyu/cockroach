@@ -36,7 +36,7 @@ type alterUserSetPasswordNode struct {
 func (p *planner) AlterUserSetPassword(
 	ctx context.Context, n *tree.AlterUserSetPassword,
 ) (planNode, error) {
-	tDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), &tree.TableName{DatabaseName: "system", TableName: "users"})
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +71,10 @@ func (n *alterUserSetPasswordNode) startExec(params runParams) error {
 	// The root user is not allowed a password.
 	if normalizedUsername == security.RootUser {
 		return errors.Errorf("user %s cannot use password authentication", security.RootUser)
+	}
+
+	if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Insecure {
+		return errors.New("cluster in insecure mode; user cannot use password authentication")
 	}
 
 	internalExecutor := InternalExecutor{ExecCfg: params.extendedEvalCtx.ExecCfg}

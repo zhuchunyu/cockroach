@@ -67,6 +67,14 @@ Here is the syntax for an operator definition:
     ...
   }
 
+And here is an example:
+
+  define Join {
+    Left  Expr
+    Right Expr
+    On    Expr
+  }
+
 Definition Tags
 
 A "definition tag" is an opaque identifier that describes some property of the
@@ -83,6 +91,14 @@ Here is the definition tagging syntax:
   define <name> {
   }
 
+And here is an example:
+
+  [Comparison, Inequality]
+  define Lt {
+    Left  Expr
+    Right Expr
+  }
+
 Rules
 
 Optgen language input files may contain any number of rules, in any order. Each
@@ -91,6 +107,12 @@ replace pattern. A rule's match pattern is tested against every node in the
 target expression tree, bottom-up. Each matching node is replaced by a node
 constructed according to the replace pattern. The replacement node is itself
 tested against every rule, and so on, until no further rules match.
+
+Note that this is just a conceptual description. Optgen does not actually do
+any of this matching or replacing itself. Other components use the Optgen
+library to generate code. These components are free to match however they want,
+and to replace nodes or keep the new and old nodes side-by-side (as with a
+typical optimizer MEMO structure).
 
 Similar to define statements, a rule may have a set of tags associated with it.
 Rule tags logically group rules, and can also serve as directives to the code
@@ -200,23 +222,46 @@ and the list of arguments to the function:
     Args ExprList
   }
 
-The list matcher iterates through the nodes in a list, looking for the first
-node that matches its condition. Any subsequent matching nodes are ignored by
-the matcher. However, often the replace pattern removes or modifies the first
-node so that it no longer matches. Then, when the same pattern is applied to
-the replacement expression, the list matcher will find the next matching node,
-and so on.
+There are several kinds of list matchers, each of which uses a variant of the
+list matching bracket syntax. The ellipses signify that 0 or more items can
+match at either the beginning or end of the list. The item pattern can be any
+legal match pattern, and can be bound to a variable.
 
-List matching syntax looks like this:
+  [ ... <item pattern> ... ]
+
+- ANY: Matches if any item in the list matches the item pattern. If multiple
+items match, then the list matcher binds to the first match.
+
+  [ ... $item:* ... ]
+
+- FIRST: Matches if the first item in the list matches the item pattern (and
+there is at least one item in the list).
+
+  [ $item:* ... ]
+
+- LAST: Matches if the last item in the list matches the item pattern (and
+there is at least one item).
+
+  [ ... $item:* ]
+
+- SINGLE: Matches if there is exactly one item in the list, and it matches the
+item pattern.
+
+  [ $item:* ]
+
+- EMPTY: Matches if there are zero items in the list.
+
+  []
+
+Following is a more complete example. The ANY list matcher in the example
+searches through the Filter child's list, looking for a Subquery node. If a
+matching node is found, then the list matcher succeeds and binds the node to
+the $item variable.
 
   (Select
     $input:*
     (Filter [ ... $item:(Subquery) ... ])
   )
-
-The list matcher searches through the Filter child's list, looking for a
-Subquery node. If a matching node is found, then the list matcher succeeds and
-binds the node to the $item variable.
 
 Custom Matching
 
@@ -228,23 +273,30 @@ match. For example:
   [EliminateFilters]
   (Filters $items:* & (IsEmptyList $items)) => (True)
 
-Custom matching functions are always combined with a child matcher using a
-boolean & (AND) operator (see Boolean Expressions section for more details).
 This pattern passes the $items child node to the IsEmptyList function. If that
 returns true, then the pattern matches.
 
+Custom matching functions can appear anywhere that other matchers can, and can
+be combined with other matchers using boolean operators (see the Boolean
+Expressions section for more details). While variable references are the most
+common argument, it is also legal to nest function invocations:
+
+  (Project
+    $input:*
+    $projections:* & ^(IsEmpty (FindUnusedColumns $projections))
+  )
+
 Boolean Expressions
 
-Child matchers can be combined with custom matching functions using the boolean
-& (AND) operator. Multiple match expressions can be combined in this way:
+Multiple match expressions of any type can be combined using the boolean &
+(AND) operator. All must match in order for the overall match to succeed:
 
-  (FuncCall
-    $name:*
-    $args:* & (IsAggFunc $name) & (IsSingletonList $args)
+  (Not
+    $input:(Comparison) & (Inequality) & (CanInvert $input)
   )
 
 The boolean ^ (NOT) operator negates the result of a boolean match expression.
-It can be used with any kind of matcher:
+It can be used with any kind of matcher, including custom match functions:
 
   (JoinApply
     $left:^(Select)
@@ -286,7 +338,8 @@ case where the substitution node was already present in the match pattern:
   [EliminateAnd]
   (And $left:* (True)) => $left
 
-Literal strings can be part of a replace pattern, or even all of it:
+Literal strings can be part of a replace pattern, or even all of it, if the
+intent is to construct a constant string node:
 
   (Concat "" "") => ""
 
@@ -310,8 +363,30 @@ the name of a custom function. For example:
   )
 
 Here, the ConcatFilters custom function is invoked in order to concatenate two
-filter lists together. While custom functions typically return a node, they can
-return other types if the context allows it.
+filter lists together. Function parameters can include nodes, lists (see the
+Constructing Lists section), operator names (see the Name parameters section),
+and the results of nested custom function calls. While custom functions
+typically return a node, they can return other types if they are parameters to
+other custom functions.
+
+Constructing Lists
+
+Lists can be constructed and passed as parameters to node construction
+expressions or custom replace functions. A list consists of multiple items that
+can be of any parameter type, including nodes, strings, custom function
+invocations, or lists. Here is an example:
+
+  [MergeSelectJoin]
+  (Select
+    (InnerJoin $left:* $right:* $on:*)
+    $filters:*
+  )
+  =>
+  (InnerJoin
+    $left
+    $right
+    (And [$on $filters])
+  )
 
 Dynamic Construction
 
@@ -329,9 +404,9 @@ to dynamically construct the right kind of node. For example:
 
 In this pattern, the name of the constructed result is either Eq or Ne,
 depending on which is matched. When the OpName function has no arguments, then
-it is bound to the name of the top-level match expression. The OpName function
-can also take a single variable reference argument. In that case, it refers to
-the name of the expression bound to that variable:
+it is bound to the name of the node matched at the top-level. The OpName
+function can also take a single variable reference argument. In that case, it
+refers to the name of the node bound to that variable:
 
   [PushDownSelect]
   (Select
@@ -347,6 +422,39 @@ the name of the expression bound to that variable:
 
 In this pattern, Join is a tag that refers to a group of nodes. The replace
 expression will construct a node having the same name as the matched join node.
+
+Name Parameters
+
+The OpName built-in function can also be a parameter to a custom match or
+replace function which needs to know which name matched. For example:
+
+  [FoldBinaryNull]
+  (Binary $left:* (Null) & ^(HasNullableArgs (OpName)))
+  =>
+  (Null)
+
+The name of the matched Binary node (e.g. Plus, In, Contains) is passed to the
+HasNullableArgs function as a symbolic identifier. Here is an example that uses
+a custom replace function and the OpName function with an argument:
+
+  [NegateComparison]
+  (Not $input:(Comparison $left:* $right:*))
+  =>
+  (InvertComparison (OpName $input) $left $right)
+
+As described in the previous section, adding the argument enables OpName to
+return a name that was matched deeper in the pattern.
+
+In addition to a name returned by the OpName function, custom match and replace
+functions can accept literal operator names as parameters. The Minus operator
+name is passed as a parameter to two functions in this example:
+
+  [FoldMinus]
+  (UnaryMinus
+    (Minus $left $right) & (OverloadExists Minus $right $left)
+  )
+  =>
+  (ConstructBinary Minus $right $left)
 
 Syntax
 
@@ -366,24 +474,31 @@ grammar.
   field-type          = IDENT
 
   rule                = match '=>' replace
-  match               = '(' match-opnames match-child* ')'
-  match-opnames       = match-opname ('|' match-opname)
-  match-opname        = IDENT
-  match-child         = (bind-child | match-unbound-child) ('&' match-and)?
-  bind-child          = '$' label ':' match-unbound-child
-  label               = IDENT
-  match-unbound-child = match | STRING | '^' match-unbound-child | match-any |
-                        match-list
-  match-and           = match-custom ('&' match-and)?
-  match-custom        = match-invoke | '^' match-custom
-  match-invoke        = '(' invoke-name ref* ')'
-  invoke-name         = IDENT
-  match-list          = '[' '...' match-child '...' ']'
+  match               = '(' match-names match-child* ')'
+  match-names         = name ('|' name)*
+  match-child         = bind | ref | match-and
+  bind                = '$' label ':' match-and
   ref                 = '$' label
+  match-and           = match-item ('&' match-and)
+  match-item          = match | match-not | match-list | match-any | name |
+                        STRING
+  match-not           = '^' match-item
+  match-list          = match-list-any | match-list-first | match-list-last |
+                        match-list-single | match-list-empty
+  match-list-any      = '[' '...' match-child '...' ']'
+  match-list-first    = '[' match-child '...' ']'
+  match-list-last     = '[' '...' match-child ']'
+  match-list-single   = '[' match-child ']'
+  match-list-empty    = '[' ']'
+  match-any           = '*'
 
-  replace             = construct | STRING | ref
+  replace             = construct | construct-list | ref | STRING
   construct           = '(' construct-name replace* ')'
-  construct-name      = IDENT | construct
+  construct-name      = name | construct
+  construct-list      = '[' replace* ']'
+
+  name                = IDENT
+  label               = IDENT
 
 Here are the pseudo-regex definitions for the lexical tokens that aren't
 represented as single-quoted strings above:

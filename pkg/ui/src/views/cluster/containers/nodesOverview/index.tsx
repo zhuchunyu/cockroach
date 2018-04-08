@@ -6,14 +6,14 @@ import { createSelector } from "reselect";
 import _ from "lodash";
 
 import {
-  NodesSummary, nodesSummarySelector, LivenessStatus, deadTimeout,
+  livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid,
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
 import { LocalSetting } from "src/redux/localsettings";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
-import { NanoToMilli, LongToMoment } from "src/util/convert";
+import { LongToMoment } from "src/util/convert";
 import { Bytes } from "src/util/format";
 import { NodeStatus$Properties, MetricConstants, BytesUsed } from "src/util/proto";
 
@@ -73,7 +73,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             // Node ID column.
             {
               title: "ID",
-              cell: (ns) => ns.desc.node_id,
+              cell: (ns) => `n${ns.desc.node_id}`,
               sort: (ns) => ns.desc.node_id,
             },
             // Node address column - displays the node address, links to the
@@ -81,16 +81,24 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             {
               title: "Address",
               cell: (ns) => {
-                const status = nodesSummary.livenessStatusByNodeID[ns.desc.node_id] || LivenessStatus.HEALTHY;
-                const s = LivenessStatus[status].toLowerCase();
-                const tooltip = (status === LivenessStatus.HEALTHY) ?
-                  "This node is currently healthy." :
-                  "This node has not recently reported as being live. " +
-                  "It may not be functioning correctly, but no automatic action has yet been taken.";
+                const status = nodesSummary.livenessStatusByNodeID[ns.desc.node_id] || LivenessStatus.LIVE;
+                const s = livenessNomenclature(status);
+                let tooltip: string;
+                switch (status) {
+                  case LivenessStatus.LIVE:
+                    tooltip = "This node is currently healthy.";
+                    break;
+                  case LivenessStatus.DECOMMISSIONING:
+                    tooltip = "This node is currently being decommissioned.";
+                    break;
+                  default:
+                    tooltip = "This node has not recently reported as being live. " +
+                      "It may not be functioning correctly, but no automatic action has yet been taken.";
+                }
                 return (
                   <div className="sort-table__unbounded-column">
                     <div className={"icon-circle-filled node-status-icon node-status-icon--" + s} title={tooltip} />
-                    <Link to={`/cluster/nodes/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
+                    <Link to={`/node/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
                   </div>
                 );
               },
@@ -105,7 +113,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             {
               title: "Uptime",
               cell: (ns) => {
-                const startTime = moment(NanoToMilli(ns.started_at.toNumber()));
+                const startTime = LongToMoment(ns.started_at);
                 return moment.duration(startTime.diff(moment())).humanize();
               },
               sort: (ns) => ns.started_at,
@@ -137,7 +145,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             // Logs - a link to the logs data for this node.
             {
               title: "Logs",
-              cell: (ns) => <Link to={`/cluster/nodes/${ns.desc.node_id}/logs`}>Logs</Link>,
+              cell: (ns) => <Link to={`/node/${ns.desc.node_id}/logs`}>Logs</Link>,
               className: "expand-link",
             },
           ]} />
@@ -150,7 +158,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
  * NotLiveNodeListProps are the properties of NotLiveNodeList.
  */
 interface NotLiveNodeListProps extends NodeCategoryListProps {
-  status: LivenessStatus.DECOMMISSIONED | LivenessStatus.DEAD;
+  status: LivenessStatus.DECOMMISSIONING | LivenessStatus.DEAD;
 }
 
 /**
@@ -179,7 +187,7 @@ class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
             // Node ID column.
             {
               title: "ID",
-              cell: (ns) => ns.desc.node_id,
+              cell: (ns) => `n${ns.desc.node_id}`,
               sort: (ns) => ns.desc.node_id,
             },
             // Node address column - displays the node address, links to the
@@ -191,9 +199,13 @@ class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
                   <div>
                     <div
                       className="icon-circle-filled node-status-icon node-status-icon--dead"
-                      title={`This node has not reported as live for over ${deadTimeout.humanize()} and is considered dead.`}
+                      title={
+                        "This node has not reported as live for a significant period and is considered dead. " +
+                        "The cut-off period for dead nodes is configurable as cluster setting " +
+                        "'server.time_until_store_dead'"
+                      }
                     />
-                    <Link to={`/cluster/nodes/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
+                    <Link to={`/node/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
                   </div>
                 );
               },
@@ -229,9 +241,6 @@ class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
   }
 }
 
-// Base selectors to extract data from redux state.
-const nodeQueryValid = (state: AdminUIState): boolean => state.cachedData.nodes.valid && state.cachedData.liveness.valid;
-
 /**
  * partitionedStatuses divides the list of node statuses into "live" and "dead".
  */
@@ -242,8 +251,9 @@ const partitionedStatuses = createSelector(
       summary.nodeStatuses,
       (ns) => {
         switch (summary.livenessStatusByNodeID[ns.desc.node_id]) {
-          case LivenessStatus.HEALTHY:
-          case LivenessStatus.SUSPECT:
+          case LivenessStatus.LIVE:
+          case LivenessStatus.UNAVAILABLE:
+          case LivenessStatus.DECOMMISSIONING:
             return "live";
           case LivenessStatus.DECOMMISSIONED:
             return "decommissioned";
@@ -323,7 +333,7 @@ interface NodesMainProps {
   refreshLiveness: typeof refreshLiveness;
   // True if current status results are still valid. Needed so that this
   // component refreshes status query when it becomes invalid.
-  statusesValid: boolean;
+  nodesSummaryValid: boolean;
 }
 
 /**
@@ -346,8 +356,8 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
 
   render() {
     return <div>
-      <LiveNodesConnected />
       <DeadNodesConnected />
+      <LiveNodesConnected />
       <DecommissionedNodesConnected />
     </div>;
   }
@@ -360,7 +370,7 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
 const NodesMainConnected = connect(
   (state: AdminUIState) => {
     return {
-      statusesValid: nodeQueryValid(state),
+      nodesSummaryValid: selectNodesSummaryValid(state),
     };
   },
   {
@@ -376,9 +386,6 @@ const NodesMainConnected = connect(
 function NodesPage() {
   return (
     <div>
-      <section className="section parent-link">
-        <Link to="/cluster">&lt; Back to Cluster</Link>
-      </section>
       <NodesMainConnected />
     </div>
   );

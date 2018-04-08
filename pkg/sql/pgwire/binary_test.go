@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -71,11 +73,13 @@ func testBinaryDatumType(t *testing.T, typ string, datumConstructor func(val str
 			if buf.err != nil {
 				t.Fatal(buf.err)
 			}
-			evalCtx := tree.NewTestingEvalContext()
+			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
 			if got := buf.wrapped.Bytes(); !bytes.Equal(got, test.Expect) {
 				t.Errorf("%q:\n\t%v found,\n\t%v expected", test.In, got, test.Expect)
-			} else if datum, err := decodeOidDatum(oid, pgwirebase.FormatBinary, got[4:]); err != nil {
+			} else if datum, err := pgwirebase.DecodeOidDatum(
+				oid, pgwirebase.FormatBinary, got[4:],
+			); err != nil {
 				t.Fatalf("unable to decode %v: %s", got[4:], err)
 			} else if d.Compare(evalCtx, datum) != 0 {
 				t.Errorf("expected %s, got %s", d, datum)
@@ -161,6 +165,39 @@ func TestBinaryInet(t *testing.T) {
 	})
 }
 
+func TestBinaryJSONB(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testBinaryDatumType(t, "jsonb", func(val string) tree.Datum {
+		j, err := tree.ParseDJSON(val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
+	})
+}
+
+func TestBinaryUUIDArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testBinaryDatumType(t, "uuid_array", func(val string) tree.Datum {
+		ary, err := tree.ParseDArrayFromString(tree.NewTestingEvalContext(nil), val, coltypes.UUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ary
+	})
+}
+
+func TestBinaryDecimalArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testBinaryDatumType(t, "decimal_array", func(val string) tree.Datum {
+		ary, err := tree.ParseDArrayFromString(tree.NewTestingEvalContext(nil), val, coltypes.Decimal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ary
+	})
+}
+
 func TestBinaryIntArray(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	buf := writeBuffer{bytecount: metric.NewCounter(metric.Metadata{})}
@@ -174,11 +211,11 @@ func TestBinaryIntArray(t *testing.T) {
 
 	b := buf.wrapped.Bytes()
 
-	got, err := decodeOidDatum(oid.T__int8, pgwirebase.FormatBinary, b[4:])
+	got, err := pgwirebase.DecodeOidDatum(oid.T__int8, pgwirebase.FormatBinary, b[4:])
 	if err != nil {
 		t.Fatal(err)
 	}
-	evalCtx := tree.NewTestingEvalContext()
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	if got.Compare(evalCtx, d) != 0 {
 		t.Fatalf("expected %s, got %s", d, got)
@@ -242,10 +279,10 @@ func TestRandomBinaryDecimal(t *testing.T) {
 		if buf.err != nil {
 			t.Fatal(buf.err)
 		}
-		evalCtx := tree.NewTestingEvalContext()
+		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		if got := buf.wrapped.Bytes(); !bytes.Equal(got, test.Expect) {
 			t.Errorf("%q:\n\t%v found,\n\t%v expected", test.In, got, test.Expect)
-		} else if datum, err := decodeOidDatum(
+		} else if datum, err := pgwirebase.DecodeOidDatum(
 			oid.T_numeric, pgwirebase.FormatBinary, got[4:],
 		); err != nil {
 			t.Errorf("%q: unable to decode %v: %s", test.In, got[4:], err)

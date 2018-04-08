@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
-	migrations "github.com/cockroachdb/cockroach/pkg/sqlmigrations"
+	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
@@ -72,7 +72,7 @@ func makeTestConfig(st *cluster.Settings) Config {
 
 	// Configure the default in-memory temp storage for all tests unless
 	// otherwise configured.
-	cfg.TempStorageConfig = base.DefaultTestTempStorageConfig()
+	cfg.TempStorageConfig = base.DefaultTestTempStorageConfig(st)
 
 	// Load test certs. In addition, the tests requiring certs
 	// need to call security.SetAssetLoader(securitytest.EmbeddedAssets)
@@ -120,6 +120,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.Insecure = params.Insecure
 	cfg.SocketFile = params.SocketFile
 	cfg.RetryOptions = params.RetryOptions
+	cfg.Locality = params.Locality
 	if knobs := params.Knobs.Store; knobs != nil {
 		if mo := knobs.(*storage.StoreTestingKnobs).MaxOffset; mo != 0 {
 			cfg.MaxOffset = MaxOffsetType(mo)
@@ -136,6 +137,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	if params.TimeSeriesQueryWorkerMax != 0 {
 		cfg.TimeSeriesServerConfig.QueryWorkerMax = params.TimeSeriesQueryWorkerMax
+	}
+	if params.TimeSeriesQueryMemoryBudget != 0 {
+		cfg.TimeSeriesServerConfig.QueryMemoryMax = params.TimeSeriesQueryMemoryBudget
 	}
 	if params.DisableEventLog {
 		cfg.EventLogEnabled = false
@@ -198,6 +202,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.TestingKnobs.Store = &storage.StoreTestingKnobs{}
 	}
 	cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs).SkipMinSizeCheck = true
+
+	if params.ConnResultsBufferBytes != 0 {
+		cfg.ConnResultsBufferBytes = params.ConnResultsBufferBytes
+	}
 
 	return cfg
 }
@@ -362,7 +370,7 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 // assuming no additional information is added outside of the normal bootstrap
 // process.
 func ExpectedInitialRangeCount(db *client.DB) (int, error) {
-	descriptorIDs, err := migrations.ExpectedDescriptorIDs(context.Background(), db)
+	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db)
 	if err != nil {
 		return 0, err
 	}
@@ -523,8 +531,14 @@ func (ts *TestServer) MustGetSQLNetworkCounter(name string) int64 {
 	reg.AddMetricStruct(ts.pgServer.Metrics())
 	reg.Each(func(n string, v interface{}) {
 		if name == n {
-			c = v.(*metric.Counter).Count()
-			found = true
+			switch t := v.(type) {
+			case *metric.Counter:
+				c = t.Count()
+				found = true
+			case *metric.Gauge:
+				c = t.Value()
+				found = true
+			}
 		}
 	})
 	if !found {

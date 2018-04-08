@@ -19,7 +19,7 @@ SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t]
 fetched: /t/primary/1/f -> /9
 output row: [1 9]
 
-statement error invalid table name
+statement error syntax error at or near "*"
 ALTER TABLE t RENAME TO t.*
 
 statement ok
@@ -49,7 +49,7 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 1
 ----
-SCHEMA CHANGE  ALTER TABLE test.t ADD CONSTRAINT foo UNIQUE (b)  root  succeeded  1  ·
+SCHEMA CHANGE  ALTER TABLE test.public.t ADD CONSTRAINT foo UNIQUE (b)  root  succeeded  1  ·
 
 statement error duplicate constraint name: "foo"
 ALTER TABLE t ADD CONSTRAINT foo UNIQUE (b)
@@ -81,14 +81,15 @@ INSERT INTO t VALUES (2, 9, 1, 1), (3, 9, 2, 1)
 statement error duplicate key value \(c\)=\(1\) violates unique constraint "bar"
 ALTER TABLE t ADD CONSTRAINT bar UNIQUE (c)
 
+# Test that rollback was successful
 query TTTTRT
 SELECT type, description, username, status, fraction_completed::decimal(10,2), error
 FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 2
 ----
-SCHEMA CHANGE  ROLL BACK ALTER TABLE test.t ADD CONSTRAINT bar UNIQUE (c)  root  succeeded  1.00  ·
-SCHEMA CHANGE  ALTER TABLE test.t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.10  duplicate key value (c)=(1) violates unique constraint "bar"
+SCHEMA CHANGE  ROLL BACK ALTER TABLE test.public.t ADD CONSTRAINT bar UNIQUE (c)  root  succeeded  1.00  ·
+SCHEMA CHANGE  ALTER TABLE test.public.t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.10  duplicate key value (c)=(1) violates unique constraint "bar"
 
 query IIII colnames,rowsort
 SELECT * FROM t
@@ -98,13 +99,14 @@ a f b    c
 2 9 1    1
 3 9 2    1
 
-query TTTTT
+query TTTTT colnames
 SHOW CONSTRAINTS FROM t
 ----
-t  check_a         CHECK        NULL  a > 0
-t  fk_f_ref_other  FOREIGN KEY  f  other.[b]
-t  foo             UNIQUE       b  NULL
-t  primary         PRIMARY KEY  a  NULL
+Table  Name            Type         Column(s)  Details
+t      check_a         CHECK        a          a > 0
+t      fk_f_ref_other  FOREIGN KEY  f          other.[b]
+t      foo             UNIQUE       b          NULL
+t      primary         PRIMARY KEY  a          NULL
 
 statement error CHECK
 INSERT INTO t (a, f) VALUES (-2, 9)
@@ -124,7 +126,7 @@ INSERT INTO t (a) VALUES (-3)
 query TTTTT
 SHOW CONSTRAINTS FROM t
 ----
-t  check_a         CHECK (UNVALIDATED)  NULL  a > 0
+t  check_a         CHECK (UNVALIDATED)  a  a > 0
 t  fk_f_ref_other  FOREIGN KEY          f  other.[b]
 t  foo             UNIQUE               b  NULL
 t  primary         PRIMARY KEY          a  NULL
@@ -139,8 +141,8 @@ ALTER TABLE t ADD CHECK (a > 0)
 query TTTTT
 SHOW CONSTRAINTS FROM t
 ----
-t  check_a         CHECK (UNVALIDATED)  NULL  a > 0
-t  check_a1        CHECK (UNVALIDATED)  NULL  a > 0
+t  check_a         CHECK (UNVALIDATED)  a  a > 0
+t  check_a1        CHECK (UNVALIDATED)  a  a > 0
 t  fk_f_ref_other  FOREIGN KEY          f  other.[b]
 t  foo             UNIQUE               b  NULL
 t  primary         PRIMARY KEY          a  NULL
@@ -160,8 +162,8 @@ ALTER TABLE t VALIDATE CONSTRAINT check_a
 query TTTTT
 SHOW CONSTRAINTS FROM t
 ----
-t  check_a         CHECK                NULL  a > 0
-t  check_a1        CHECK (UNVALIDATED)  NULL  a > 0
+t  check_a         CHECK                a  a > 0
+t  check_a1        CHECK (UNVALIDATED)  a  a > 0
 t  fk_f_ref_other  FOREIGN KEY          f  other.[b]
 t  foo             UNIQUE               b  NULL
 t  primary         PRIMARY KEY          a  NULL
@@ -169,7 +171,7 @@ t  primary         PRIMARY KEY          a  NULL
 statement ok
 ALTER TABLE t DROP CONSTRAINT check_a, DROP CONSTRAINT check_a1
 
-statement error column "d" does not exist
+statement error pgcode 42703 column "d" does not exist
 ALTER TABLE t DROP d
 
 statement ok
@@ -196,7 +198,7 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 1
 ----
-SCHEMA CHANGE  DROP INDEX test.t@foo CASCADE root  succeeded  1  ·
+SCHEMA CHANGE  DROP INDEX test.public.t@foo CASCADE root  succeeded  1  ·
 
 query TTBITTBB colnames
 SHOW INDEXES FROM t
@@ -294,7 +296,7 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 1
 ----
-SCHEMA CHANGE  DROP INDEX test.t@t_f_idx  root  succeeded  1  ·
+SCHEMA CHANGE  DROP INDEX test.public.t@t_f_idx  root  succeeded  1  ·
 
 statement ok
 ALTER TABLE t DROP COLUMN f
@@ -548,6 +550,20 @@ SELECT a,b,f FROM add_default
 statement error duplicate key value .* violates unique constraint \"add_default_g_key\"
 ALTER TABLE add_default ADD g INT UNIQUE DEFAULT 1
 
+# various default evaluation errors
+
+statement ok
+CREATE SEQUENCE initial_seq
+
+statement error cannot backfill such sequence operation
+ALTER TABLE add_default ADD g INT DEFAULT nextval('initial_seq')
+
+statement error cannot backfill such evaluated expression
+ALTER TABLE add_default ADD g OID DEFAULT 'foo'::regclass::oid
+
+statement error cannot backfill such evaluated expression
+ALTER TABLE add_default ADD g INT DEFAULT 'foo'::regtype::INT
+
 # Multiple columns can be added at once with heterogeneous DEFAULT usage
 statement ok
 CREATE TABLE d (a INT PRIMARY KEY)
@@ -577,6 +593,11 @@ statement ok
 INSERT INTO privs VALUES (1)
 
 user testuser
+
+query T
+SHOW DATABASE
+----
+test
 
 statement error user testuser does not have CREATE privilege on relation privs
 ALTER TABLE privs ADD c INT
@@ -612,10 +633,10 @@ a     INT  false NULL    {"primary","foo"}
 b     INT  true  NULL    {"foo"}
 c     INT  true  NULL    {}
 
-statement error relation "nonexistent" does not exist
+statement error pgcode 42P01 relation "nonexistent" does not exist
 ALTER TABLE nonexistent SPLIT AT VALUES (42)
 
-statement error relation "nonexistent" does not exist
+statement error pgcode 42P01 relation "nonexistent" does not exist
 ALTER INDEX nonexistent@noindex SPLIT AT VALUES (42)
 
 user root
@@ -682,3 +703,22 @@ SELECT * from default_err_test ORDER BY foo
 bar
 baz
 foo
+
+# Verify that auditing can be enabled by root, and cannot be disabled by non-root.
+
+statement ok
+CREATE TABLE audit(x INT); ALTER TABLE audit EXPERIMENTAL_AUDIT SET READ WRITE;
+
+# The user must be able to issue ALTER for this test to be meaningful.
+statement ok
+GRANT CREATE ON audit TO testuser
+
+user testuser
+
+# Check the user can indeed change the table
+statement ok
+ALTER TABLE audit ADD COLUMN y INT
+
+# But not the audit settings.
+statement error change auditing settings on a table
+ALTER TABLE audit EXPERIMENTAL_AUDIT SET OFF;

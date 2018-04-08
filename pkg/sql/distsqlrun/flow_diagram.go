@@ -71,6 +71,16 @@ func (*NoopCoreSpec) summary() (string, []string) {
 }
 
 // summary implements the diagramCellType interface.
+func (mts *MetadataTestSenderSpec) summary() (string, []string) {
+	return "MetadataTestSender", []string{mts.ID}
+}
+
+// summary implements the diagramCellType interface.
+func (*MetadataTestReceiverSpec) summary() (string, []string) {
+	return "MetadataTestReceiver", []string{}
+}
+
+// summary implements the diagramCellType interface.
 func (v *ValuesCoreSpec) summary() (string, []string) {
 	var bytes uint64
 	for _, b := range v.RawBytes {
@@ -126,16 +136,34 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 	if jr.IndexIdx > 0 {
 		index = jr.Table.Indexes[jr.IndexIdx-1].Name
 	}
-	details := []string{
-		fmt.Sprintf("%s@%s", index, jr.Table.Name),
+	details := make([]string, 0, 2)
+	details = append(details, fmt.Sprintf("%s@%s", index, jr.Table.Name))
+	if jr.LookupColumns != nil {
+		details = append(details, fmt.Sprintf("Lookup join on: %s", colListStr(jr.LookupColumns)))
 	}
 	return "JoinReader", details
 }
 
+func joinTypeDetail(joinType sqlbase.JoinType) string {
+	typeStr := strings.Replace(joinType.String(), "_", " ", -1)
+	if joinType == sqlbase.IntersectAllJoin || joinType == sqlbase.ExceptAllJoin {
+		return fmt.Sprintf("Type: %s", typeStr)
+	}
+	return fmt.Sprintf("Type: %s JOIN", typeStr)
+}
+
 // summary implements the diagramCellType interface.
 func (hj *HashJoinerSpec) summary() (string, []string) {
-	details := make([]string, 0, 3)
+	name := "HashJoiner"
+	if isSetOpJoin(hj.Type) {
+		name = "HashSetOp"
+	}
 
+	details := make([]string, 0, 4)
+
+	if hj.Type != sqlbase.InnerJoin {
+		details = append(details, joinTypeDetail(hj.Type))
+	}
 	if len(hj.LeftEqColumns) > 0 {
 		details = append(details, fmt.Sprintf(
 			"left(%s)=right(%s)",
@@ -149,14 +177,20 @@ func (hj *HashJoinerSpec) summary() (string, []string) {
 		details = append(details, fmt.Sprintf("Merged columns: %d", len(hj.LeftEqColumns)))
 	}
 
-	return "HashJoiner", details
+	return name, details
 }
 
-func orderedJoinDetails(left, right Ordering, onExpr Expression) []string {
-	details := make([]string, 1, 2)
-	details[0] = fmt.Sprintf(
+func orderedJoinDetails(
+	joinType sqlbase.JoinType, left, right Ordering, onExpr Expression,
+) []string {
+	details := make([]string, 0, 3)
+
+	if joinType != sqlbase.InnerJoin {
+		details = append(details, joinTypeDetail(joinType))
+	}
+	details = append(details, fmt.Sprintf(
 		"left(%s)=right(%s)", left.diagramString(), right.diagramString(),
-	)
+	))
 
 	if onExpr.Expr != "" {
 		details = append(details, fmt.Sprintf("ON %s", onExpr.Expr))
@@ -167,8 +201,11 @@ func orderedJoinDetails(left, right Ordering, onExpr Expression) []string {
 
 // summary implements the diagramCellType interface.
 func (mj *MergeJoinerSpec) summary() (string, []string) {
-	details := orderedJoinDetails(mj.LeftOrdering, mj.RightOrdering, mj.OnExpr)
-	return "MergeJoiner", details
+	name := "MergeJoiner"
+	if isSetOpJoin(mj.Type) {
+		name = "MergeSetOp"
+	}
+	return name, orderedJoinDetails(mj.Type, mj.LeftOrdering, mj.RightOrdering, mj.OnExpr)
 }
 
 // summary implements the diagramCellType interface.
@@ -192,23 +229,10 @@ func (irj *InterleavedReaderJoinerSpec) summary() (string, []string) {
 		details = append(details, table.Post.summaryWithPrefix(fmt.Sprintf("%s ", tableLabel))...)
 	}
 	details = append(details, "Joiner")
-	details = append(details, orderedJoinDetails(tables[0].Ordering, tables[1].Ordering, irj.OnExpr)...)
+	details = append(
+		details, orderedJoinDetails(irj.Type, tables[0].Ordering, tables[1].Ordering, irj.OnExpr)...,
+	)
 	return "InterleaveReaderJoiner", details
-}
-
-// summary implements the diagramCellType interface.
-func (aso *AlgebraicSetOpSpec) summary() (string, []string) {
-	var details []string
-	if len(aso.Ordering.Columns) > 0 {
-		details = append(details, aso.Ordering.diagramString())
-	}
-
-	switch aso.OpType {
-	case AlgebraicSetOpSpec_Except_all:
-		return "ExceptAll", details
-	default:
-		panic(fmt.Sprintf("Unsupported op type: %v", aso.OpType))
-	}
 }
 
 // summary implements the diagramCellType interface.
@@ -307,7 +331,11 @@ func (post *PostProcessSpec) summaryWithPrefix(prefix string) []string {
 		res = append(res, fmt.Sprintf("%sFilter: %s", prefix, post.Filter.Expr))
 	}
 	if post.Projection {
-		res = append(res, fmt.Sprintf("%sOut: %s", prefix, colListStr(post.OutputColumns)))
+		outputColumns := "None"
+		if len(post.OutputColumns) > 0 {
+			outputColumns = colListStr(post.OutputColumns)
+		}
+		res = append(res, fmt.Sprintf("%sOut: %s", prefix, outputColumns))
 	}
 	if len(post.RenderExprs) > 0 {
 		var buf bytes.Buffer
@@ -340,7 +368,11 @@ func (post *PostProcessSpec) summaryWithPrefix(prefix string) []string {
 
 // summary implements the diagramCellType interface.
 func (c *ReadCSVSpec) summary() (string, []string) {
-	return "ReadCSV", c.Uri
+	ss := make([]string, 0, len(c.Uri))
+	for _, s := range c.Uri {
+		ss = append(ss, s)
+	}
+	return "ReadCSV", ss
 }
 
 // summary implements the diagramCellType interface.

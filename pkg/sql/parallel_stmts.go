@@ -72,20 +72,16 @@ func MakeParallelizeQueue(analyzer DependencyAnalyzer) ParallelizeQueue {
 	}
 }
 
-// Add inserts the current plan in the queue and executes the provided
-// function when all plans that it depends on have completed
-// successfully, obeying the guarantees made by the ParallelizeQueue
-// above.
+// Add inserts the current plan in the queue and executes the provided function
+// when all plans that it depends on have completed successfully, obeying the
+// guarantees made by the ParallelizeQueue above.
 //
 // Add should not be called concurrently with Wait. See Wait's comment for more
 // details.
 func (pq *ParallelizeQueue) Add(params runParams, exec func() error) error {
-	// plan is used as a hash key in the data structures, we don't
-	// consider it further here.
-	plan := params.p.curPlan.plan
 	prereqs, finishLocked, err := pq.insertInQueue(params)
 	if err != nil {
-		plan.Close(params.ctx)
+		params.p.curPlan.close(params.ctx)
 		return err
 	}
 
@@ -296,7 +292,7 @@ func NewSpanBasedDependencyAnalyzer() DependencyAnalyzer {
 
 func (a *spanBasedDependencyAnalyzer) Analyze(params runParams) error {
 	p := params.p.curPlan.plan
-	readSpans, writeSpans, err := collectSpans(params, p)
+	readSpans, writeSpans, err := params.p.curPlan.collectSpans(params)
 	if err != nil {
 		return err
 	}

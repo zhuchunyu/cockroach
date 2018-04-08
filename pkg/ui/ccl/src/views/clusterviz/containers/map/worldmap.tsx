@@ -18,12 +18,11 @@ interface WorldMapProps {
   projection: d3.geo.Projection;
 }
 
-export class WorldMap extends React.Component<WorldMapProps, {}> {
+export class WorldMap extends React.Component<WorldMapProps> {
   render() {
     const pathGen = d3.geo.path().projection(this.props.projection);
     return (
       <g>
-        <rect className="map-background" />
         <g>
           {worldShapes.features.map((feature: any, i: number) =>
             <path

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -48,6 +49,7 @@ func testTableDesc() *sqlbase.TableDescriptor {
 			{Name: "n", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DATE}},
 			{Name: "o", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMP}},
 			{Name: "p", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMPTZ}},
+			{Name: "q", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}, Nullable: true},
 		},
 		PrimaryIndex: sqlbase.IndexDescriptor{
 			Name: "primary", Unique: true, ColumnNames: []string{"a"},
@@ -60,13 +62,13 @@ func testTableDesc() *sqlbase.TableDescriptor {
 
 func makeSelectNode(t *testing.T, p *planner) *renderNode {
 	desc := testTableDesc()
-	sel := testInitDummySelectNode(p, desc)
+	sel := testInitDummySelectNode(t, p, desc)
 	if err := desc.AllocateIDs(); err != nil {
 		t.Fatal(err)
 	}
-	numColumns := len(sel.sourceInfo[0].sourceColumns)
+	numColumns := len(sel.sourceInfo[0].SourceColumns)
 	sel.ivarHelper = tree.MakeIndexedVarHelper(sel, numColumns)
-	p.extendedEvalCtx.IVarHelper = &sel.ivarHelper
+	p.extendedEvalCtx.IVarContainer = sel
 	sel.run.curSourceRow = make(tree.Datums, numColumns)
 	return sel
 }
@@ -82,7 +84,7 @@ func parseAndNormalizeExpr(t *testing.T, p *planner, sql string, sel *renderNode
 	if expr, _, _, err = p.resolveNamesForRender(expr, sel); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
-	p.semaCtx.IVarHelper = p.extendedEvalCtx.IVarHelper
+	p.semaCtx.IVarContainer = p.extendedEvalCtx.IVarContainer
 	typedExpr, err := tree.TypeCheck(expr, &p.semaCtx, types.Any)
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
@@ -140,7 +142,7 @@ func TestSplitOrExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -167,7 +169,7 @@ func TestSplitAndExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -238,7 +240,7 @@ func TestSimplifyExpr(t *testing.T) {
 		{`a IN (1, 1)`, `a IN (1)`, true},
 		{`a IN (2, 3, 1)`, `a IN (1, 2, 3)`, true},
 		{`a IN (1, NULL, 2, NULL)`, `a IN (NULL, 1, 2)`, true},
-		{`a IN (1, NULL) OR a IN (2, NULL)`, `a IN (NULL, 1, 2)`, true},
+		{`a IN (1, 2) OR a IN (2, 3)`, `a IN (1, 2, 3)`, true},
 
 		{`(a, b) IN ((1, 2))`, `(a, b) IN ((1, 2))`, true},
 		{`(a, b) IN ((1, 2), (1, 2))`, `(a, b) IN ((1, 2))`, true},
@@ -264,10 +266,8 @@ func TestSimplifyExpr(t *testing.T) {
 
 		{`c IS NULL`, `c IS NULL`, true},
 		{`c IS NOT NULL`, `c IS NOT NULL`, true},
-		{`c IS TRUE`, `c = true`, true},
-		{`c IS NOT TRUE`, `(c < true) OR (c IS NULL)`, true},
-		{`c IS FALSE`, `c = false`, true},
-		{`c IS NOT FALSE`, `(c > false) OR (c IS NULL)`, true},
+		{`c ISNULL`, `c IS NULL`, true},
+		{`c NOTNULL`, `c IS NOT NULL`, true},
 		{`c IS UNKNOWN`, `c IS NULL`, true},
 		{`c IS NOT UNKNOWN`, `c IS NOT NULL`, true},
 		{`a IS DISTINCT FROM NULL`, `a IS NOT NULL`, true},
@@ -295,13 +295,13 @@ func TestSimplifyExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			// We need to manually close this memory account because we're doing the
 			// evals ourselves here.
 			defer p.extendedEvalCtx.ActiveMemAcc.Close(context.Background())
-			p.extendedEvalCtx.IVarHelper = &sel.ivarHelper
+			p.extendedEvalCtx.IVarContainer = sel
 			expr := parseAndNormalizeExpr(t, p, d.expr, sel)
 			expr, equiv := SimplifyExpr(p.EvalContext(), expr)
 			if s := expr.String(); d.expected != s {
@@ -340,8 +340,6 @@ func TestSimplifyNotExpr(t *testing.T) {
 		{`NOT i !~ 'foo'`, `true`, false, false},
 		{`NOT i ~* 'foo'`, `true`, false, false},
 		{`NOT i !~* 'foo'`, `true`, false, false},
-		{`NOT a IS DISTINCT FROM 1`, `a = 1`, true, false},
-		{`NOT a IS NOT DISTINCT FROM 1`, `(a != 1) OR (a IS NULL)`, true, false},
 		{`NOT a IS NULL`, `a IS NOT NULL`, true, true},
 		{`NOT a IS NOT NULL`, `a IS NULL`, true, true},
 		{`NOT (a != 1 AND b != 1)`, `(a = 1) OR (b = 1)`, true, true},
@@ -353,7 +351,7 @@ func TestSimplifyNotExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr1 := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -391,7 +389,7 @@ func TestSimplifyAndExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr1 := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -597,7 +595,7 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr1 := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -650,7 +648,7 @@ func TestSimplifyOrExpr(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr1 := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -826,7 +824,7 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr1 := parseAndNormalizeExpr(t, p, d.expr, sel)

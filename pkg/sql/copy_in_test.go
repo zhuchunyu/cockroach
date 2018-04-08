@@ -67,7 +67,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("t"))
+	stmt, err := txn.Prepare(pq.CopyIn("t", "i", "f", "s", "b", "d", "t", "ts", "n", "o", "e", "u", "ip", "tz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,6 +397,9 @@ func TestCopyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Note that, at least with lib/pq, this doesn't actually send a Parse msg
+	// (which we wouldn't support, as we don't support Copy-in in extended
+	// protocol mode). lib/pq has magic for recognizing a Copy.
 	stmt, err := txn.Prepare(pq.CopyIn("t", "i"))
 	if err != nil {
 		t.Fatal(err)

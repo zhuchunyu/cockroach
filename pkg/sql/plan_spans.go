@@ -45,13 +45,15 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 	case *updateNode:
 		return editNodeSpans(params, &n.run.editNodeRun)
 	case *insertNode:
-		if v, ok := n.run.editNodeRun.rows.(*valuesNode); ok && !n.isUpsert() {
+		if v, ok := n.run.editNodeRun.rows.(*valuesNode); ok {
 			// subqueries, even within valuesNodes, can be arbitrarily complex,
 			// so we can't run the valuesNode ahead of time if they are present.
 			if v.isConst {
 				return insertNodeWithValuesSpans(params, n, v)
 			}
 		}
+		return editNodeSpans(params, &n.run.editNodeRun)
+	case *upsertNode:
 		return editNodeSpans(params, &n.run.editNodeRun)
 	case *deleteNode:
 		return editNodeSpans(params, &n.run.editNodeRun)
@@ -68,6 +70,8 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 		return collectSpans(params, n.plan)
 	case *limitNode:
 		return collectSpans(params, n.plan)
+	case *spoolNode:
+		return collectSpans(params, n.source)
 	case *sortNode:
 		return collectSpans(params, n.plan)
 	case *groupNode:
@@ -102,22 +106,13 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 // Where possible, we should try to specialize this analysis like we do with
 // insertNodeWithValuesSpans.
 func editNodeSpans(params runParams, r *editNodeRun) (reads, writes roachpb.Spans, err error) {
-	scanReads, scanWrites, err := collectSpans(params, r.rows)
+	readerReads, readerWrites, err := collectSpans(params, r.rows)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(scanWrites) > 0 {
-		return nil, nil, errors.Errorf("unexpected scan span writes: %v", scanWrites)
-	}
-
 	writerReads, writerWrites := tableWriterSpans(params, r.tw)
 
-	sqReads, err := collectSubquerySpans(params, r.rows)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return append(scanReads, append(writerReads, sqReads...)...), writerWrites, nil
+	return append(readerReads, writerReads...), append(readerWrites, writerWrites...), nil
 }
 
 func tableWriterSpans(params runParams, tw tableWriter) (reads, writes roachpb.Spans) {

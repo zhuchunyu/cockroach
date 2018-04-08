@@ -19,6 +19,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -35,7 +36,8 @@ func TestRowContainerReplaceMax(t *testing.T) {
 	ctx := context.Background()
 	rng, _ := randutil.NewPseudoRand()
 
-	evalCtx := tree.NewTestingEvalContext()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	typeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
@@ -53,7 +55,7 @@ func TestRowContainerReplaceMax(t *testing.T) {
 	}
 
 	m := mon.MakeUnlimitedMonitor(
-		context.Background(), "test", mon.MemoryResource, nil, nil, math.MaxInt64,
+		context.Background(), "test", mon.MemoryResource, nil, nil, math.MaxInt64, st,
 	)
 	defer m.Stop(ctx)
 

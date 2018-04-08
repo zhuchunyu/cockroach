@@ -22,12 +22,13 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
 )
 
 // Processor contains the information associated with a processor in a plan.
@@ -141,6 +142,22 @@ func (p *PhysicalPlan) AddNoGroupingStage(
 	outputTypes []sqlbase.ColumnType,
 	newOrdering distsqlrun.Ordering,
 ) {
+	p.AddNoGroupingStageWithCoreFunc(
+		func(_ int, _ *Processor) distsqlrun.ProcessorCoreUnion { return core },
+		post,
+		outputTypes,
+		newOrdering,
+	)
+}
+
+// AddNoGroupingStageWithCoreFunc is like AddNoGroupingStage, but creates a core
+// spec based on the input processor's spec.
+func (p *PhysicalPlan) AddNoGroupingStageWithCoreFunc(
+	coreFunc func(int, *Processor) distsqlrun.ProcessorCoreUnion,
+	post distsqlrun.PostProcessSpec,
+	outputTypes []sqlbase.ColumnType,
+	newOrdering distsqlrun.Ordering,
+) {
 	stageID := p.NewStageID()
 	for i, resultProc := range p.ResultRouters {
 		prevProc := &p.Processors[resultProc]
@@ -152,7 +169,7 @@ func (p *PhysicalPlan) AddNoGroupingStage(
 					Type:        distsqlrun.InputSyncSpec_UNORDERED,
 					ColumnTypes: p.ResultTypes,
 				}},
-				Core: core,
+				Core: coreFunc(int(resultProc), prevProc),
 				Post: post,
 				Output: []distsqlrun.OutputRouterSpec{{
 					Type: distsqlrun.OutputRouterSpec_PASS_THROUGH,
@@ -276,14 +293,33 @@ func (p *PhysicalPlan) SetLastStagePost(
 	p.ResultTypes = outputTypes
 }
 
+func isIdentityProjection(columns []uint32, numExistingCols int) bool {
+	if len(columns) != numExistingCols {
+		return false
+	}
+	for i, c := range columns {
+		if c != uint32(i) {
+			return false
+		}
+	}
+	return true
+}
+
 // AddProjection applies a projection to a plan. The new plan outputs the
 // columns of the old plan as listed in the slice. The Ordering is updated;
 // columns in the ordering are added to the projection as needed.
 //
+// The PostProcessSpec may not be updated if the resulting projection keeps all
+// the columns in their original order.
+//
 // Note: the columns slice is relinquished to this function, which can modify it
 // or use it directly in specs.
 func (p *PhysicalPlan) AddProjection(columns []uint32) {
-	post := p.GetLastStagePost()
+	// If the projection we are trying to apply projects every column, don't
+	// update the spec.
+	if isIdentityProjection(columns, len(p.ResultTypes)) {
+		return
+	}
 
 	// Update the ordering.
 	if len(p.MergeOrdering.Columns) > 0 {
@@ -312,6 +348,8 @@ func (p *PhysicalPlan) AddProjection(columns []uint32) {
 	for i, c := range columns {
 		newResultTypes[i] = p.ResultTypes[c]
 	}
+
+	post := p.GetLastStagePost()
 
 	if post.RenderExprs != nil {
 		// Apply the projection to the existing rendering; in other words, keep
@@ -769,4 +807,194 @@ func MergeResultTypes(left, right []sqlbase.ColumnType) ([]sqlbase.ColumnType, e
 		}
 	}
 	return merged, nil
+}
+
+// AddJoinStage adds join processors at each of the specified nodes, and wires
+// the left and right-side outputs to these processors.
+func (p *PhysicalPlan) AddJoinStage(
+	nodes []roachpb.NodeID,
+	core distsqlrun.ProcessorCoreUnion,
+	post distsqlrun.PostProcessSpec,
+	leftEqCols, rightEqCols []uint32,
+	leftTypes, rightTypes []sqlbase.ColumnType,
+	leftMergeOrd, rightMergeOrd distsqlrun.Ordering,
+	leftRouters, rightRouters []ProcessorIdx,
+	includeRight bool,
+) {
+	pIdxStart := ProcessorIdx(len(p.Processors))
+	stageID := p.NewStageID()
+
+	for _, n := range nodes {
+		inputs := make([]distsqlrun.InputSyncSpec, 0, 2)
+		inputs = append(inputs, distsqlrun.InputSyncSpec{ColumnTypes: leftTypes})
+		if includeRight {
+			inputs = append(inputs, distsqlrun.InputSyncSpec{ColumnTypes: rightTypes})
+		}
+
+		proc := Processor{
+			Node: n,
+			Spec: distsqlrun.ProcessorSpec{
+				Input:   inputs,
+				Core:    core,
+				Post:    post,
+				Output:  []distsqlrun.OutputRouterSpec{{Type: distsqlrun.OutputRouterSpec_PASS_THROUGH}},
+				StageID: stageID,
+			},
+		}
+		p.Processors = append(p.Processors, proc)
+	}
+
+	if len(nodes) > 1 {
+		// Parallel hash or merge join: we distribute rows (by hash of
+		// equality columns) to len(nodes) join processors.
+
+		routerType := distsqlrun.OutputRouterSpec_BY_HASH
+		if !includeRight {
+			routerType = distsqlrun.OutputRouterSpec_PASS_THROUGH
+		}
+
+		// Set up the left routers.
+		for _, resultProc := range leftRouters {
+			p.Processors[resultProc].Spec.Output[0] = distsqlrun.OutputRouterSpec{
+				Type:        routerType,
+				HashColumns: leftEqCols,
+			}
+		}
+		// Set up the right routers.
+		for _, resultProc := range rightRouters {
+			p.Processors[resultProc].Spec.Output[0] = distsqlrun.OutputRouterSpec{
+				Type:        routerType,
+				HashColumns: rightEqCols,
+			}
+		}
+	}
+	p.ResultRouters = p.ResultRouters[:0]
+
+	// Connect the left and right routers to the output joiners. Each joiner
+	// corresponds to a hash bucket.
+	for bucket := 0; bucket < len(nodes); bucket++ {
+		pIdx := pIdxStart + ProcessorIdx(bucket)
+
+		if includeRight {
+			// Connect left routers to the processor's first input. Currently the join
+			// node doesn't care about the orderings of the left and right results.
+			p.MergeResultStreams(leftRouters, bucket, leftMergeOrd, pIdx, 0)
+			// Connect right routers to the processor's second input if it has one.
+			p.MergeResultStreams(rightRouters, bucket, rightMergeOrd, pIdx, 1)
+		} else {
+			p.MergeResultStreams(leftRouters[bucket:bucket+1], 0, leftMergeOrd, pIdx, 0)
+		}
+
+		p.ResultRouters = append(p.ResultRouters, pIdx)
+	}
+}
+
+// AddDistinctSetOpStage creates a distinct stage and a join stage to implement
+// INTERSECT and EXCEPT plans.
+//
+// TODO(abhimadan): If there's a strong key on the left or right side, we
+// can elide the distinct stage on that side.
+func (p *PhysicalPlan) AddDistinctSetOpStage(
+	nodes []roachpb.NodeID,
+	joinCore distsqlrun.ProcessorCoreUnion,
+	distinctCores []distsqlrun.ProcessorCoreUnion,
+	post distsqlrun.PostProcessSpec,
+	eqCols []uint32,
+	leftTypes, rightTypes []sqlbase.ColumnType,
+	leftMergeOrd, rightMergeOrd distsqlrun.Ordering,
+	leftRouters, rightRouters []ProcessorIdx,
+) {
+	const numSides = 2
+	inputResultTypes := [numSides][]sqlbase.ColumnType{leftTypes, rightTypes}
+	inputMergeOrderings := [numSides]distsqlrun.Ordering{leftMergeOrd, rightMergeOrd}
+	inputResultRouters := [numSides][]ProcessorIdx{leftRouters, rightRouters}
+
+	// Create distinct stages for the left and right sides, where left and right
+	// sources are sent by hash to the node which will contain the join processor.
+	// The distinct stage must be before the join stage for EXCEPT queries to
+	// produce correct results (e.g., (VALUES (1),(1),(2)) EXCEPT (VALUES (1))
+	// would return (1),(2) instead of (2) if there was no distinct processor
+	// before the EXCEPT ALL join).
+	distinctIdxStart := len(p.Processors)
+	distinctProcs := make(map[roachpb.NodeID][]ProcessorIdx)
+
+	for side, types := range inputResultTypes {
+		distinctStageID := p.NewStageID()
+		for _, n := range nodes {
+			proc := Processor{
+				Node: n,
+				Spec: distsqlrun.ProcessorSpec{
+					Input: []distsqlrun.InputSyncSpec{
+						{ColumnTypes: types},
+					},
+					Core:    distinctCores[side],
+					Post:    distsqlrun.PostProcessSpec{},
+					Output:  []distsqlrun.OutputRouterSpec{{Type: distsqlrun.OutputRouterSpec_PASS_THROUGH}},
+					StageID: distinctStageID,
+				},
+			}
+			pIdx := p.AddProcessor(proc)
+			distinctProcs[n] = append(distinctProcs[n], pIdx)
+		}
+	}
+
+	if len(nodes) > 1 {
+		// Set up the left routers.
+		for _, resultProc := range leftRouters {
+			p.Processors[resultProc].Spec.Output[0] = distsqlrun.OutputRouterSpec{
+				Type:        distsqlrun.OutputRouterSpec_BY_HASH,
+				HashColumns: eqCols,
+			}
+		}
+		// Set up the right routers.
+		for _, resultProc := range rightRouters {
+			p.Processors[resultProc].Spec.Output[0] = distsqlrun.OutputRouterSpec{
+				Type:        distsqlrun.OutputRouterSpec_BY_HASH,
+				HashColumns: eqCols,
+			}
+		}
+	}
+
+	// Connect the left and right streams to the distinct processors.
+	for side, routers := range inputResultRouters {
+		// Get the processor index offset for the current side.
+		sideOffset := side * len(nodes)
+		for bucket := 0; bucket < len(nodes); bucket++ {
+			pIdx := ProcessorIdx(distinctIdxStart + sideOffset + bucket)
+			p.MergeResultStreams(routers, bucket, inputMergeOrderings[side], pIdx, 0)
+		}
+	}
+
+	// Create a join stage, where the distinct processors on the same node are
+	// connected to a join processor.
+	joinStageID := p.NewStageID()
+	p.ResultRouters = p.ResultRouters[:0]
+
+	for _, n := range nodes {
+		proc := Processor{
+			Node: n,
+			Spec: distsqlrun.ProcessorSpec{
+				Input: []distsqlrun.InputSyncSpec{
+					{ColumnTypes: leftTypes},
+					{ColumnTypes: rightTypes},
+				},
+				Core:    joinCore,
+				Post:    post,
+				Output:  []distsqlrun.OutputRouterSpec{{Type: distsqlrun.OutputRouterSpec_PASS_THROUGH}},
+				StageID: joinStageID,
+			},
+		}
+		pIdx := p.AddProcessor(proc)
+
+		for side, distinctProc := range distinctProcs[n] {
+			p.Streams = append(p.Streams, Stream{
+				SourceProcessor:  distinctProc,
+				SourceRouterSlot: 0,
+				DestProcessor:    pIdx,
+				DestInput:        side,
+			})
+		}
+
+		p.ResultRouters = append(p.ResultRouters, pIdx)
+	}
 }

@@ -27,7 +27,7 @@ import (
 // GetUserHashedPassword returns the hashedPassword for the given username if
 // found in system.users.
 func GetUserHashedPassword(
-	ctx context.Context, executor *Executor, metrics *MemoryMetrics, username string,
+	ctx context.Context, execCfg *ExecutorConfig, metrics *MemoryMetrics, username string,
 ) (bool, []byte, error) {
 	normalizedUsername := tree.Name(username).Normalize()
 	// Always return no password for the root user, even if someone manually inserts one.
@@ -37,13 +37,13 @@ func GetUserHashedPassword(
 
 	var hashedPassword []byte
 	var exists bool
-	err := executor.cfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		p, cleanup := newInternalPlanner(
-			"get-pwd", txn, security.RootUser, metrics, &executor.cfg)
+			"get-pwd", txn, security.RootUser, metrics, execCfg)
 		defer cleanup()
 		const getHashedPassword = `SELECT "hashedPassword" FROM system.users ` +
 			`WHERE username=$1 AND "isRole" = false`
-		values, err := p.QueryRow(ctx, getHashedPassword, normalizedUsername)
+		values, err := p.queryRow(ctx, getHashedPassword, normalizedUsername)
 		if err != nil {
 			return errors.Errorf("error looking up user %s", normalizedUsername)
 		}
@@ -98,4 +98,11 @@ func existingUserIsRole(
 
 	isRole := bool(*(values[0]).(*tree.DBool))
 	return isRole, nil
+}
+
+var roleMembersTableName = tree.MakeTableName("system", "role_members")
+
+// BumpRoleMembershipTableVersion increases the table version for the role membership table.
+func (p *planner) BumpRoleMembershipTableVersion(ctx context.Context) error {
+	return p.bumpTableVersion(ctx, &roleMembersTableName)
 }

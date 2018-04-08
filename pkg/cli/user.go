@@ -31,18 +31,22 @@ var getUserCmd = &cobra.Command{
 	Long: `
 Fetches and displays the user for <username>.
 `,
+	Args: cobra.ExactArgs(1),
 	RunE: MaybeDecorateGRPCError(runGetUser),
 }
 
 func runGetUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(">=v2.0-alpha.20180116"); err != nil {
+		return err
+	}
 	return runQueryAndFormatResults(conn, os.Stdout,
 		makeQuery(`SELECT * FROM system.users WHERE username=$1 AND "isRole" = false`, args[0]))
 }
@@ -54,14 +58,12 @@ var lsUsersCmd = &cobra.Command{
 	Long: `
 List all users.
 `,
+	Args: cobra.NoArgs,
 	RunE: MaybeDecorateGRPCError(runLsUsers),
 }
 
 func runLsUsers(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
@@ -77,18 +79,22 @@ var rmUserCmd = &cobra.Command{
 	Long: `
 Remove an existing user by username.
 `,
+	Args: cobra.ExactArgs(1),
 	RunE: MaybeDecorateGRPCError(runRmUser),
 }
 
 func runRmUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(">=v1.1-alpha.20170622"); err != nil {
+		return err
+	}
 	return runQueryAndFormatResults(conn, os.Stdout,
 		makeQuery(`DROP USER $1`, args[0]))
 }
@@ -105,6 +111,7 @@ Valid usernames contain 1 to 63 alphanumeric characters. They must
 begin with either a letter or an underscore. Subsequent characters
 may be letters, numbers, or underscores.
 `,
+	Args: cobra.ExactArgs(1),
 	RunE: MaybeDecorateGRPCError(runSetUser),
 }
 
@@ -113,9 +120,6 @@ may be letters, numbers, or underscores.
 // TODO(marc): once we have more fields in the user, we will need
 // to allow changing just some of them (eg: change email, but leave password).
 func runSetUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
 	pwdString := ""
 	if password {
 		var err error
@@ -125,23 +129,26 @@ func runSetUser(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	if err := runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`CREATE USER IF NOT EXISTS $1`, args[0])); err != nil {
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(">=v1.2-alpha.20171113"); err != nil {
 		return err
 	}
+
 	if password {
-		// TODO(asubiotto): Implement appropriate server-side authorization rules
-		// for users to be able to change their own passwords.
 		return runQueryAndFormatResults(conn, os.Stdout,
-			makeQuery(`ALTER USER $1 WITH PASSWORD $2`, args[0], pwdString))
+			makeQuery(`CREATE USER IF NOT EXISTS $1 PASSWORD $2`, args[0], pwdString),
+		)
 	}
-	return nil
+	return runQueryAndFormatResults(conn, os.Stdout,
+		makeQuery(`CREATE USER IF NOT EXISTS $1`, args[0]))
 }
 
 var userCmds = []*cobra.Command{

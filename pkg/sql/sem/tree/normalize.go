@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 )
 
 type normalizableExpr interface {
@@ -128,7 +129,7 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	right := expr.TypedRight()
 	expectedType := expr.ResolvedType()
 
-	if !expr.fn.nullableArgs && (left == DNull || right == DNull) {
+	if !expr.fn.NullableArgs && (left == DNull || right == DNull) {
 		return DNull
 	}
 
@@ -288,7 +289,6 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 			if !ok {
 				return expr
 			}
-
 			// The right is const and the left side is a binary expression. Rotate the
 			// comparison combining portions that are const.
 
@@ -418,16 +418,42 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 					// variable.
 					continue
 				}
+
+			case expr.Operator == EQ && left.Operator == JSONFetchVal && v.isConst(left.Right) &&
+				v.isConst(expr.Right):
+				// This is a JSONB inverted index normalization, changing things of the form
+				// x->y=z to x @> {y:z} which can be used to build spans for inverted index
+				// lookups.
+
+				if left.TypedRight().ResolvedType() != types.String {
+					break
+				}
+
+				str, err := left.TypedRight().Eval(v.ctx)
+				if err != nil {
+					break
+				}
+
+				j := json.NewObjectBuilder(1)
+				j.Add(string(*str.(*DString)), expr.Right.(*DJSON).JSON)
+
+				dj, err := MakeDJSON(j.Build())
+				if err != nil {
+					break
+				}
+
+				typedJ, err := dj.TypeCheck(nil, types.JSON)
+				if err != nil {
+					break
+				}
+
+				return NewTypedComparisonExpr(Contains, left.TypedLeft(), typedJ)
 			}
 
 			// We've run out of work to do.
 			break
 		}
 	case In, NotIn:
-		if expr.TypedLeft() == DNull {
-			return DNull
-		}
-
 		// If the right tuple in an In or NotIn comparison expression is constant, it can
 		// be normalized.
 		tuple, ok := expr.Right.(*DTuple)
@@ -440,46 +466,27 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 			if len(tupleCopy.D) == 1 && tupleCopy.D[0] == DNull {
 				return DNull
 			}
+			if len(tupleCopy.D) == 0 {
+				// NULL IN <empty-tuple> is false.
+				return DBoolFalse
+			}
+			if expr.TypedLeft() == DNull {
+				// NULL IN <non-empty-tuple> is NULL.
+				return DNull
+			}
 
 			exprCopy := *expr
 			expr = &exprCopy
 			expr.Right = &tupleCopy
 		}
-	case IsNotDistinctFrom:
-		if expr.TypedRight() != DNull {
-			if expr.TypedLeft() == DNull {
-				// Switch two sides of the ComparisonExp if left side is NULL.
-				return NewTypedComparisonExpr(IsNotDistinctFrom, expr.TypedRight(), expr.TypedLeft())
-			}
-			// IS exprs handle NULL and return a bool while EQ exprs propagate
-			// it (e.g. NULL IS b -> false, NULL = b -> NULL). To provide the
-			// same semantics, we catch NULL values with an AND expr. Now the
-			// three cases are:
-			//  a := b:    (a = b) AND (a IS DISTINCT FROM NULL) -> true  AND true  -> true
-			//  a := !b:   (a = b) AND (a IS DISTINCT FROM NULL) -> false AND true  -> false
-			//  a := NULL: (a = b) AND (a IS DISTINCT FROM NULL) -> NULL  AND false -> false
-			return NewTypedAndExpr(
-				NewTypedComparisonExpr(EQ, expr.TypedLeft(), expr.TypedRight()),
-				NewTypedComparisonExpr(IsDistinctFrom, expr.TypedLeft(), DNull),
-			)
-		}
-	case IsDistinctFrom:
-		if expr.TypedRight() != DNull {
-			if expr.TypedLeft() == DNull {
-				// Switch two sides of the ComparisonExp if left side is NULL.
-				return NewTypedComparisonExpr(IsDistinctFrom, expr.TypedRight(), expr.TypedLeft())
-			}
-			// IS NOT exprs handle NULL and return a bool while NE exprs propagate
-			// it (e.g. NULL IS NOT b -> false, NULL != b -> NULL). To provide the
-			// same semantics, we catch NULL values with an OR expr. Now the three
-			// cases are:
-			//  a := b:    (a != b) OR (a IS NOT DISTINCT FROM NULL) -> false OR false -> false
-			//  a := !b:   (a != b) OR (a IS NOT DISTINCT FROM NULL) -> true  OR false -> true
-			//  a := NULL: (a != b) OR (a IS NOT DISTINCT FROM NULL) -> NULL  OR true  -> true
-			return NewTypedOrExpr(
-				NewTypedComparisonExpr(NE, expr.TypedLeft(), expr.TypedRight()),
-				NewTypedComparisonExpr(IsNotDistinctFrom, expr.TypedLeft(), DNull),
-			)
+	case IsDistinctFrom, IsNotDistinctFrom:
+		left := expr.TypedLeft()
+		right := expr.TypedRight()
+
+		if v.isConst(left) && !v.isConst(right) {
+			// Switch operand order so that constant expression is on the right.
+			// This helps support index selection rules.
+			return NewTypedComparisonExpr(expr.Operator, right, left)
 		}
 	case NE,
 		Like, NotLike,

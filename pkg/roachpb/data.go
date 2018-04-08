@@ -326,6 +326,18 @@ func (v Value) dataBytes() []byte {
 	return v.RawBytes[headerSize:]
 }
 
+// EqualData returns a boolean reporting whether the receiver and the parameter
+// have equivalent byte values. This check ignores the optional checksum field
+// in the Values' byte slices, returning only whether the Values have the same
+// tag and encoded data.
+//
+// This method should be used whenever the raw bytes of two Values are being
+// compared instead of comparing the RawBytes slices directly because it ignores
+// the checksum header, which is optional.
+func (v Value) EqualData(o Value) bool {
+	return bytes.Equal(v.RawBytes[checksumSize:], o.RawBytes[checksumSize:])
+}
+
 // SetBytes sets the bytes and tag field of the receiver and clears the checksum.
 func (v *Value) SetBytes(b []byte) {
 	v.RawBytes = make([]byte, headerSize+len(b))
@@ -544,7 +556,12 @@ func (v Value) GetDecimal() (apd.Decimal, error) {
 // TIMESERIES or if decoding fails.
 func (v Value) GetTimeseries() (InternalTimeSeriesData, error) {
 	ts := InternalTimeSeriesData{}
-	return ts, v.GetProto(&ts)
+	// GetProto mutates its argument. `return ts, v.GetProto(&ts)`
+	// happens to work in gc, but does not work in gccgo.
+	//
+	// See https://github.com/golang/go/issues/23188.
+	err := v.GetProto(&ts)
+	return ts, err
 }
 
 // GetTuple returns the tuple bytes of the receiver. If the tag is not TUPLE an
@@ -901,30 +918,39 @@ func (t *Transaction) Update(o *Transaction) {
 	if o.Status != PENDING {
 		t.Status = o.Status
 	}
+
+	// If the epoch or refreshed timestamp move forward, overwrite
+	// WriteTooOld and RetryOnPush, otherwise the flags are cumulative.
+	if t.Epoch < o.Epoch || t.RefreshedTimestamp.Less(o.RefreshedTimestamp) {
+		t.WriteTooOld = o.WriteTooOld
+		t.RetryOnPush = o.RetryOnPush
+		t.OrigTimestampWasObserved = o.OrigTimestampWasObserved
+	} else {
+		t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
+		t.RetryOnPush = t.RetryOnPush || o.RetryOnPush
+		t.OrigTimestampWasObserved = t.OrigTimestampWasObserved || o.OrigTimestampWasObserved
+	}
+
 	if t.Epoch < o.Epoch {
 		t.Epoch = o.Epoch
 	}
+
 	t.Timestamp.Forward(o.Timestamp)
 	t.LastHeartbeat.Forward(o.LastHeartbeat)
 	t.OrigTimestamp.Forward(o.OrigTimestamp)
 	t.MaxTimestamp.Forward(o.MaxTimestamp)
+	t.RefreshedTimestamp.Forward(o.RefreshedTimestamp)
 
 	// Absorb the collected clock uncertainty information.
 	for _, v := range o.ObservedTimestamps {
 		t.UpdateObservedTimestamp(v.NodeID, v.Timestamp)
 	}
 	t.UpgradePriority(o.Priority)
+
 	// We can't assert against regression here since it can actually happen
 	// that we update from a transaction which isn't Writing.
 	t.Writing = t.Writing || o.Writing
-	// This isn't or'd (similar to Writing) because we want WriteTooOld
-	// and RetryOnPush to be set each time according to "o". This allows
-	// a persisted txn to have its WriteTooOld flag reset on update.
-	// TODO(tschottdorf): reset in a central location when it's certifiably
-	//   a new request. Update is called in many situations and shouldn't
-	//   reset anything.
-	t.WriteTooOld = o.WriteTooOld
-	t.RetryOnPush = o.RetryOnPush
+
 	if t.Sequence < o.Sequence {
 		t.Sequence = o.Sequence
 	}
@@ -947,6 +973,12 @@ func (t *Transaction) UpgradePriority(minPriority int32) {
 	if minPriority > t.Priority && t.Priority != MinTxnPriority {
 		t.Priority = minPriority
 	}
+}
+
+// IsSerializable returns whether this transaction uses serializable
+// isolation.
+func (t *Transaction) IsSerializable() bool {
+	return t != nil && t.Isolation == enginepb.SERIALIZABLE
 }
 
 // String formats transaction into human readable string.
@@ -1058,17 +1090,8 @@ func PrepareTransactionForRetry(
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri
 	case *ReadWithinUncertaintyIntervalError:
-		// If the reader encountered a newer write within the uncertainty
-		// interval, we advance the txn's timestamp just past the last observed
-		// timestamp from the node.
-		ts, ok := txn.GetObservedTimestamp(pErr.OriginNode)
-		if !ok {
-			log.Fatalf(ctx,
-				"missing observed timestamp for node %d found on uncertainty restart. "+
-					"err: %s. txn: %s. Observed timestamps: %s",
-				pErr.OriginNode, pErr, txn, txn.ObservedTimestamps)
-		}
-		txn.Timestamp.Forward(ts)
+		txn.Timestamp.Forward(
+			readWithinUncertaintyIntervalRetryTimestamp(ctx, &txn, tErr, pErr.OriginNode))
 	case *TransactionPushError:
 		// Increase timestamp if applicable, ensuring that we're just ahead of
 		// the pushee.
@@ -1080,7 +1103,7 @@ func PrepareTransactionForRetry(
 		// the restart.
 	case *WriteTooOldError:
 		// Increase the timestamp to the ts at which we've actually written.
-		txn.Timestamp.Forward(tErr.ActualTimestamp)
+		txn.Timestamp.Forward(writeTooOldRetryTimestamp(&txn, tErr))
 	default:
 		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
@@ -1088,6 +1111,62 @@ func PrepareTransactionForRetry(
 		txn.Restart(pri, txn.Priority, txn.Timestamp)
 	}
 	return txn
+}
+
+// CanTransactionRetryAtRefreshedTimestamp returns whether the transaction
+// specified in the supplied error can be retried at a refreshed timestamp
+// to avoid a client-side transaction restart. If true, returns a cloned,
+// updated Transaction object with the refreshed timestamp set appropriately.
+func CanTransactionRetryAtRefreshedTimestamp(
+	ctx context.Context, pErr *Error,
+) (bool, *Transaction) {
+	txn := pErr.GetTxn()
+	if !txn.IsSerializable() || txn.OrigTimestampWasObserved {
+		return false, nil
+	}
+	timestamp := txn.Timestamp
+	switch err := pErr.GetDetail().(type) {
+	case *TransactionRetryError:
+		if err.Reason != RETRY_SERIALIZABLE && err.Reason != RETRY_WRITE_TOO_OLD {
+			return false, nil
+		}
+	case *WriteTooOldError:
+		timestamp.Forward(writeTooOldRetryTimestamp(txn, err))
+	case *ReadWithinUncertaintyIntervalError:
+		timestamp.Forward(
+			readWithinUncertaintyIntervalRetryTimestamp(ctx, txn, err, pErr.OriginNode))
+	default:
+		return false, nil
+	}
+
+	newTxn := txn.Clone()
+	newTxn.Timestamp.Forward(timestamp)
+	newTxn.RefreshedTimestamp.Forward(newTxn.Timestamp)
+	newTxn.WriteTooOld = false
+
+	return true, &newTxn
+}
+
+func readWithinUncertaintyIntervalRetryTimestamp(
+	ctx context.Context, txn *Transaction, err *ReadWithinUncertaintyIntervalError, origin NodeID,
+) hlc.Timestamp {
+	// If the reader encountered a newer write within the uncertainty
+	// interval, we advance the txn's timestamp just past the last observed
+	// timestamp from the node.
+	ts, ok := txn.GetObservedTimestamp(origin)
+	if !ok {
+		log.Fatalf(ctx,
+			"missing observed timestamp for node %d found on uncertainty restart. "+
+				"err: %s. txn: %s. Observed timestamps: %s",
+			origin, err, txn, txn.ObservedTimestamps)
+	}
+	// Also forward by the existing timestamp.
+	ts.Forward(err.ExistingTimestamp.Next())
+	return ts
+}
+
+func writeTooOldRetryTimestamp(txn *Transaction, err *WriteTooOldError) hlc.Timestamp {
+	return err.ActualTimestamp
 }
 
 var _ fmt.Stringer = &ChangeReplicasTrigger{}

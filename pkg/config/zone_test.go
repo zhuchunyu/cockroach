@@ -12,15 +12,17 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-package config_test
+package config
 
 import (
 	"fmt"
+	"math/rand"
+	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	proto "github.com/gogo/protobuf/proto"
 	yaml "gopkg.in/yaml.v2"
 )
@@ -29,45 +31,212 @@ func TestZoneConfigValidate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	testCases := []struct {
-		cfg      config.ZoneConfig
+		cfg      ZoneConfig
 		expected string
 	}{
 		{
-			config.ZoneConfig{},
+			ZoneConfig{},
 			"at least one replica is required",
 		},
 		{
-			config.ZoneConfig{
+			ZoneConfig{
+				NumReplicas: -1,
+			},
+			"at least one replica is required",
+		},
+		{
+			ZoneConfig{
 				NumReplicas: 2,
 			},
 			"at least 3 replicas are required for multi-replica configurations",
 		},
 		{
-			config.ZoneConfig{
+			ZoneConfig{
 				NumReplicas: 1,
 			},
 			"RangeMaxBytes 0 less than minimum allowed",
 		},
 		{
-			config.ZoneConfig{
+			ZoneConfig{
 				NumReplicas:   1,
-				RangeMaxBytes: config.DefaultZoneConfig().RangeMaxBytes,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+			},
+			"GC.TTLSeconds 0 less than minimum allowed",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
 			},
 			"",
 		},
 		{
-			config.ZoneConfig{
+			ZoneConfig{
 				NumReplicas:   1,
-				RangeMinBytes: config.DefaultZoneConfig().RangeMaxBytes,
-				RangeMaxBytes: config.DefaultZoneConfig().RangeMaxBytes,
+				RangeMinBytes: -1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+			},
+			"RangeMinBytes -1 less than minimum allowed",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMinBytes: DefaultZoneConfig().RangeMaxBytes,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
 			},
 			"is greater than or equal to RangeMaxBytes",
 		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{Constraints: []Constraint{{Value: "a", Type: Constraint_DEPRECATED_POSITIVE}}},
+				},
+			},
+			"constraints must either be required .+ or prohibited .+",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}}},
+				},
+			},
+			"",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}},
+						NumReplicas: 1,
+					},
+				},
+			},
+			"",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+						NumReplicas: 2,
+					},
+				},
+			},
+			"the number of replicas specified in constraints .+ cannot be greater than",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   3,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+						NumReplicas: 2,
+					},
+				},
+			},
+			"",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+						NumReplicas: 0,
+					},
+					{
+						Constraints: []Constraint{{Value: "b", Type: Constraint_REQUIRED}},
+						NumReplicas: 1,
+					},
+				},
+			},
+			"constraints must apply to at least one replica",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   3,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+						NumReplicas: 2,
+					},
+					{
+						Constraints: []Constraint{{Value: "b", Type: Constraint_PROHIBITED}},
+						NumReplicas: 1,
+					},
+				},
+			},
+			"only required constraints .+ can be applied to a subset of replicas",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				LeasePreferences: []LeasePreference{
+					{
+						Constraints: []Constraint{},
+					},
+				},
+			},
+			"every lease preference must include at least one constraint",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				LeasePreferences: []LeasePreference{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_DEPRECATED_POSITIVE}},
+					},
+				},
+			},
+			"lease preference constraints must either be required .+ or prohibited .+",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   1,
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            GCPolicy{TTLSeconds: 1},
+				LeasePreferences: []LeasePreference{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+					},
+					{
+						Constraints: []Constraint{{Value: "b", Type: Constraint_PROHIBITED}},
+					},
+				},
+			},
+			"",
+		},
 	}
+
 	for i, c := range testCases {
 		err := c.cfg.Validate()
 		if !testutils.IsError(err, c.expected) {
-			t.Fatalf("%d: expected %q, got %v", i, c.expected, err)
+			t.Errorf("%d: expected %q, got %v", i, c.expected, err)
 		}
 	}
 }
@@ -75,10 +244,10 @@ func TestZoneConfigValidate(t *testing.T) {
 func TestZoneConfigSubzones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	zone := config.DefaultZoneConfig()
-	subzoneAInvalid := config.Subzone{IndexID: 1, PartitionName: "a", Config: config.ZoneConfig{}}
-	subzoneA := config.Subzone{IndexID: 1, PartitionName: "a", Config: config.DefaultZoneConfig()}
-	subzoneB := config.Subzone{IndexID: 1, PartitionName: "b", Config: config.DefaultZoneConfig()}
+	zone := DefaultZoneConfig()
+	subzoneAInvalid := Subzone{IndexID: 1, PartitionName: "a", Config: ZoneConfig{}}
+	subzoneA := Subzone{IndexID: 1, PartitionName: "a", Config: DefaultZoneConfig()}
+	subzoneB := Subzone{IndexID: 1, PartitionName: "b", Config: DefaultZoneConfig()}
 
 	if zone.IsSubzonePlaceholder() {
 		t.Errorf("default zone config should not be considered a subzone placeholder")
@@ -111,8 +280,8 @@ func TestZoneConfigSubzones(t *testing.T) {
 	}
 
 	zone.DeleteTableConfig()
-	if e := (config.ZoneConfig{
-		Subzones: []config.Subzone{subzoneA, subzoneB},
+	if e := (ZoneConfig{
+		Subzones: []Subzone{subzoneA, subzoneB},
 	}); !e.Equal(zone) {
 		t.Errorf("expected zone after clearing to equal %+v, but got %+v", e, zone)
 	}
@@ -133,10 +302,10 @@ func TestZoneConfigSubzones(t *testing.T) {
 		t.Errorf("expected non-deleted subzone to equal %+v, but got %+v", &subzoneA, subzone)
 	}
 
-	zone.SetSubzone(config.Subzone{IndexID: 2, Config: config.DefaultZoneConfig()})
-	zone.SetSubzone(config.Subzone{IndexID: 2, PartitionName: "a", Config: config.DefaultZoneConfig()})
+	zone.SetSubzone(Subzone{IndexID: 2, Config: DefaultZoneConfig()})
+	zone.SetSubzone(Subzone{IndexID: 2, PartitionName: "a", Config: DefaultZoneConfig()})
 	zone.SetSubzone(subzoneB) // interleave a subzone from a different index
-	zone.SetSubzone(config.Subzone{IndexID: 2, PartitionName: "b", Config: config.DefaultZoneConfig()})
+	zone.SetSubzone(Subzone{IndexID: 2, PartitionName: "b", Config: DefaultZoneConfig()})
 	if e, a := 5, len(zone.Subzones); e != a {
 		t.Fatalf("expected %d subzones, but found %d", e, a)
 	}
@@ -163,55 +332,311 @@ func TestZoneConfigSubzones(t *testing.T) {
 func TestZoneConfigMarshalYAML(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	original := config.ZoneConfig{
+	original := ZoneConfig{
 		RangeMinBytes: 1,
 		RangeMaxBytes: 1,
-		GC: config.GCPolicy{
+		GC: GCPolicy{
 			TTLSeconds: 1,
 		},
 		NumReplicas: 1,
-		Constraints: config.Constraints{
-			Constraints: []config.Constraint{
-				{
-					Type:  config.Constraint_POSITIVE,
-					Value: "foo",
-				},
-				{
-					Type:  config.Constraint_REQUIRED,
-					Key:   "duck",
-					Value: "foo",
-				},
-				{
-					Type:  config.Constraint_PROHIBITED,
-					Key:   "duck",
-					Value: "foo",
-				},
-			},
-		},
 	}
 
-	expected := `range_min_bytes: 1
+	testCases := []struct {
+		constraints      []Constraints
+		leasePreferences []LeasePreference
+		expected         string
+	}{
+		{
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: []
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: [+duck=foo]
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_DEPRECATED_POSITIVE,
+							Value: "foo",
+						},
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+						{
+							Type:  Constraint_PROHIBITED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
 range_max_bytes: 1
 gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: [foo, +duck=foo, -duck=foo]
-`
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					NumReplicas: 3,
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: {+duck=foo: 3}
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					NumReplicas: 3,
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_DEPRECATED_POSITIVE,
+							Value: "foo",
+						},
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+						{
+							Type:  Constraint_PROHIBITED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: {'foo,+duck=foo,-duck=foo': 3}
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					NumReplicas: 1,
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "bar1",
+						},
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "bar2",
+						},
+					},
+				},
+				{
+					NumReplicas: 2,
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: {'+duck=bar1,+duck=bar2': 1, +duck=foo: 2}
+`,
+		},
+		{
+			leasePreferences: []LeasePreference{},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: []
+`,
+		},
+		{
+			leasePreferences: []LeasePreference{
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: []
+experimental_lease_preferences: [[+duck=foo]]
+`,
+		},
+		{
+			constraints: []Constraints{
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			leasePreferences: []LeasePreference{
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "bar1",
+						},
+						{
+							Type:  Constraint_REQUIRED,
+							Key:   "duck",
+							Value: "bar2",
+						},
+					},
+				},
+				{
+					Constraints: []Constraint{
+						{
+							Type:  Constraint_PROHIBITED,
+							Key:   "duck",
+							Value: "foo",
+						},
+					},
+				},
+			},
+			expected: `range_min_bytes: 1
+range_max_bytes: 1
+gc:
+  ttlseconds: 1
+num_replicas: 1
+constraints: [+duck=foo]
+experimental_lease_preferences: [[+duck=bar1, +duck=bar2], [-duck=foo]]
+`,
+		},
+	}
 
-	body, err := yaml.Marshal(original)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			original.Constraints = tc.constraints
+			original.LeasePreferences = tc.leasePreferences
+			body, err := yaml.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != tc.expected {
+				t.Fatalf("yaml.Marshal(%+v)\ngot:\n%s\nwant:\n%s", original, body, tc.expected)
+			}
+
+			var unmarshaled ZoneConfig
+			if err := yaml.UnmarshalStrict(body, &unmarshaled); err != nil {
+				t.Fatal(err)
+			}
+			if !proto.Equal(&unmarshaled, &original) {
+				t.Errorf("yaml.UnmarshalStrict(%q)\ngot:\n%+v\nwant:\n%+v", body, unmarshaled, original)
+			}
+		})
 	}
-	if string(body) != expected {
-		t.Fatalf("yaml.Marshal(%+v) = %s; not %s", original, body, expected)
+}
+
+func TestConstraintsListYAML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		input     string
+		expectErr bool
+	}{
+		{},
+		{input: "[]"},
+		{input: "[+a]"},
+		{input: "[+a, -b=2, +c=d, e]"},
+		{input: "{+a: 1}"},
+		{input: "{+a: 1, '+a=1,+b,+c=d': 2}"},
+		{input: "{'+a: 1'}"},  // unfortunately this parses just fine because yaml autoconverts it to a list...
+		{input: "{+a,+b: 1}"}, // this also parses fine but will fail ZoneConfig.Validate()
+		{input: "{+a: 1, '+a=1,+b,+c=d': b}", expectErr: true},
+		{input: "[+a: 1]", expectErr: true},
+		{input: "[+a: 1, '+a=1,+b,+c=d': 2]", expectErr: true},
 	}
 
-	var unmarshaled config.ZoneConfig
-	if err := yaml.UnmarshalStrict(body, &unmarshaled); err != nil {
-		t.Fatal(err)
+	for _, tc := range testCases {
+		t.Run(tc.input, func(t *testing.T) {
+			var constraints ConstraintsList
+			err := yaml.UnmarshalStrict([]byte(tc.input), &constraints)
+			if err == nil && tc.expectErr {
+				t.Errorf("expected error, but got constraints %+v", constraints)
+			}
+			if err != nil && !tc.expectErr {
+				t.Errorf("expected success, but got %v", err)
+			}
+		})
 	}
-	if !proto.Equal(&unmarshaled, &original) {
-		t.Errorf("yaml.UnmarshalStrict(%q) = %+v; not %+v", body, unmarshaled, original)
+}
+
+func TestMarshalableZoneConfigRoundTrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	original := NewPopulatedZoneConfig(
+		rand.New(rand.NewSource(timeutil.Now().UnixNano())), false /* easy */)
+	marshalable := zoneConfigToMarshalable(*original)
+	roundTripped := zoneConfigFromMarshalable(marshalable)
+
+	if !reflect.DeepEqual(roundTripped, *original) {
+		t.Errorf("round-tripping a ZoneConfig through a marshalableZoneConfig failed:\noriginal:\n%+v\nmarshable:\n%+v\ngot:\n%+v", original, marshalable, roundTripped)
 	}
 }
 
@@ -219,16 +644,16 @@ func TestZoneSpecifiers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Simulate exactly two named zones: one named default and one named carl.
-	// N.B. config.DefaultZoneName must always exist in the mapping; it is treated
+	// N.B. DefaultZoneName must always exist in the mapping; it is treated
 	// specially so that it always appears first in the lookup path.
-	defer func(old map[string]uint32) { config.NamedZones = old }(config.NamedZones)
-	config.NamedZones = map[string]uint32{
-		config.DefaultZoneName: 0,
-		"carl":                 42,
+	defer func(old map[string]uint32) { NamedZones = old }(NamedZones)
+	NamedZones = map[string]uint32{
+		DefaultZoneName: 0,
+		"carl":          42,
 	}
-	defer func(old map[uint32]string) { config.NamedZonesByID = old }(config.NamedZonesByID)
-	config.NamedZonesByID = map[uint32]string{
-		0:  config.DefaultZoneName,
+	defer func(old map[uint32]string) { NamedZonesByID = old }(NamedZonesByID)
+	NamedZonesByID = map[uint32]string{
+		0:  DefaultZoneName,
 		42: "carl",
 	}
 
@@ -280,7 +705,7 @@ func TestZoneSpecifiers(t *testing.T) {
 		{"db.tbl.prt", 51, ""},
 		{`db.tbl@idx`, 51, ""},
 		{`db.tbl.prt@idx`, -1, "index and partition cannot be specified simultaneously"},
-		{"db.tbl.too.many.dots", 0, "invalid table name"},
+		{"db.tbl.too.many.dots", 0, `malformed name: "db.tbl.too.many.dots"`},
 		{`db.tbl@primary`, 51, ""},
 		{"tbl", -1, `"tbl" not found`},
 		{"table", -1, `malformed name: "table"`}, // SQL keyword; requires quotes
@@ -299,19 +724,18 @@ func TestZoneSpecifiers(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("parse-cli=%s", tc.cliSpecifier), func(t *testing.T) {
 			err := func() error {
-				zs, err := config.ParseCLIZoneSpecifier(tc.cliSpecifier)
+				zs, err := ParseCLIZoneSpecifier(tc.cliSpecifier)
 				if err != nil {
 					return err
 				}
-				sessionDB := "" // the zone CLI never sets a session DB
-				id, err := config.ResolveZoneSpecifier(&zs, sessionDB, resolveName)
+				id, err := ResolveZoneSpecifier(&zs, resolveName)
 				if err != nil {
 					return err
 				}
 				if e, a := tc.id, int(id); a != e {
 					t.Errorf("path %d did not match expected path %d", a, e)
 				}
-				if e, a := tc.cliSpecifier, config.CLIZoneSpecifier(&zs); e != a {
+				if e, a := tc.cliSpecifier, CLIZoneSpecifier(&zs); e != a {
 					t.Errorf("expected %q to roundtrip, but got %q", e, a)
 				}
 				return nil
@@ -341,14 +765,14 @@ func TestZoneSpecifiers(t *testing.T) {
 		{58, "", "58 not found"},
 	} {
 		t.Run(fmt.Sprintf("resolve-id=%d", tc.id), func(t *testing.T) {
-			zs, err := config.ZoneSpecifierFromID(tc.id, resolveID)
+			zs, err := ZoneSpecifierFromID(tc.id, resolveID)
 			if !testutils.IsError(err, tc.err) {
 				t.Errorf("unable to lookup ID %d: %s", tc.id, err)
 			}
 			if tc.err != "" {
 				return
 			}
-			if e, a := tc.cliSpecifier, config.CLIZoneSpecifier(&zs); e != a {
+			if e, a := tc.cliSpecifier, CLIZoneSpecifier(&zs); e != a {
 				t.Errorf("expected %q specifier for ID %d, but got %q", e, tc.id, a)
 			}
 		})

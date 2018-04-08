@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -71,7 +70,7 @@ func (p *planner) distinct(
 
 	for _, expr := range n.DistinctOn {
 		// The expressions in DISTINCT ON follow similar rules as
-		// the expressionss in ORDER BY (see sort.go:sortBy).
+		// the expressions in ORDER BY (see sort.go:sortBy).
 
 		// The logical data source for DISTINCT ON is the list of render
 		// expressions for a SELECT, as specified in the input SQL text
@@ -158,10 +157,7 @@ func (p *planner) distinct(
 		}
 
 		if index == -1 {
-			return nil, nil, pgerror.NewErrorf(
-				pgerror.CodeUndefinedColumnError,
-				"column %s does not exist", expr,
-			)
+			return nil, nil, sqlbase.NewUndefinedColumnError(expr.String())
 		}
 
 		d.distinctOnColIdxs.Add(index)
@@ -170,13 +166,20 @@ func (p *planner) distinct(
 	// We add a post renderNode if DISTINCT ON introduced additional render
 	// expressions.
 	if len(origRender) < len(r.render) {
-		src := planDataSource{info: newSourceInfoForSingleTable(anonymousTable, origColumns), plan: d}
+		src := planDataSource{
+			info: sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, origColumns),
+			plan: d,
+		}
 		postRender := &renderNode{
 			source:     src,
-			sourceInfo: multiSourceInfo{src.info},
+			sourceInfo: sqlbase.MakeMultiSourceInfo(src.info),
 		}
-		postRender.ivarHelper = tree.MakeIndexedVarHelper(postRender, len(src.info.sourceColumns))
-		if err := p.initTargets(ctx, postRender, tree.SelectExprs{tree.SelectExpr{Expr: &tree.AllColumnsSelector{}}}, nil /* desiredTypes */); err != nil {
+		postRender.ivarHelper = tree.MakeIndexedVarHelper(postRender, len(src.info.SourceColumns))
+		if err := p.initTargets(ctx, postRender, tree.SelectExprs{
+			tree.SelectExpr{
+				Expr: tree.StarExpr(),
+			},
+		}, nil /* desiredTypes */); err != nil {
 			return nil, nil, err
 		}
 		plan = postRender

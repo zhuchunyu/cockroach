@@ -9,7 +9,7 @@
 set -euo pipefail
 
 apt-get update
-apt-get install -y autoconf cmake libtinfo-dev
+apt-get install -y autoconf cmake libncurses-dev
 
 workdir=$(mktemp -d)
 tar xzf cockroach.src.tgz -C "$workdir"
@@ -24,6 +24,5 @@ EOF
 diff -u - <(cockroach sql --insecure -e 'SELECT * FROM bank.accounts') <<EOF
 id	balance
 1	1000.50
-# 1 row
 EOF
 cockroach quit --insecure

@@ -39,7 +39,7 @@ function ClusterNodeTotals (props: ClusterSummaryProps) {
   return (
     <SummaryStat
       title={
-        <span>Total Nodes <Link to="/cluster/nodes">View nodes list</Link></span>
+        <span>Total Nodes <Link to="/nodes">View nodes list</Link></span>
       }
       value={nodeCounts.total}
     >
@@ -59,9 +59,8 @@ function formatNanosAsMillis (n: number) {
  */
 export default function(props: ClusterSummaryProps) {
   // Capacity math used in the summary status section.
-  const { capacityAvailable, capacityUsed } = props.nodesSummary.nodeSums;
-  const usableCapacity = capacityAvailable + capacityUsed;
-  const capacityPercent = usableCapacity !== 0 ? (capacityUsed / usableCapacity) : null;
+  const { capacityUsed, capacityUsable } = props.nodesSummary.nodeSums;
+  const capacityPercent = capacityUsable !== 0 ? (capacityUsed / capacityUsable) : null;
 
   return (
     <div>
@@ -69,7 +68,7 @@ export default function(props: ClusterSummaryProps) {
         <SummaryLabel>Summary</SummaryLabel>
         <ClusterNodeTotals {...props}/>
         <SummaryStat title="Capacity Used" value={capacityPercent} format={formatPercentage}>
-          <SummaryStatMessage message={`You are using ${Bytes(capacityUsed)} of ${Bytes(usableCapacity)}
+          <SummaryStatMessage message={`You are using ${Bytes(capacityUsed)} of ${Bytes(capacityUsable)}
                                         usable storage capacity across all nodes.`} />
         </SummaryStat>
         <SummaryStat title="Unavailable ranges" value={props.nodesSummary.nodeSums.unavailableRanges} />
@@ -77,10 +76,10 @@ export default function(props: ClusterSummaryProps) {
           <Metric sources={props.nodeSources} name="cr.node.sql.query.count" title="Queries/Sec" nonNegativeRate />
         </SummaryMetricStat>
         <SummaryMetricStat id="p50" title="P50 latency" format={formatNanosAsMillis} >
-          <Metric sources={props.nodeSources} name="cr.node.exec.latency-p50" aggregateMax downsampleMax />
+          <Metric sources={props.nodeSources} name="cr.node.sql.service.latency-p50" aggregateMax downsampleMax />
         </SummaryMetricStat>
         <SummaryMetricStat id="p99" title="P99 latency" format={formatNanosAsMillis} >
-          <Metric sources={props.nodeSources} name="cr.node.exec.latency-p99" aggregateMax downsampleMax />
+          <Metric sources={props.nodeSources} name="cr.node.sql.service.latency-p99" aggregateMax downsampleMax />
         </SummaryMetricStat>
       </SummaryBar>
       <SummaryBar>

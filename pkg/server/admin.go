@@ -17,6 +17,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -30,15 +31,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"encoding/json"
-
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -95,6 +94,7 @@ func newAdminServer(s *Server, ie *sql.InternalExecutor) *adminServer {
 		nil,
 		nil,
 		noteworthyAdminMemoryUsageBytes,
+		s.ClusterSettings(),
 	)
 	return server
 }
@@ -155,9 +155,10 @@ func (s *adminServer) isNotFoundError(err error) bool {
 func (s *adminServer) NewContextAndSessionForRPC(
 	ctx context.Context, args sql.SessionArgs,
 ) (context.Context, *sql.Session) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.server.AnnotateCtx(ctx)
 	session := sql.NewSession(
-		ctx, args, s.server.sqlExecutor, nil /* remote */, s.memMetrics, nil /* conn */)
+		ctx, args, s.server.sqlExecutor, s.memMetrics, nil /* conn */)
 	session.StartMonitor(&s.memMonitor, mon.BoundAccount{})
 	return ctx, session
 }
@@ -183,9 +184,7 @@ func (s *adminServer) Databases(
 			return nil, s.serverErrorf("type assertion failed on db name: %T", row[0])
 		}
 		dbName := string(dbDatum)
-		if !s.server.sqlExecutor.IsVirtualDatabase(dbName) {
-			resp.Databases = append(resp.Databases, dbName)
-		}
+		resp.Databases = append(resp.Databases, dbName)
 	}
 
 	return &resp, nil
@@ -201,10 +200,6 @@ func (s *adminServer) DatabaseDetails(
 	defer session.Finish(s.server.sqlExecutor)
 
 	escDBName := tree.NameStringP(&req.Database)
-	if err := s.assertNotVirtualSchema(escDBName); err != nil {
-		return nil, err
-	}
-
 	// Placeholders don't work with SHOW statements, so we need to manually
 	// escape the database name.
 	//
@@ -223,6 +218,7 @@ func (s *adminServer) DatabaseDetails(
 	var resp serverpb.DatabaseDetailsResponse
 	{
 		const (
+			schemaCol     = "Schema"
 			userCol       = "User"
 			privilegesCol = "Privileges"
 		)
@@ -230,6 +226,16 @@ func (s *adminServer) DatabaseDetails(
 		scanner := makeResultScanner(r.ResultList[0].Columns)
 		for i, nRows := 0, r.ResultList[0].Rows.Len(); i < nRows; i++ {
 			row := r.ResultList[0].Rows.At(i)
+
+			var schemaName string
+			if err := scanner.Scan(row, schemaCol, &schemaName); err != nil {
+				return nil, err
+			}
+			if schemaName != tree.PublicSchema {
+				// We only want to list real tables.
+				continue
+			}
+
 			// Marshal grant, splitting comma-separated privileges into a proper slice.
 			var grant serverpb.DatabaseDetailsResponse_Grant
 			var privileges string
@@ -300,10 +306,6 @@ func (s *adminServer) TableDetails(
 	defer session.Finish(s.server.sqlExecutor)
 
 	escDBName := tree.NameStringP(&req.Database)
-	if err := s.assertNotVirtualSchema(escDBName); err != nil {
-		return nil, err
-	}
-
 	// TODO(cdo): Use real placeholders for the table and database names when we've extended our SQL
 	// grammar to allow that.
 	escTableName := tree.NameStringP(&req.Table)
@@ -441,43 +443,15 @@ func (s *adminServer) TableDetails(
 		resp.CreateTableStatement = createStmt
 	}
 
-	// Get the number of ranges in the table. We get the key span for the table
-	// data. Then, we count the number of ranges that make up that key span.
-	{
-		var tableSpan roachpb.Span
-		if err := s.server.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			var err error
-			tableSpan, err = s.executor.GetTableSpan(
-				ctx, s.getUser(req), txn, req.Database, req.Table,
-			)
-			return err
-		}); err != nil {
-			return nil, s.serverError(err)
-		}
-		tableRSpan := roachpb.RSpan{}
-		var err error
-		tableRSpan.Key, err = keys.Addr(tableSpan.Key)
-		if err != nil {
-			return nil, s.serverError(err)
-		}
-		tableRSpan.EndKey, err = keys.Addr(tableSpan.EndKey)
-		if err != nil {
-			return nil, s.serverError(err)
-		}
-		rangeCount, err := s.server.distSender.CountRanges(ctx, tableRSpan)
-		if err != nil {
-			return nil, s.serverError(err)
-		}
-		resp.RangeCount = rangeCount
-	}
-
+	var tableID sqlbase.ID
 	// Query the descriptor ID and zone configuration for this table.
 	{
 		path, err := s.queryDescriptorIDPath(ctx, session, []string{req.Database, req.Table})
 		if err != nil {
 			return nil, s.serverError(err)
 		}
-		resp.DescriptorID = int64(path[2])
+		tableID = path[2]
+		resp.DescriptorID = int64(tableID)
 
 		id, zone, zoneExists, err := s.queryZonePath(ctx, session, path)
 		if err != nil {
@@ -499,29 +473,82 @@ func (s *adminServer) TableDetails(
 		}
 	}
 
+	// Get the number of ranges in the table. We get the key span for the table
+	// data. Then, we count the number of ranges that make up that key span.
+	{
+		tableSpan := generateTableSpan(tableID)
+		tableRSpan := roachpb.RSpan{}
+		var err error
+		tableRSpan.Key, err = keys.Addr(tableSpan.Key)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+		tableRSpan.EndKey, err = keys.Addr(tableSpan.EndKey)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+		rangeCount, err := s.server.distSender.CountRanges(ctx, tableRSpan)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+		resp.RangeCount = rangeCount
+	}
+
 	return &resp, nil
 }
 
-// TableStats is an endpoint that returns columns, indices, and other
-// relevant details for the specified table.
+// generateTableSpan generates a table's key span.
+//
+// NOTE: this doesn't make sense for interleaved (children) table. As of
+// 03/2018, callers around here use it anyway.
+func generateTableSpan(tableID sqlbase.ID) roachpb.Span {
+	tablePrefix := keys.MakeTablePrefix(uint32(tableID))
+	tableStartKey := roachpb.Key(tablePrefix)
+	tableEndKey := tableStartKey.PrefixEnd()
+	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}
+}
+
+// TableStats is an endpoint that returns disk usage and replication statistics
+// for the specified table.
 func (s *adminServer) TableStats(
 	ctx context.Context, req *serverpb.TableStatsRequest,
 ) (*serverpb.TableStatsResponse, error) {
-	escDBName := tree.NameStringP(&req.Database)
-	if err := s.assertNotVirtualSchema(escDBName); err != nil {
-		return nil, err
-	}
+	args := sql.SessionArgs{User: s.getUser(req)}
+	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
+	defer session.Finish(s.server.sqlExecutor)
 
 	// Get table span.
-	var tableSpan roachpb.Span
-	if err := s.server.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		var err error
-		tableSpan, err = s.executor.GetTableSpan(ctx, s.getUser(req), txn, req.Database, req.Table)
-		return err
-	}); err != nil {
+	path, err := s.queryDescriptorIDPath(ctx, session, []string{req.Database, req.Table})
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	tableID := path[2]
+	tableSpan := generateTableSpan(tableID)
 
+	return s.tableStatsForSpan(ctx, tableSpan)
+}
+
+// NonTableStats is an endpoint that returns disk usage and replication
+// statistics for the time series system.
+func (s *adminServer) NonTableStats(
+	ctx context.Context, req *serverpb.NonTableStatsRequest,
+) (*serverpb.NonTableStatsResponse, error) {
+	timeSeriesStats, err := s.tableStatsForSpan(ctx, roachpb.Span{
+		Key:    keys.TimeseriesPrefix,
+		EndKey: keys.TimeseriesPrefix.PrefixEnd(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	response := serverpb.NonTableStatsResponse{
+		TimeSeriesStats: timeSeriesStats,
+	}
+	return &response, nil
+}
+
+func (s *adminServer) tableStatsForSpan(
+	ctx context.Context, tableSpan roachpb.Span,
+) (*serverpb.TableStatsResponse, error) {
 	startKey, err := keys.Addr(tableSpan.Key)
 	if err != nil {
 		return nil, s.serverError(err)
@@ -721,10 +748,10 @@ func (s *adminServer) Events(
 			return nil, err
 		}
 		if event.EventType == string(sql.EventLogSetClusterSetting) {
-			if s.getUser(req) != security.RootUser {
-				// TODO(dt): unpack and selectively redact the setting value.
-				event.Info = ""
-			}
+
+			// TODO: `if s.getUser(req) != security.RootUser` when we have auth.
+
+			event.Info = redactSettingsChange(event.Info)
 		}
 		if err := scanner.ScanIndex(row, 5, &event.UniqueID); err != nil {
 			return nil, err
@@ -733,6 +760,20 @@ func (s *adminServer) Events(
 		resp.Events = append(resp.Events, event)
 	}
 	return &resp, nil
+}
+
+// make a best-effort attempt at redacting the setting value.
+func redactSettingsChange(info string) string {
+	var s sql.EventLogSetClusterSettingDetail
+	if err := json.Unmarshal([]byte(info), &s); err != nil {
+		return ""
+	}
+	s.Value = "<hidden>"
+	ret, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(ret)
 }
 
 // RangeLog is an endpoint that returns the latest range log entries.
@@ -747,6 +788,8 @@ func (s *adminServer) RangeLog(
 	if limit == 0 {
 		limit = defaultAPIEventLimit
 	}
+
+	includeRawKeys := debug.GatewayRemoteAllowed(ctx, s.server.ClusterSettings())
 
 	// Execute the query.
 	q := makeSQLQuery()
@@ -821,9 +864,17 @@ func (s *adminServer) RangeLog(
 				return nil, errors.Wrap(err, fmt.Sprintf("info didn't parse correctly: %s", info))
 			}
 			if event.Info.NewDesc != nil {
+				if !includeRawKeys {
+					event.Info.NewDesc.StartKey = nil
+					event.Info.NewDesc.EndKey = nil
+				}
 				prettyInfo.NewDesc = event.Info.NewDesc.String()
 			}
 			if event.Info.UpdatedDesc != nil {
+				if !includeRawKeys {
+					event.Info.UpdatedDesc.StartKey = nil
+					event.Info.UpdatedDesc.EndKey = nil
+				}
 				prettyInfo.UpdatedDesc = event.Info.UpdatedDesc.String()
 			}
 			if event.Info.AddedReplica != nil {
@@ -972,7 +1023,7 @@ func (s *adminServer) Settings(
 		}
 		resp.KeyValues[k] = serverpb.SettingsResponse_Value{
 			Type:        v.Typ(),
-			Value:       v.String(&s.server.st.SV),
+			Value:       settings.SanitizedValue(k, &s.server.st.SV),
 			Description: v.Description(),
 		}
 	}
@@ -992,13 +1043,8 @@ func (s *adminServer) Cluster(
 	// Check if enterprise features are enabled.  We currently test for the
 	// feature "BACKUP", although enterprise licenses do not yet distinguish
 	// between different features.
-	enterpriseEnabled := false
 	organization := sql.ClusterOrganization.Get(&s.server.st.SV)
-	if err := LicenseCheckFn(
-		s.server.st, clusterID, organization, "BACKUP",
-	); err == nil {
-		enterpriseEnabled = true
-	}
+	enterpriseEnabled := base.CheckEnterpriseEnabled(s.server.st, clusterID, organization, "BACKUP") == nil
 
 	return &serverpb.ClusterResponse{
 		ClusterID:         clusterID.String(),
@@ -1025,8 +1071,22 @@ func (s *adminServer) Health(
 func (s *adminServer) Liveness(
 	context.Context, *serverpb.LivenessRequest,
 ) (*serverpb.LivenessResponse, error) {
+	now := s.server.clock.PhysicalTime()
+	livenesses := s.server.nodeLiveness.GetLivenesses()
+
+	// Generate map from NodeID to LivenessStatus.
+	threshold := storage.TimeUntilStoreDead.Get(&s.server.st.SV)
+	maxOffset := s.server.clock.MaxOffset()
+	statusMap := make(map[roachpb.NodeID]storage.NodeLivenessStatus, len(livenesses))
+	for _, liveness := range livenesses {
+		statusMap[liveness.NodeID] = liveness.LivenessStatus(
+			now, threshold, maxOffset,
+		)
+	}
+
 	return &serverpb.LivenessResponse{
-		Livenesses: s.server.nodeLiveness.GetLivenesses(),
+		Livenesses: livenesses,
+		Statuses:   statusMap,
 	}, nil
 }
 
@@ -1618,13 +1678,4 @@ func (s *adminServer) queryDescriptorIDPath(
 		path = append(path, id)
 	}
 	return path, nil
-}
-
-// assertNotVirtualSchema checks if the provided database name corresponds to a
-// virtual schema, and if so, returns an error.
-func (s *adminServer) assertNotVirtualSchema(dbName string) error {
-	if s.server.sqlExecutor.IsVirtualDatabase(dbName) {
-		return status.Errorf(codes.InvalidArgument, "%q is a virtual schema", dbName)
-	}
-	return nil
 }

@@ -22,7 +22,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 
 	raven "github.com/getsentry/raven-go"
@@ -30,12 +29,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var (
+	// crashReportEnv controls the version reported in crash reports
+	crashReportEnv = "development"
+
 	// DiagnosticsReportingEnabled wraps "diagnostics.reporting.enabled".
 	//
 	// "diagnostics.reporting.enabled" enables reporting of metrics related to a
@@ -63,6 +67,13 @@ var (
 		true,
 	)
 
+	// PanicOnAssertions wraps "debug.panic_on_failed_assertions"
+	PanicOnAssertions = settings.RegisterBoolSetting(
+		"debug.panic_on_failed_assertions",
+		"panic when an assertion fails rather than reporting",
+		false,
+	)
+
 	// startTime records when the process started so that crash reports can
 	// include the server's uptime as an extra tag.
 	startTime = timeutil.Now()
@@ -87,6 +98,23 @@ func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 		// so ReportPanic should pop four frames.
 		ReportPanic(ctx, sv, r, 4)
 		panic(r)
+	}
+}
+
+// RecoverAndReportNonfatalPanic is an alternative RecoverAndReportPanic that
+// does not re-panic in Release builds.
+func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
+	if r := recover(); r != nil {
+		// The call stack here is usually:
+		// - ReportPanic
+		// - RecoverAndReport
+		// - panic.go
+		// - panic()
+		// so ReportPanic should pop four frames.
+		ReportPanic(ctx, sv, r, 4)
+		if !build.IsRelease() || PanicOnAssertions.Get(sv) {
+			panic(r)
+		}
 	}
 }
 
@@ -198,7 +226,7 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 
 var crashReportURL = func() string {
 	var defaultURL string
-	if build.IsRelease() {
+	if build.SeemsOfficial() {
 		defaultURL = "https://ignored:ignored@errors.cockroachdb.com/sentry"
 	}
 	return envutil.EnvOrDefaultString("COCKROACH_CRASH_REPORTS", defaultURL)
@@ -215,7 +243,7 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 	}
 	info := build.GetInfo()
 	raven.SetRelease(info.Tag)
-	raven.SetEnvironment(info.Type)
+	raven.SetEnvironment(crashReportEnv)
 	raven.SetTagsContext(map[string]string{
 		"cmd":          cmd,
 		"platform":     info.Platform,
@@ -259,19 +287,13 @@ func (e *safeError) Error() string {
 	return e.message
 }
 
-// redact returns a redacted version of the supplied item that is safe to use in
+// Redact returns a redacted version of the supplied item that is safe to use in
 // anonymized reporting.
-func redact(r interface{}) string {
+func Redact(r interface{}) string {
 	typAnd := func(i interface{}, text string) string {
-		type stackTracer interface {
-			StackTrace() errors.StackTrace
-		}
-		typ := fmt.Sprintf("%T", i)
-		if e, ok := i.(stackTracer); ok {
-			tr := e.StackTrace()
-			if len(tr) > 0 {
-				typ = fmt.Sprintf("%v", tr[0]) // prints file:line
-			}
+		typ := util.ErrorSource(i)
+		if typ == "" {
+			typ = fmt.Sprintf("%T", i)
 		}
 		if text == "" {
 			return typ
@@ -302,10 +324,10 @@ func redact(r interface{}) string {
 		switch t := r.(error).(type) {
 		case runtime.Error:
 			return typAnd(t, t.Error())
-		case syscall.Errno:
+		case sysutil.Errno:
 			return typAnd(t, t.Error())
 		case *os.SyscallError:
-			s := redact(t.Err)
+			s := Redact(t.Err)
 			return typAnd(t, fmt.Sprintf("%s: %s", t.Syscall, s))
 		case *os.PathError:
 			// It hardly matters, but avoid mutating the original.
@@ -347,12 +369,12 @@ func redact(r interface{}) string {
 	case interfaceCauser:
 		cause := c.Cause()
 		if cause != nil {
-			reportable += ": caused by " + redact(c.Cause())
+			reportable += ": caused by " + Redact(c.Cause())
 		}
 	case (interface {
 		Cause() error
 	}):
-		reportable += ": caused by " + redact(c.Cause())
+		reportable += ": caused by " + Redact(c.Cause())
 	}
 	return reportable
 }
@@ -374,7 +396,7 @@ func ReportablesToSafeError(depth int, format string, reportables []interface{})
 
 	redacted := make([]string, 0, len(reportables))
 	for i := range reportables {
-		redacted = append(redacted, redact(reportables[i]))
+		redacted = append(redacted, Redact(reportables[i]))
 	}
 	reportables = nil
 
@@ -432,6 +454,14 @@ func SendCrashReport(
 	tags := map[string]string{
 		"uptime": uptimeTag(timeutil.Now()),
 	}
+
+	for _, f := range tagFns {
+		v := f.value(ctx)
+		if v != "" {
+			tags[f.key] = maybeTruncate(v)
+		}
+	}
+
 	eventID, ch := raven.DefaultClient.Capture(packet, tags)
 	select {
 	case <-ch:
@@ -439,4 +469,43 @@ func SendCrashReport(
 	case <-time.After(10 * time.Second):
 		Shout(ctx, Severity_ERROR, "Time out trying to submit crash report")
 	}
+}
+
+// ReportOrPanic either reports an error to sentry, if run from a release
+// binary, or panics, if triggered in tests. This is intended to be used for
+// failing assertions which are recoverable but serious enough to report and to
+// cause tests to fail.
+//
+// Like SendCrashReport, the format string should not contain any sensitive
+// data, and unsafe reportables will be redacted before reporting.
+func ReportOrPanic(
+	ctx context.Context, sv *settings.Values, format string, reportables []interface{},
+) {
+	if !build.IsRelease() || PanicOnAssertions.Get(sv) {
+		panic(fmt.Sprintf(format, reportables...))
+	}
+	Warningf(ctx, format, reportables...)
+	SendCrashReport(ctx, sv, 1 /* depth */, format, reportables)
+}
+
+const maxTagLen = 500
+
+func maybeTruncate(tagValue string) string {
+	if len(tagValue) > maxTagLen {
+		return tagValue[:maxTagLen] + " [...]"
+	}
+	return tagValue
+}
+
+type tagFn struct {
+	key   string
+	value func(context.Context) string
+}
+
+var tagFns []tagFn
+
+// RegisterTagFn adds a function for tagging crash reports based on the context.
+// This is intended to be called by other packages at init time.
+func RegisterTagFn(key string, value func(context.Context) string) {
+	tagFns = append(tagFns, tagFn{key, value})
 }

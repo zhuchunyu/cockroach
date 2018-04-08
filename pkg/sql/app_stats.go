@@ -17,10 +17,12 @@ package sql
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
-	"strconv"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -29,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -119,7 +122,7 @@ func (a *appStats) recordStatement(
 		// Use the cached anonymized string.
 		key.stmt = stmt.AnonymizedStr
 	} else {
-		key.stmt = a.getStrForStmt(stmt)
+		key.stmt = anonymizeStmt(stmt)
 	}
 
 	// Get the statistics object.
@@ -130,6 +133,7 @@ func (a *appStats) recordStatement(
 	s.data.Count++
 	if err != nil {
 		s.data.LastErr = err.Error()
+		s.data.LastErrRedacted = log.Redact(err)
 	}
 	if automaticRetryCount == 0 {
 		s.data.FirstAttemptCount++
@@ -159,18 +163,19 @@ func (a *appStats) getStatsForStmt(key stmtKey) *stmtStats {
 	return s
 }
 
-func (a *appStats) getStrForStmt(stmt Statement) string {
+func anonymizeStmt(stmt Statement) string {
 	return tree.AsStringWithFlags(stmt.AST, tree.FmtHideConstants)
 }
 
 // sqlStats carries per-application statistics for all applications on
-// each node. It hangs off Executor.
+// each node.
 type sqlStats struct {
 	st *cluster.Settings
 	syncutil.Mutex
 
-	// apps is the container for all the per-application statistics
-	// objects.
+	// lastReset is the time at which the app containers were reset.
+	lastReset time.Time
+	// apps is the container for all the per-application statistics objects.
 	apps map[string]*appStats
 }
 
@@ -221,6 +226,7 @@ func (s *sqlStats) resetStats(ctx context.Context) {
 		a.stmts = make(map[stmtKey]*stmtStats, len(a.stmts)/2)
 		a.Unlock()
 	}
+	s.lastReset = timeutil.Now()
 	s.Unlock()
 }
 
@@ -265,9 +271,12 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 				ctx.WriteByte('_')
 				return
 			}
-			// Virtual table: we want to keep the name.
+			// Virtual table: we want to keep the name; however
+			// we need to scrub the database name prefix.
+			newTn := *tn
+			newTn.CatalogName = "_"
 			keepNameCtx := ctx.CopyWithFlags(tree.FmtParsable)
-			keepNameCtx.FormatNode(tn)
+			keepNameCtx.FormatNode(&newTn)
 		})
 	f.FormatNode(stmt)
 	return f.CloseAndGetString(), true
@@ -277,15 +286,22 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 // queries scrubbed of their identifiers. Any statements which cannot be
 // scrubbed will be omitted from the returned map.
 func (e *Executor) GetScrubbedStmtStats() []roachpb.CollectedStatementStatistics {
+	return e.sqlStats.getScrubbedStmtStats(e.cfg.VirtualSchemas)
+}
+
+func (s *sqlStats) getScrubbedStmtStats(
+	vt *VirtualSchemaHolder,
+) []roachpb.CollectedStatementStatistics {
+	s.Lock()
+	defer s.Unlock()
 	var ret []roachpb.CollectedStatementStatistics
-	vt := e.cfg.VirtualSchemas
-	e.sqlStats.Lock()
-	for appName, a := range e.sqlStats.apps {
+	salt := ClusterSecret.Get(&s.st.SV)
+	for appName, a := range s.apps {
 		if cap(ret) == 0 {
-			// guesitmate that we'll need apps*(queries-per-app).
-			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(e.sqlStats.apps))
+			// guesstimate that we'll need apps*(queries-per-app).
+			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(s.apps))
 		}
-		hashedApp := HashAppName(appName)
+		hashedAppName := HashForReporting(salt, appName)
 		a.Lock()
 		for q, stats := range a.stmts {
 			scrubbed, ok := scrubStmtStatKey(vt, q.stmt)
@@ -294,19 +310,15 @@ func (e *Executor) GetScrubbedStmtStats() []roachpb.CollectedStatementStatistics
 					Query:   scrubbed,
 					DistSQL: q.distSQLUsed,
 					Failed:  q.failed,
-					App:     hashedApp,
+					App:     hashedAppName,
 				}
 				stats.Lock()
 				data := stats.data
 				stats.Unlock()
 
 				if data.LastErr != "" {
-					// Unfortunately by this point we just have an opaque string and must
-					// assume it could contain anything and is thus not suitable for
-					// inclusion in for diagnostic reporting. If/when we kept the original
-					// error around, we could do some smarter redacting or classification,
-					// or we could do that upstream and keep a "clean" string for
-					// diagnostic reporting, rather than this blunt scrub.
+					// We have a redacted version in lastErrRedacted -- this one is not ok
+					// to report as-in though.
 					data.LastErr = "scrubbed"
 				}
 				ret = append(ret, roachpb.CollectedStatementStatistics{Key: k, Stats: data})
@@ -314,18 +326,26 @@ func (e *Executor) GetScrubbedStmtStats() []roachpb.CollectedStatementStatistics
 		}
 		a.Unlock()
 	}
-	e.sqlStats.Unlock()
 	return ret
 }
 
-// HashAppName 1-way hashes an application names for use in stat reporting.
-func HashAppName(appName string) string {
-	hash := fnv.New64a()
+// FailedHashedValue is used as a default return value for when HashForReporting
+// cannot hash a value correctly.
+const FailedHashedValue = "unknown"
 
+// HashForReporting 1-way hashes values for use in stat reporting. The secret
+// should be the cluster.secret setting.
+func HashForReporting(secret, appName string) string {
+	// If no secret is provided, we cannot irreversibly hash the value, so return
+	// a default value.
+	if len(secret) == 0 {
+		return FailedHashedValue
+	}
+	hash := hmac.New(sha256.New, []byte(secret))
 	if _, err := hash.Write([]byte(appName)); err != nil {
 		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
-	return strconv.Itoa(int(hash.Sum64()))
+	return hex.EncodeToString(hash.Sum(nil)[:4])
 }
 
 // ResetStatementStats resets the executor's collected statement statistics.
@@ -333,31 +353,31 @@ func (e *Executor) ResetStatementStats(ctx context.Context) {
 	e.sqlStats.resetStats(ctx)
 }
 
-// FillUnimplementedErrorCounts fills the passed map with the executor's current
+// LasStatementStatReset returns the time the stmt stats were last rest.
+func (e *Executor) LasStatementStatReset() time.Time {
+	e.sqlStats.Lock()
+	last := e.sqlStats.lastReset
+	e.sqlStats.Unlock()
+	return last
+}
+
+// FillErrorCounts fills the passed map with the executor's current
 // counts of how often individual unimplemented features have been encountered.
-func (e *Executor) FillUnimplementedErrorCounts(fill map[string]int64) {
-	e.unimplementedErrors.Lock()
-	for k, v := range e.unimplementedErrors.counts {
-		fill[k] = v
+func (e *Executor) FillErrorCounts(codes, unimplemented map[string]int64) {
+	e.errorCounts.Lock()
+	for k, v := range e.errorCounts.codes {
+		codes[k] = v
 	}
-	e.unimplementedErrors.Unlock()
+	for k, v := range e.errorCounts.unimplemented {
+		unimplemented[k] = v
+	}
+	e.errorCounts.Unlock()
 }
 
-func (e *Executor) recordUnimplementedFeature(feature string) {
-	if feature == "" {
-		return
-	}
-	e.unimplementedErrors.Lock()
-	if e.unimplementedErrors.counts == nil {
-		e.unimplementedErrors.counts = make(map[string]int64)
-	}
-	e.unimplementedErrors.counts[feature]++
-	e.unimplementedErrors.Unlock()
-}
-
-// ResetUnimplementedCounts resets counting of unimplemented errors.
-func (e *Executor) ResetUnimplementedCounts() {
-	e.unimplementedErrors.Lock()
-	e.unimplementedErrors.counts = make(map[string]int64, len(e.unimplementedErrors.counts))
-	e.unimplementedErrors.Unlock()
+// ResetErrorCounts resets counts of errors returned.
+func (e *Executor) ResetErrorCounts() {
+	e.errorCounts.Lock()
+	e.errorCounts.codes = make(map[string]int64, len(e.errorCounts.codes))
+	e.errorCounts.unimplemented = make(map[string]int64, len(e.errorCounts.unimplemented))
+	e.errorCounts.Unlock()
 }

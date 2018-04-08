@@ -35,9 +35,11 @@ type TableLookupsByID map[ID]TableLookup
 // TableLookup is the value type of TableLookupsByID: An optional table
 // descriptor, populated when the table is public/leasable, and an IsAdding
 // flag.
+// This also includes an optional CheckHelper for the table.
 type TableLookup struct {
-	Table    *TableDescriptor
-	IsAdding bool
+	Table       *TableDescriptor
+	IsAdding    bool
+	CheckHelper *CheckHelper
 }
 
 // TableLookupFunction is the function type used by TablesNeededForFKs that will
@@ -83,6 +85,16 @@ type tableLookupQueue struct {
 	tableLookups   TableLookupsByID
 	lookup         TableLookupFunction
 	checkPrivilege CheckPrivilegeFunction
+	analyzeExpr    AnalyzeExprFunction
+}
+
+func (tl *TableLookup) addCheckHelper(ctx context.Context, analyzeExpr AnalyzeExprFunction) error {
+	if analyzeExpr == nil {
+		return nil
+	}
+	tableName := tree.MakeUnqualifiedTableName(tree.Name(tl.Table.Name))
+	tl.CheckHelper = &CheckHelper{}
+	return tl.CheckHelper.Init(ctx, analyzeExpr, &tableName, tl.Table)
 }
 
 func (q *tableLookupQueue) getTable(ctx context.Context, tableID ID) (TableLookup, error) {
@@ -95,6 +107,9 @@ func (q *tableLookupQueue) getTable(ctx context.Context, tableID ID) (TableLooku
 	}
 	if !tableLookup.IsAdding && tableLookup.Table != nil {
 		if err := q.checkPrivilege(ctx, tableLookup.Table, privilege.SELECT); err != nil {
+			return TableLookup{}, err
+		}
+		if err := tableLookup.addCheckHelper(ctx, q.analyzeExpr); err != nil {
 			return TableLookup{}, err
 		}
 	}
@@ -153,22 +168,32 @@ func (q *tableLookupQueue) dequeue() (TableLookup, FKCheck, bool) {
 // TablesNeededForFKs populates a map of TableLookupsByID for all the
 // TableDescriptors that might be needed when performing FK checking for delete
 // and/or insert operations. It uses the passed in lookup function to perform
-// the actual lookup.
+// the actual lookup. The AnalyzeExpr function, if provided, is used to
+// initialize the CheckHelper, and this requires that the TableLookupFunction
+// and CheckPrivilegeFunction are provided and not just placeholder functions
+// as well. If an operation may include a cascading operation then the
+// CheckHelpers are required.
 func TablesNeededForFKs(
 	ctx context.Context,
 	table TableDescriptor,
 	usage FKCheck,
 	lookup TableLookupFunction,
 	checkPrivilege CheckPrivilegeFunction,
+	analyzeExpr AnalyzeExprFunction,
 ) (TableLookupsByID, error) {
 	queue := tableLookupQueue{
 		tableLookups:   make(TableLookupsByID),
 		alreadyChecked: make(map[ID]map[FKCheck]struct{}),
 		lookup:         lookup,
 		checkPrivilege: checkPrivilege,
+		analyzeExpr:    analyzeExpr,
 	}
 	// Add the passed in table descriptor to the table lookup.
-	queue.tableLookups[table.ID] = TableLookup{Table: &table}
+	baseTableLookup := TableLookup{Table: &table}
+	if err := baseTableLookup.addCheckHelper(ctx, analyzeExpr); err != nil {
+		return nil, err
+	}
+	queue.tableLookups[table.ID] = baseTableLookup
 	if err := queue.enqueue(ctx, table.ID, usage); err != nil {
 		return nil, err
 	}
@@ -241,24 +266,24 @@ func TablesNeededForFKs(
 	}
 }
 
-// spanKVFetcher is an kvFetcher that returns a set slice of kvs.
-type spanKVFetcher struct {
-	kvs []roachpb.KeyValue
+// SpanKVFetcher is an kvFetcher that returns a set slice of kvs.
+type SpanKVFetcher struct {
+	KVs []roachpb.KeyValue
 }
 
-// nextKV implements the kvFetcher interface.
-func (f *spanKVFetcher) nextKV(ctx context.Context) (bool, roachpb.KeyValue, error) {
-	if len(f.kvs) == 0 {
-		return false, roachpb.KeyValue{}, nil
+// nextBatch implements the kvFetcher interface.
+func (f *SpanKVFetcher) nextBatch(_ context.Context) (bool, []roachpb.KeyValue, error) {
+	if len(f.KVs) == 0 {
+		return false, nil, nil
 	}
-	kv := f.kvs[0]
-	f.kvs = f.kvs[1:]
-	return true, kv, nil
+	res := f.KVs
+	f.KVs = nil
+	return true, res, nil
 }
 
 // getRangesInfo implements the kvFetcher interface.
-func (f *spanKVFetcher) getRangesInfo() []roachpb.RangeInfo {
-	panic("getRangesInfo() called on spanKVFetcher")
+func (f *SpanKVFetcher) getRangesInfo() []roachpb.RangeInfo {
+	panic("getRangesInfo() called on SpanKVFetcher")
 }
 
 // fkBatchChecker accumulates foreign key checks and sends them out as a single
@@ -310,10 +335,10 @@ func (f *fkBatchChecker) runCheck(
 		return err.GoError()
 	}
 
-	fetcher := spanKVFetcher{}
+	fetcher := SpanKVFetcher{}
 	for i, resp := range br.Responses {
 		fk := f.batchIdxToFk[i]
-		fetcher.kvs = resp.GetInner().(*roachpb.ScanResponse).Rows
+		fetcher.KVs = resp.GetInner().(*roachpb.ScanResponse).Rows
 		if err := fk.rf.StartScanFrom(ctx, &fetcher); err != nil {
 			return err
 		}
@@ -327,8 +352,8 @@ func (f *fkBatchChecker) runCheck(
 					fkValues[valueIdx] = newRow[fk.ids[colID]]
 				}
 				return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-					"foreign key violation: value %s not found in %s@%s %s",
-					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen])
+					"foreign key violation: value %s not found in %s@%s %s (txn=%s)",
+					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen], f.txn.Proto())
 			}
 		case CheckDeletes:
 			// If we're deleting, then there's a violation if the scan found something.
@@ -543,8 +568,10 @@ func makeFKUpdateHelper(
 	return ret, err
 }
 
-func (fks fkUpdateHelper) addCheckForIndex(indexID IndexID) {
-	fks.indexIDsToCheck[indexID] = struct{}{}
+func (fks fkUpdateHelper) addCheckForIndex(indexID IndexID, descriptorType IndexDescriptor_Type) {
+	if descriptorType == IndexDescriptor_FORWARD {
+		fks.indexIDsToCheck[indexID] = struct{}{}
+	}
 }
 
 func (fks fkUpdateHelper) runIndexChecks(

@@ -21,7 +21,6 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -40,21 +39,16 @@ var tableInserterPool = sync.Pool{
 	},
 }
 
-var tableUpserterPool = sync.Pool{
-	New: func() interface{} {
-		return &tableUpserter{}
-	},
-}
-
 type insertNode struct {
 	// The following fields are populated during makePlan.
 	editNodeBase
 	defaultExprs []tree.TypedExpr
-	n            *tree.Insert
-	checkHelper  checkHelper
+	computeExprs []tree.TypedExpr
+	checkHelper  *sqlbase.CheckHelper
 
-	insertCols []sqlbase.ColumnDescriptor
-	tw         tableWriter
+	insertCols   []sqlbase.ColumnDescriptor
+	computedCols []sqlbase.ColumnDescriptor
+	tw           tableInserter
 
 	run insertRun
 
@@ -87,15 +81,9 @@ func (p *planner) Insert(
 	if err != nil {
 		return nil, err
 	}
-	isUpsertReturning := false
-	if n.OnConflict != nil {
-		if !n.OnConflict.DoNothing {
-			if err := p.CheckPrivilege(ctx, en.tableDesc, privilege.UPDATE); err != nil {
-				return nil, err
-			}
-		}
-		if _, ok := n.Returning.(*tree.ReturningExprs); ok {
-			isUpsertReturning = true
+	if n.OnConflict != nil && !n.OnConflict.DoNothing {
+		if err := p.CheckPrivilege(ctx, en.tableDesc, privilege.UPDATE); err != nil {
+			return nil, err
 		}
 	}
 
@@ -105,14 +93,40 @@ func (p *planner) Insert(
 		cols = en.tableDesc.Columns
 	} else {
 		var err error
-		if cols, err = p.processColumns(en.tableDesc, n.Columns); err != nil {
+		if cols, err = p.processColumns(en.tableDesc, n.Columns,
+			true /* ensureColumns */, false /* allowMutations */); err != nil {
 			return nil, err
 		}
 	}
+
+	// maxInsertIdx is the highest column index we are allowed to insert into -
+	// in the presence of computed columns, when we don't explicitly specify the
+	// columns we're inserting into, we should allow inserts if and only if they
+	// don't touch a computed column, and we only have the ordinal positions to
+	// go by.
+	maxInsertIdx := len(cols)
+	for i, col := range cols {
+		if col.IsComputed() {
+			maxInsertIdx = i
+			break
+		}
+	}
+
 	// Number of columns expecting an input. This doesn't include the
-	// columns receiving a default value.
+	// columns receiving a default value, or computed columns.
 	numInputColumns := len(cols)
 
+	// We update the set of columns being inserted into with any computed columns.
+	cols, computedCols, computeExprs, err :=
+		ProcessComputedColumns(ctx, cols, tn, en.tableDesc, &p.txCtx, p.EvalContext())
+	if err != nil {
+		return nil, err
+	}
+
+	// We update the set of columns being inserted into with any default values
+	// for columns. This needs to happen after we process the computed columns,
+	// because `defaultExprs` is expected to line up with the final set of
+	// columns being inserted into.
 	cols, defaultExprs, err :=
 		sqlbase.ProcessDefaultColumns(cols, en.tableDesc, &p.txCtx, p.EvalContext())
 	if err != nil {
@@ -134,6 +148,9 @@ func (p *planner) Insert(
 				numExprs := len(values.Tuples[0].Exprs)
 				if err := checkNumExprs(numExprs, numInputColumns, n.Columns != nil); err != nil {
 					return nil, err
+				}
+				if numExprs > maxInsertIdx {
+					return nil, cannotWriteToComputedColError(cols[maxInsertIdx])
 				}
 			}
 			src, err = fillDefaults(defaultExprs, cols, values)
@@ -165,10 +182,24 @@ func (p *planner) Insert(
 		if err := checkNumExprs(numExprs, numInputColumns, n.Columns != nil); err != nil {
 			return nil, err
 		}
+		if numExprs > maxInsertIdx {
+			return nil, cannotWriteToComputedColError(cols[maxInsertIdx])
+		}
 	}
 
+	var fkCheckType sqlbase.FKCheck
+	if n.OnConflict == nil || n.OnConflict.DoNothing {
+		fkCheckType = sqlbase.CheckInserts
+	} else {
+		fkCheckType = sqlbase.CheckUpdates
+	}
 	fkTables, err := sqlbase.TablesNeededForFKs(
-		ctx, *en.tableDesc, sqlbase.CheckInserts, p.lookupFKTable, p.CheckPrivilege,
+		ctx,
+		*en.tableDesc,
+		fkCheckType,
+		p.lookupFKTable,
+		p.CheckPrivilege,
+		p.analyzeExpr,
 	)
 	if err != nil {
 		return nil, err
@@ -179,97 +210,46 @@ func (p *planner) Insert(
 		return nil, err
 	}
 
-	var tw tableWriter
-	if n.OnConflict == nil {
-		ti := tableInserterPool.Get().(*tableInserter)
-		*ti = tableInserter{ri: ri}
-		tw = ti
-	} else {
-		updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.InsertCols)
-		if err != nil {
-			return nil, err
-		}
-
-		if n.OnConflict.DoNothing {
-			// TODO(dan): Postgres allows ON CONFLICT DO NOTHING without specifying a
-			// conflict index, which means do nothing on any conflict. Support this if
-			// someone needs it.
-			tu := tableUpserterPool.Get().(*tableUpserter)
-			*tu = tableUpserter{
-				ri:            ri,
-				conflictIndex: *conflictIndex,
-				alloc:         &p.alloc,
-				collectRows:   isUpsertReturning,
-			}
-			tw = tu
-		} else {
-			names, err := p.namesForExprs(updateExprs)
-			if err != nil {
-				return nil, err
-			}
-			// Also include columns that are inactive because they should be
-			// updated.
-			updateCols := make([]sqlbase.ColumnDescriptor, len(names))
-			for i, n := range names {
-				c, err := n.NormalizeUnqualifiedColumnItem()
-				if err != nil {
-					return nil, err
-				}
-
-				col, _, err := en.tableDesc.FindColumnByName(c.ColumnName)
-				if err != nil {
-					return nil, err
-				}
-				updateCols[i] = col
-			}
-
-			helper, err := p.makeUpsertHelper(
-				ctx, tn, en.tableDesc, ri.InsertCols, updateCols, updateExprs, conflictIndex, n.OnConflict.Where,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			fkTables, err := sqlbase.TablesNeededForFKs(
-				ctx, *en.tableDesc, sqlbase.CheckUpdates, p.lookupFKTable, p.CheckPrivilege,
-			)
-			if err != nil {
-				return nil, err
-			}
-			tu := tableUpserterPool.Get().(*tableUpserter)
-			*tu = tableUpserter{
-				ri:            ri,
-				alloc:         &p.alloc,
-				collectRows:   isUpsertReturning,
-				fkTables:      fkTables,
-				updateCols:    updateCols,
-				conflictIndex: *conflictIndex,
-				evaler:        helper,
-				isUpsertAlias: n.OnConflict.IsUpsertAlias(),
-			}
-			tw = tu
-		}
+	if n.OnConflict != nil {
+		return p.newUpsertNode(
+			ctx, n, en, ri, tn, alias, rows,
+			defaultExprs, computeExprs, computedCols, fkTables, desiredTypes)
 	}
+	return newInsertNode(
+		ctx, n, en, ri, alias, rows, defaultExprs, computeExprs, computedCols,
+		fkTables[en.tableDesc.ID].CheckHelper, desiredTypes)
+}
 
+func newInsertNode(
+	ctx context.Context,
+	n *tree.Insert,
+	en editNodeBase,
+	ri sqlbase.RowInserter,
+	alias *tree.TableName,
+	rows planNode,
+	defaultExprs []tree.TypedExpr,
+	computeExprs []tree.TypedExpr,
+	computedCols []sqlbase.ColumnDescriptor,
+	checkHelper *sqlbase.CheckHelper,
+	desiredTypes []types.T,
+) (planNode, error) {
 	in := insertNodePool.Get().(*insertNode)
 	*in = insertNode{
-		n:            n,
 		editNodeBase: en,
 		defaultExprs: defaultExprs,
+		computeExprs: computeExprs,
 		insertCols:   ri.InsertCols,
-		tw:           tw,
+		computedCols: computedCols,
+		tw:           tableInserter{ri: ri},
 		run: insertRun{
 			insertColIDtoRowIndex: ri.InsertColIDtoRowIndex,
-			isUpsertReturning:     isUpsertReturning,
 		},
-	}
-
-	if err := in.checkHelper.init(ctx, p, tn, en.tableDesc); err != nil {
-		return nil, err
+		checkHelper: checkHelper,
 	}
 
 	if err := in.run.initEditNode(
-		ctx, &in.editNodeBase, rows, in.tw, alias, n.Returning, desiredTypes); err != nil {
+		ctx, &in.editNodeBase, rows, &in.tw, alias, n.Returning, desiredTypes); err != nil {
+		in.Close(ctx)
 		return nil, err
 	}
 
@@ -281,14 +261,10 @@ type insertRun struct {
 	// The following fields are populated during Start().
 	editNodeRun
 
-	isUpsertReturning     bool
 	insertColIDtoRowIndex map[sqlbase.ColumnID]int
 
 	rowIdxToRetIdx []int
 	rowTemplate    tree.Datums
-
-	doneUpserting bool
-	rowsUpserted  *sqlbase.RowContainer
 }
 
 func (n *insertNode) startExec(params runParams) error {
@@ -323,97 +299,42 @@ func (n *insertNode) startExec(params runParams) error {
 	return n.run.tw.init(params.p.txn, params.EvalContext())
 }
 
-func (n *insertNode) Next(params runParams) (bool, error) {
-	if n.run.isUpsertReturning {
-		return n.drain(params)
-	}
-
-	return n.internalNext(params)
-}
+// requireSpool implements the planNodeRequireSpool interface.
+func (n *insertNode) requireSpool() {}
 
 func (n *insertNode) Close(ctx context.Context) {
 	n.tw.close(ctx)
-	n.run.rows.Close(ctx)
-	n.run.rows = nil
-	if n.run.rowsUpserted != nil {
-		n.run.rowsUpserted.Close(ctx)
-		n.run.rowsUpserted = nil
-	}
-	switch t := n.tw.(type) {
-	case *tableInserter:
-		*t = tableInserter{}
-		tableInserterPool.Put(t)
-	case *tableUpserter:
-		*t = tableUpserter{}
-		tableUpserterPool.Put(t)
+	if n.run.rows != nil {
+		n.run.rows.Close(ctx)
 	}
 	*n = insertNode{}
 	insertNodePool.Put(n)
 }
 
 func (n *insertNode) Values() tree.Datums {
-	if !n.run.isUpsertReturning {
-		return n.run.resultRow
-	}
-
-	row := n.run.rowsUpserted.At(0)
-	n.run.rowsUpserted.PopFirst()
-	return row
+	return n.run.resultRow
 }
 
-// Because TableUpserter batches the upserts, we need to completely drain the
-// source and handle all the rows before returning from the first call to Next,
-// so that we can return an upserted row from each call to Values.
-func (n *insertNode) drain(params runParams) (bool, error) {
-	for !n.run.doneUpserting {
-		_, err := n.internalNext(params)
+func (n *insertNode) Next(params runParams) (bool, error) {
+	if err := params.p.cancelChecker.Check(); err != nil {
+		return false, err
+	}
+	if next, err := n.run.rows.Next(params); !next {
 		if err != nil {
 			return false, err
 		}
-	}
-	hasRows := n.run.rowsUpserted.Len() > 0
-	return hasRows, nil
-}
-
-func (n *insertNode) internalNext(params runParams) (bool, error) {
-	if next, err := n.run.rows.Next(params); !next {
-		if err == nil {
-			if err := params.p.cancelChecker.Check(); err != nil {
-				return false, err
-			}
-			// We're done. Finish the batch.
-			rows, err := n.tw.finalize(
-				params.ctx, n.autoCommit, params.extendedEvalCtx.Tracing.KVTracingEnabled())
-			if err != nil {
-				return false, err
-			}
-
-			if n.run.isUpsertReturning {
-				n.run.rowsUpserted = sqlbase.NewRowContainer(
-					params.EvalContext().Mon.MakeBoundAccount(),
-					sqlbase.ColTypeInfoFromResCols(n.rh.columns),
-					rows.Len(),
-				)
-				for i := 0; i < rows.Len(); i++ {
-					cooked, err := n.rh.cookResultRow(rows.At(i))
-					if err != nil {
-						return false, err
-					}
-					_, err = n.run.rowsUpserted.AddRow(params.ctx, cooked)
-					if err != nil {
-						return false, err
-					}
-				}
-				n.run.doneUpserting = true
-			}
-		}
+		// We're done. Finish the batch.
+		_, err := n.tw.finalize(
+			params.ctx, n.autoCommit, params.extendedEvalCtx.Tracing.KVTracingEnabled())
 		return false, err
 	}
 
 	rowVals, err := GenerateInsertRow(
 		n.defaultExprs,
+		n.computeExprs,
 		n.run.insertColIDtoRowIndex,
 		n.insertCols,
+		n.computedCols,
 		*params.EvalContext(),
 		n.tableDesc,
 		n.run.rows.Values(),
@@ -422,10 +343,10 @@ func (n *insertNode) internalNext(params runParams) (bool, error) {
 		return false, err
 	}
 
-	if err := n.checkHelper.loadRow(n.run.insertColIDtoRowIndex, rowVals, false); err != nil {
+	if err := n.checkHelper.LoadRow(n.run.insertColIDtoRowIndex, rowVals, false); err != nil {
 		return false, err
 	}
-	if err := n.checkHelper.check(params.EvalContext()); err != nil {
+	if err := n.checkHelper.Check(params.EvalContext()); err != nil {
 		return false, err
 	}
 
@@ -434,12 +355,9 @@ func (n *insertNode) internalNext(params runParams) (bool, error) {
 		return false, err
 	}
 
-	// Handle regular INSERT ... RETURNING without ON CONFLICT clause
-	if !n.run.isUpsertReturning {
+	if n.run.rowTemplate != nil {
 		for i, val := range rowVals {
-			if n.run.rowTemplate != nil {
-				n.run.rowTemplate[n.run.rowIdxToRetIdx[i]] = val
-			}
+			n.run.rowTemplate[n.run.rowIdxToRetIdx[i]] = val
 		}
 
 		resultRow, err := n.rh.cookResultRow(n.run.rowTemplate)
@@ -452,12 +370,37 @@ func (n *insertNode) internalNext(params runParams) (bool, error) {
 	return true, nil
 }
 
+// rowIndexedVarContainer is used to evaluate expressions over various rows.
+type rowIndexedVarContainer struct {
+	curSourceRow tree.Datums
+	// Because the rows we have might not be permuted in the same way as the
+	// original table, we need to store a mapping between them.
+	cols    []sqlbase.ColumnDescriptor
+	mapping map[sqlbase.ColumnID]int
+}
+
+func (r *rowIndexedVarContainer) IndexedVarEval(
+	idx int, ctx *tree.EvalContext,
+) (tree.Datum, error) {
+	return r.curSourceRow[r.mapping[r.cols[idx].ID]], nil
+}
+
+func (r *rowIndexedVarContainer) IndexedVarResolvedType(idx int) types.T {
+	panic("unsupported")
+}
+
+func (*rowIndexedVarContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
+	return nil
+}
+
 // GenerateInsertRow prepares a row tuple for insertion. It fills in default
 // expressions, verifies non-nullable columns, and checks column widths.
 func GenerateInsertRow(
 	defaultExprs []tree.TypedExpr,
+	computeExprs []tree.TypedExpr,
 	insertColIDtoRowIndex map[sqlbase.ColumnID]int,
 	insertCols []sqlbase.ColumnDescriptor,
+	computedCols []sqlbase.ColumnDescriptor,
 	evalCtx tree.EvalContext,
 	tableDesc *sqlbase.TableDescriptor,
 	rowVals tree.Datums,
@@ -486,6 +429,27 @@ func GenerateInsertRow(
 		}
 	}
 
+	if len(computeExprs) > 0 {
+		// Evaluate any computed columns. Since these obviously can reference other
+		// columns, we need an IVarContainer to be able to resolve column references.
+		iv := &rowIndexedVarContainer{rowVals, tableDesc.Columns, insertColIDtoRowIndex}
+		evalCtx.PushIVarContainer(iv)
+
+		for i := range computedCols {
+			// Note that even though the row is not fully constructed at this point,
+			// since we disallow computed columns from referencing other computed
+			// columns, all the columns which could possibly be referenced *are*
+			// available.
+			d, err := computeExprs[i].Eval(&evalCtx)
+			if err != nil {
+				return nil, err
+			}
+			rowVals[insertColIDtoRowIndex[computedCols[i].ID]] = d
+		}
+
+		evalCtx.PopIVarContainer()
+	}
+
 	// Check to see if NULL is being inserted into any non-nullable column.
 	for _, col := range tableDesc.Columns {
 		if !col.Nullable {
@@ -504,37 +468,42 @@ func GenerateInsertRow(
 	return rowVals, nil
 }
 
+// processColumns returns the column descriptors identified by the
+// given name list. It also checks that a given column name is only
+// listed once. If no column names are given (special case for INSERT)
+// and ensureColumns is set, the descriptors for all visible columns
+// are returned. If allowMutations is set, even columns undergoing
+// mutations are added.
 func (p *planner) processColumns(
-	tableDesc *sqlbase.TableDescriptor, node tree.UnresolvedNames,
+	tableDesc *sqlbase.TableDescriptor, nameList tree.NameList, ensureColumns, allowMutations bool,
 ) ([]sqlbase.ColumnDescriptor, error) {
-	if node == nil {
-		// VisibleColumns is used here to prevent INSERT INTO <table> VALUES (...)
-		// (as opposed to INSERT INTO <table> (...) VALUES (...)) from writing
-		// hidden columns. At present, the only hidden column is the implicit rowid
-		// primary key column.
-		return tableDesc.VisibleColumns(), nil
+	if len(nameList) == 0 {
+		if ensureColumns {
+			// VisibleColumns is used here to prevent INSERT INTO <table> VALUES (...)
+			// (as opposed to INSERT INTO <table> (...) VALUES (...)) from writing
+			// hidden columns. At present, the only hidden column is the implicit rowid
+			// primary key column.
+			return tableDesc.VisibleColumns(), nil
+		}
+		return nil, nil
 	}
 
-	cols := make([]sqlbase.ColumnDescriptor, len(node))
-	colIDSet := make(map[sqlbase.ColumnID]struct{}, len(node))
-	for i := range node {
-		c, err := node[i].NormalizeUnqualifiedColumnItem()
-		if err != nil {
-			return nil, err
+	cols := make([]sqlbase.ColumnDescriptor, len(nameList))
+	colIDSet := make(map[sqlbase.ColumnID]struct{}, len(nameList))
+	for i, colName := range nameList {
+		var col sqlbase.ColumnDescriptor
+		var err error
+		if allowMutations {
+			col, _, err = tableDesc.FindColumnByName(colName)
+		} else {
+			col, err = tableDesc.FindActiveColumnByName(string(colName))
 		}
-
-		if len(c.Selector) > 0 {
-			return nil, pgerror.UnimplementedWithIssueErrorf(8318,
-				"compound types not supported yet: %q", &node[i])
-		}
-
-		col, err := tableDesc.FindActiveColumnByName(string(c.ColumnName))
 		if err != nil {
 			return nil, err
 		}
 
 		if _, ok := colIDSet[col.ID]; ok {
-			return nil, fmt.Errorf("multiple assignments to the same column %q", &node[i])
+			return nil, fmt.Errorf("multiple assignments to the same column %q", &nameList[i])
 		}
 		colIDSet[col.ID] = struct{}{}
 		cols[i] = col
@@ -669,10 +638,6 @@ func checkNumExprs(numExprs, numCols int, specifiedTargets bool) error {
 			more, less, numExprs, numCols)
 	}
 	return nil
-}
-
-func (n *insertNode) isUpsert() bool {
-	return n.n.OnConflict != nil
 }
 
 // enableAutoCommit is part of the autoCommitNode interface.

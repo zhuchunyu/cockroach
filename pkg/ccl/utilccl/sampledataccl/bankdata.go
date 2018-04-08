@@ -21,7 +21,8 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -29,9 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/workload"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/workload"
 )
 
 // ToBackup creates an enterprise backup in `dir`.
@@ -53,14 +54,16 @@ func toBackup(t testing.TB, data workload.Table, dir string, chunkBytes int64) (
 
 	var stmts bytes.Buffer
 	fmt.Fprintf(&stmts, "CREATE TABLE %s %s;\n", data.Name, data.Schema)
-	for rowIdx := 0; rowIdx < data.InitialRowCount; rowIdx++ {
-		row := data.InitialRowFn(rowIdx)
-		fmt.Fprintf(&stmts, "INSERT INTO %s VALUES (%s);\n", data.Name, strings.Join(row, `,`))
+	for rowIdx := 0; rowIdx < data.InitialRows.NumBatches; rowIdx++ {
+		for _, row := range data.InitialRows.Batch(rowIdx) {
+			rowBatch := strings.Join(workload.StringTuple(row), `,`)
+			fmt.Fprintf(&stmts, "INSERT INTO %s VALUES (%s);\n", data.Name, rowBatch)
+		}
 	}
 
 	// TODO(dan): The csv load will be less overhead, use it when we have it.
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	desc, err := sqlccl.Load(ctx, db, &stmts, `data`, `nodelocal://`+dir, ts, chunkBytes, tempDir)
+	desc, err := importccl.Load(ctx, db, &stmts, `data`, `nodelocal://`+dir, ts, chunkBytes, tempDir)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +75,7 @@ type Backup struct {
 	// BaseDir can be used for a RESTORE. All paths in the descriptor are
 	// relative to this.
 	BaseDir string
-	Desc    sqlccl.BackupDescriptor
+	Desc    backupccl.BackupDescriptor
 
 	fileIdx int
 	iterIdx int

@@ -436,8 +436,9 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	{
 		var ba roachpb.BatchRequest
 		ba.Add(&roachpb.EndTransactionRequest{
-			Commit: false,
 			Span:   roachpb.Span{Key: initialTxn.Proto().Key},
+			Commit: false,
+			Poison: true,
 		})
 		ba.Txn = initialTxn.Proto()
 		if _, pErr := tc.TxnCoordSenderFactory.wrapped.Send(context.Background(), ba); pErr != nil {
@@ -713,8 +714,7 @@ func TestTxnCoordSenderCancel(t *testing.T) {
 	// path. We'll either succeed, get a "does not exist" error, or get a
 	// context canceled error. Anything else is unexpected.
 	err := txn.CommitOrCleanup(ctx)
-	if err != nil && err.Error() != context.Canceled.Error() &&
-		!testutils.IsError(err, "TransactionStatusError: does not exist") {
+	if err != nil && err.Error() != context.Canceled.Error() {
 		t.Fatal(err)
 	}
 }
@@ -723,7 +723,25 @@ func TestTxnCoordSenderCancel(t *testing.T) {
 // transactions and intents after the lastUpdateNanos exceeds the timeout.
 func TestTxnCoordSenderGCTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := createTestDB(t)
+	// Add a testing request filter which pauses a get request for the
+	// key until after the signal channel is closed.
+	key := roachpb.Key("a")
+	value := []byte("value")
+	signal := make(chan struct{})
+	knobs := &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		TestingRequestFilter: func(ba roachpb.BatchRequest) *roachpb.Error {
+			for _, req := range ba.Requests {
+				if getReq, ok := req.GetInner().(*roachpb.GetRequest); ok && getReq.Key.Equal(key) {
+					<-signal
+				}
+			}
+			return nil
+		},
+	}
+
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), knobs)
 	defer s.Stop()
 
 	// Set heartbeat interval to 1ms for testing.
@@ -731,10 +749,17 @@ func TestTxnCoordSenderGCTimeout(t *testing.T) {
 	tc.TxnCoordSenderFactory.heartbeatInterval = 1 * time.Millisecond
 
 	txn := client.NewTxn(s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	key := roachpb.Key("a")
-	if err := txn.Put(context.TODO(), key, []byte("value")); err != nil {
+	if err := txn.Put(context.TODO(), key, value); err != nil {
 		t.Fatal(err)
 	}
+	errCh := make(chan error)
+	go func() {
+		if _, err := txn.Get(context.TODO(), key); err != nil {
+			errCh <- err
+		} else {
+			errCh <- errors.New("expected error")
+		}
+	}()
 
 	// Now, advance clock past the default client timeout.
 	// Locking the TxnCoordSender to prevent a data race.
@@ -753,7 +778,15 @@ func TestTxnCoordSenderGCTimeout(t *testing.T) {
 		return nil
 	})
 
+	// Verify all intents have been cleaned up.
 	verifyCleanup(key, s.Eng, t, tc)
+
+	// Verify that the inflight get request receives a transaction
+	// aborted error.
+	close(signal)
+	if err := <-errCh; !testutils.IsError(err, "txn aborted") {
+		t.Errorf("expected transaction aborted error; got %s", err)
+	}
 }
 
 // TestTxnCoordSenderGCWithCancel verifies that the coordinator cleans up extant
@@ -1333,42 +1366,51 @@ func checkTxnMetrics(
 	commits, commits1PC, abandons, aborts, restarts int64,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		testcases := []struct {
-			name string
-			a, e int64
-		}{
-			{"commits", metrics.Commits.Count(), commits},
-			{"commits1PC", metrics.Commits1PC.Count(), commits1PC},
-			{"abandons", metrics.Abandons.Count(), abandons},
-			{"aborts", metrics.Aborts.Count(), aborts},
-			{"durations", metrics.Durations.TotalCount(),
-				commits + abandons + aborts},
-		}
-
-		for _, tc := range testcases {
-			if tc.a != tc.e {
-				return errors.Errorf("%s: actual %s %d != expected %d", name, tc.name, tc.a, tc.e)
-			}
-		}
-
-		// Handle restarts separately, because that's a histogram. Though the
-		// histogram is approximate, we're recording so few distinct values
-		// that we should be okay.
-		dist := metrics.Restarts.Snapshot().Distribution()
-		var actualRestarts int64
-		for _, b := range dist {
-			if b.From == b.To {
-				actualRestarts += b.From * b.Count
-			} else {
-				t.Fatalf("unexpected value in histogram: %d-%d", b.From, b.To)
-			}
-		}
-		if a, e := actualRestarts, restarts; a != e {
-			return errors.Errorf("%s: actual restarts %d != expected %d", name, a, e)
-		}
-
-		return nil
+		return checkTxnMetricsOnce(t, metrics, name, commits, commits1PC, abandons, aborts, restarts)
 	})
+}
+
+func checkTxnMetricsOnce(
+	t *testing.T,
+	metrics TxnMetrics,
+	name string,
+	commits, commits1PC, abandons, aborts, restarts int64,
+) error {
+	testcases := []struct {
+		name string
+		a, e int64
+	}{
+		{"commits", metrics.Commits.Count(), commits},
+		{"commits1PC", metrics.Commits1PC.Count(), commits1PC},
+		{"abandons", metrics.Abandons.Count(), abandons},
+		{"aborts", metrics.Aborts.Count(), aborts},
+		{"durations", metrics.Durations.TotalCount(),
+			commits + abandons + aborts},
+	}
+
+	for _, tc := range testcases {
+		if tc.a != tc.e {
+			return errors.Errorf("%s: actual %s %d != expected %d", name, tc.name, tc.a, tc.e)
+		}
+	}
+
+	// Handle restarts separately, because that's a histogram. Though the
+	// histogram is approximate, we're recording so few distinct values
+	// that we should be okay.
+	dist := metrics.Restarts.Snapshot().Distribution()
+	var actualRestarts int64
+	for _, b := range dist {
+		if b.From == b.To {
+			actualRestarts += b.From * b.Count
+		} else {
+			t.Fatalf("unexpected value in histogram: %d-%d", b.From, b.To)
+		}
+	}
+	if a, e := actualRestarts, restarts; a != e {
+		return errors.Errorf("%s: actual restarts %d != expected %d", name, a, e)
+	}
+
+	return nil
 }
 
 // setupMetricsTest sets the txn coord sender factory's metrics to
@@ -1460,10 +1502,14 @@ func TestTxnAbandonCount(t *testing.T) {
 	value := []byte("value")
 	manual := s.Manual
 
+	ctx := context.Background()
+
 	var count int
 	doneErr := errors.New("retry on abandoned successful; exiting")
+
 	db, tc := createNonCancelableDB(s.DB)
-	if err := db.Txn(context.Background(), func(ctx context.Context, txn *client.Txn) error {
+
+	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		count++
 		if count == 2 {
 			return doneErr
@@ -1478,9 +1524,24 @@ func TestTxnAbandonCount(t *testing.T) {
 			return err
 		}
 
-		manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
-
-		checkTxnMetrics(t, metrics, "abandon txn", 0, 0, 1, 0, 0)
+		testutils.SucceedsSoon(t, func() error {
+			// Note that we must bump the clock before every attempt (not just once)
+			// because otherwise there is a race in which we bump, a heartbeat happens
+			// at the new timestamp, and the transaction never expires.
+			manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
+			err := checkTxnMetricsOnce(
+				t, metrics, "abandon txn", 0, 0, 1 /* abandons */, 0, 0,
+			)
+			if err == nil {
+				return nil
+			}
+			// There's another race here: if (*TxnCoordSender).heartbeat sees the expired txn, it will
+			// asynchronously call tryAsyncAbort, which may beat the parent heartbeat loop's stats taking.
+			// In that case, we see an aborted txn.
+			return checkTxnMetricsOnce(
+				t, metrics, "abort txn", 0, 0, 0, 1 /* aborts */, 0,
+			)
+		})
 
 		return nil
 	}); err != doneErr {
@@ -1517,9 +1578,15 @@ func TestTxnReadAfterAbandon(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
-
-		checkTxnMetrics(t, metrics, "abandon txn", 0, 0, 1, 0, 0)
+		testutils.SucceedsSoon(t, func() error {
+			// See #22762 for very similar code and an explanation.
+			manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
+			err := checkTxnMetricsOnce(t, metrics, "abandon txn", 0, 0, 1 /* abandons */, 0, 0)
+			if err == nil {
+				return nil
+			}
+			return checkTxnMetricsOnce(t, metrics, "abort txn", 0, 0, 0, 1 /* aborts */, 0)
+		})
 
 		_, err := txn.Get(ctx, key)
 		if !testutils.IsError(err, "txn aborted") {
@@ -1562,51 +1629,69 @@ func TestTxnAbortCount(t *testing.T) {
 
 func TestTxnRestartCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, metrics, cleanupFn := setupMetricsTest(t)
-	defer cleanupFn()
 
-	key := []byte("key-restart")
+	readKey := []byte("read")
+	writeKey := []byte("write")
 	value := []byte("value")
 
-	// Start a transaction and do a GET. This forces a timestamp to be
-	// chosen for the transaction.
-	txn := client.NewTxn(s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	if _, err := txn.Get(context.TODO(), key); err != nil {
-		t.Fatal(err)
+	for _, expRestart := range []bool{true, false} {
+		t.Run(fmt.Sprintf("expected restart: %t", expRestart), func(t *testing.T) {
+			s, metrics, cleanupFn := setupMetricsTest(t)
+			defer cleanupFn()
+
+			// Start a transaction and do a GET. This forces a timestamp to be
+			// chosen for the transaction.
+			txn := client.NewTxn(s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+			if _, err := txn.Get(context.TODO(), readKey); err != nil {
+				t.Fatal(err)
+			}
+
+			// If expRestart is true, write the read key outside of the
+			// transaction, at a higher timestamp, which will necessitate a
+			// txn restart when the original read key span is updated.
+			if expRestart {
+				if err := s.DB.Put(context.TODO(), readKey, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Outside of the transaction, read the same key as will be
+			// written within the transaction. This means that future
+			// attempts to write will forward the txn timestamp.
+			if _, err := s.DB.Get(context.TODO(), writeKey); err != nil {
+				t.Fatal(err)
+			}
+
+			// This put will lay down an intent, txn timestamp will increase
+			// beyond OrigTimestamp.
+			if err := txn.Put(context.TODO(), writeKey, value); err != nil {
+				t.Fatal(err)
+			}
+			if !txn.Proto().OrigTimestamp.Less(txn.Proto().Timestamp) {
+				t.Errorf("expected timestamp to increase: %s", txn.Proto())
+			}
+
+			// Wait for heartbeat to start.
+			tc := txn.Sender().(*TxnCoordSender)
+			testutils.SucceedsSoon(t, func() error {
+				tc.mu.Lock()
+				defer tc.mu.Unlock()
+				if tc.mu.txnEnd == nil {
+					return errors.New("expected heartbeat to start")
+				}
+				return nil
+			})
+
+			// Commit (should cause restart metric to increase).
+			err := txn.CommitOrCleanup(context.TODO())
+			if expRestart {
+				assertTransactionRetryError(t, err)
+				checkTxnMetrics(t, metrics, "restart txn", 0, 0, 0, 1, 1)
+			} else if err != nil {
+				t.Fatalf("expected no restart; got %s", err)
+			}
+		})
 	}
-
-	// Outside of the transaction, read the same key as was read within
-	// the transaction. This means that future attempts to write will
-	// forward the txn timestamp.
-	if _, err := s.DB.Get(context.TODO(), key); err != nil {
-		t.Fatal(err)
-	}
-
-	// This put will lay down an intent, txn timestamp will increase
-	// beyond OrigTimestamp.
-	if err := txn.Put(context.TODO(), key, value); err != nil {
-		t.Fatal(err)
-	}
-	if !txn.Proto().OrigTimestamp.Less(txn.Proto().Timestamp) {
-		t.Errorf("expected timestamp to increase: %s", txn.Proto())
-	}
-
-	// Wait for heartbeat to start.
-	tc := txn.Sender().(*TxnCoordSender)
-	testutils.SucceedsSoon(t, func() error {
-		tc.mu.Lock()
-		defer tc.mu.Unlock()
-		if tc.mu.txnEnd == nil {
-			return errors.New("expected heartbeat to start")
-		}
-		return nil
-	})
-
-	// Commit (should cause restart metric to increase).
-	err := txn.CommitOrCleanup(context.TODO())
-	assertTransactionRetryError(t, err)
-
-	checkTxnMetrics(t, metrics, "restart txn", 0, 0, 0, 1, 1)
 }
 
 func TestTxnDurations(t *testing.T) {

@@ -38,6 +38,8 @@ type columnBackfiller struct {
 	// updateCols is a slice of all column descriptors that are being modified.
 	updateCols  []sqlbase.ColumnDescriptor
 	updateExprs []tree.TypedExpr
+
+	evalCtx *tree.EvalContext
 }
 
 var _ Processor = &columnBackfiller{}
@@ -60,6 +62,7 @@ func newColumnBackfiller(
 			output:  output,
 			spec:    spec,
 		},
+		evalCtx: flowCtx.NewEvalCtx(),
 	}
 	cb.backfiller.chunkBackfiller = cb
 
@@ -90,7 +93,7 @@ func (cb *columnBackfiller) init() error {
 		}
 	}
 	defaultExprs, err := sqlbase.MakeDefaultExprs(
-		cb.added, &transform.ExprTransformContext{}, cb.flowCtx.NewEvalCtx(),
+		cb.added, &transform.ExprTransformContext{}, cb.evalCtx,
 	)
 	if err != nil {
 		return err
@@ -153,7 +156,12 @@ func (cb *columnBackfiller) runChunk(
 		}
 
 		fkTables, _ := sqlbase.TablesNeededForFKs(
-			ctx, tableDesc, sqlbase.CheckUpdates, sqlbase.NoLookup, sqlbase.NoCheckPrivilege,
+			ctx,
+			tableDesc,
+			sqlbase.CheckUpdates,
+			sqlbase.NoLookup,
+			sqlbase.NoCheckPrivilege,
+			nil, /* AnalyzeExprFunction */
 		)
 		for _, fkTableDesc := range cb.spec.OtherTables {
 			found, ok := fkTables[fkTableDesc.ID]
@@ -226,7 +234,7 @@ func (cb *columnBackfiller) runChunk(
 			// Evaluate the new values. This must be done separately for
 			// each row so as to handle impure functions correctly.
 			for j, e := range cb.updateExprs {
-				val, err := e.Eval(cb.flowCtx.NewEvalCtx())
+				val, err := e.Eval(cb.evalCtx)
 				if err != nil {
 					return sqlbase.NewInvalidSchemaDefinitionError(err)
 				}

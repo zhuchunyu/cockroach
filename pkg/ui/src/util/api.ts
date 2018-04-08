@@ -48,6 +48,9 @@ export type ClusterResponseMessage = protos.cockroach.server.serverpb.ClusterRes
 export type TableStatsRequestMessage = protos.cockroach.server.serverpb.TableStatsRequest;
 export type TableStatsResponseMessage = protos.cockroach.server.serverpb.TableStatsResponse;
 
+export type NonTableStatsRequestMessage = protos.cockroach.server.serverpb.NonTableStatsRequest;
+export type NonTableStatsResponseMessage = protos.cockroach.server.serverpb.NonTableStatsResponse;
+
 export type LogsRequestMessage = protos.cockroach.server.serverpb.LogsRequest;
 export type LogEntriesResponseMessage = protos.cockroach.server.serverpb.LogEntriesResponse;
 
@@ -79,6 +82,9 @@ export type RangeLogResponseMessage =
 
 export type CommandQueueRequestMessage = protos.cockroach.server.serverpb.CommandQueueRequest;
 export type CommandQueueResponseMessage = protos.cockroach.server.serverpb.CommandQueueResponse;
+
+export type SettingsRequestMessage = protos.cockroach.server.serverpb.SettingsRequest;
+export type SettingsResponseMessage = protos.cockroach.server.serverpb.SettingsResponse;
 
 // API constants
 
@@ -230,9 +236,15 @@ export function getCluster(_req: ClusterRequestMessage, timeout?: moment.Duratio
   return timeoutFetch(serverpb.ClusterResponse, `${API_PREFIX}/cluster`, null, timeout);
 }
 
-// getTableStats gets details stats about the current table
+// getTableStats gets detailed stats about the current table
 export function getTableStats(req: TableStatsRequestMessage, timeout?: moment.Duration): Promise<TableStatsResponseMessage> {
   return timeoutFetch(serverpb.TableStatsResponse, `${API_PREFIX}/databases/${req.database}/tables/${req.table}/stats`, null, timeout);
+}
+
+// getNonTableStats gets detailed stats about non-table data ranges on the
+// cluster.
+export function getNonTableStats(_req: NonTableStatsRequestMessage, timeout?: moment.Duration): Promise<NonTableStatsResponseMessage> {
+  return timeoutFetch(serverpb.NonTableStatsResponse, `${API_PREFIX}/nontablestats`, null, timeout);
 }
 
 // TODO (maxlang): add filtering
@@ -291,4 +303,9 @@ export function getRangeLog(
 // getCommandQueue returns a representation of the command queue for a given range id
 export function getCommandQueue(req: CommandQueueRequestMessage, timeout?: moment.Duration): Promise<CommandQueueResponseMessage> {
   return timeoutFetch(serverpb.CommandQueueResponse, `${STATUS_PREFIX}/range/${req.range_id}/cmdqueue`, null, timeout);
+}
+
+// getSettings gets all cluster settings
+export function getSettings(_req: SettingsRequestMessage, timeout?: moment.Duration): Promise<SettingsResponseMessage> {
+  return timeoutFetch(serverpb.SettingsResponse, `${API_PREFIX}/settings`, null, timeout);
 }

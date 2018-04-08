@@ -65,13 +65,13 @@ typedef struct DBIterator DBIterator;
 // DBOptions contains local database options.
 typedef struct {
   DBCache* cache;
-  uint64_t block_size;
-  uint64_t wal_ttl_seconds;
   bool logging_enabled;
   int num_cpu;
   int max_open_files;
   bool use_switching_env;
   bool must_exist;
+  bool read_only;
+  DBSlice rocksdb_options;
   DBSlice extra_options;
 } DBOptions;
 
@@ -96,7 +96,7 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions options);
 DBStatus DBDestroy(DBSlice dir);
 
 // Closes the database, freeing memory and other resources.
-void DBClose(DBEngine* db);
+DBStatus DBClose(DBEngine* db);
 
 // Flushes all mem-table data to disk, blocking until the operation is
 // complete.
@@ -250,19 +250,27 @@ typedef struct {
   DBTimestamp max_timestamp;
 } DBTxn;
 
+typedef struct {
+  DBSlice* bufs;
+  // len is the number of DBSlices in bufs.
+  int32_t len;
+  // count is the number of key/value pairs in bufs.
+  int32_t count;
+} DBChunkedBuffer;
+
 // DBScanResults contains the key/value pairs and intents encoded
 // using the RocksDB batch repr format.
 typedef struct {
   DBStatus status;
-  DBSlice data;
+  DBChunkedBuffer data;
   DBSlice intents;
   DBTimestamp uncertainty_timestamp;
 } DBScanResults;
 
 DBScanResults MVCCGet(DBIterator* iter, DBSlice key, DBTimestamp timestamp, DBTxn txn,
-                      bool consistent);
+                      bool consistent, bool tombstones);
 DBScanResults MVCCScan(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp,
-                       int64_t max_keys, DBTxn txn, bool consistent, bool reverse);
+                       int64_t max_keys, DBTxn txn, bool consistent, bool reverse, bool tombstones);
 
 // DBStatsResult contains various runtime stats for RocksDB.
 typedef struct {
@@ -302,7 +310,11 @@ DBString DBGetUserProperties(DBEngine* db);
 // Bulk adds the file at the given path to a database. See the RocksDB
 // documentation on `IngestExternalFile` for the various restrictions on what
 // can be added. If move_file is true, the file will be moved instead of copied.
-DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file);
+// If allow_file_modification is false, RocksDB will return an error if it would
+// have tried to modify the file's sequence number rather than editing the file
+// in place.
+DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file,
+                              bool allow_file_modification);
 
 typedef struct DBSstFileWriter DBSstFileWriter;
 

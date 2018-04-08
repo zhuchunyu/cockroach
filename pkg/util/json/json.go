@@ -73,7 +73,12 @@ type JSON interface {
 
 	// EncodeInvertedIndexKeys takes in a key prefix and returns a slice of inverted index keys,
 	// one per path through the receiver.
-	EncodeInvertedIndexKeys(b []byte) ([][]byte, error)
+	encodeInvertedIndexKeys(b []byte) ([][]byte, error)
+
+	// allPaths returns a slice of new JSON documents, each a path to a leaf
+	// through the receiver. Note that leaves include the empty object and array
+	// in addition to scalars.
+	allPaths() ([]JSON, error)
 
 	// FetchValKey implements the `->` operator for strings, returning nil if the
 	// key is not found.
@@ -88,11 +93,18 @@ type JSON interface {
 	// and tries to access the given index.
 	FetchValKeyOrIdx(key string) (JSON, error)
 
-	// RemoveKey implements the `-` operator for strings.
-	RemoveKey(key string) (JSON, error)
+	// RemoveKey implements the `-` operator for strings, returning JSON after removal,
+	// whether removal is valid and error message.
+	RemoveKey(key string) (JSON, bool, error)
 
-	// RemoveIndex implements the `-` operator for ints.
-	RemoveIndex(idx int) (JSON, error)
+	// RemoveIndex implements the `-` operator for ints, returning JSON after removal,
+	// whether removal is valid and error message.
+	RemoveIndex(idx int) (JSON, bool, error)
+
+	// RemovePath and doRemovePath implement the `#-` operator for strings, returning JSON after removal,
+	// whether removal is valid and error message.
+	RemovePath(path []string) (JSON, bool, error)
+	doRemovePath(path []string) (JSON, bool, error)
 
 	// Concat implements the `||` operator.
 	Concat(other JSON) (JSON, error)
@@ -139,6 +151,10 @@ type JSON interface {
 	// Len returns the number of outermost elements in the JSON document if it is an object or an array.
 	// Otherwise, Len returns 0.
 	Len() int
+
+	// HasContainerLeaf returns whether this document contains in it somewhere
+	// either the empty array or the empty object.
+	HasContainerLeaf() (bool, error)
 }
 
 type jsonTrue struct{}
@@ -575,7 +591,7 @@ func (j jsonArray) Format(buf *bytes.Buffer) {
 	buf.WriteByte('[')
 	for i := range j {
 		if i != 0 {
-			buf.WriteByte(',')
+			buf.WriteString(", ")
 		}
 		j[i].Format(buf)
 	}
@@ -586,10 +602,10 @@ func (j jsonObject) Format(buf *bytes.Buffer) {
 	buf.WriteByte('{')
 	for i := range j {
 		if i != 0 {
-			buf.WriteByte(',')
+			buf.WriteString(", ")
 		}
 		encodeJSONString(buf, string(j[i].k))
-		buf.WriteByte(':')
+		buf.WriteString(": ")
 		j[i].v.Format(buf)
 	}
 	buf.WriteByte('}')
@@ -652,27 +668,41 @@ func ParseJSON(s string) (JSON, error) {
 	return MakeJSON(result)
 }
 
-func (j jsonNull) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+// EncodeInvertedIndexKeys takes in a key prefix and returns a slice of inverted index keys,
+// one per path through the receiver.
+func EncodeInvertedIndexKeys(b []byte, json JSON) ([][]byte, error) {
+	return json.encodeInvertedIndexKeys(encoding.EncodeJSONAscending(b))
+}
+func (j jsonNull) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	b = encoding.AddJSONPathTerminator(b)
 	return [][]byte{encoding.EncodeNullAscending(b)}, nil
 }
-func (jsonTrue) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (jsonTrue) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	b = encoding.AddJSONPathTerminator(b)
 	return [][]byte{encoding.EncodeTrueAscending(b)}, nil
 }
-func (jsonFalse) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (jsonFalse) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	b = encoding.AddJSONPathTerminator(b)
 	return [][]byte{encoding.EncodeFalseAscending(b)}, nil
 }
-func (j jsonString) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (j jsonString) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	b = encoding.AddJSONPathTerminator(b)
 	return [][]byte{encoding.EncodeStringAscending(b, string(j))}, nil
 }
-func (j jsonNumber) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (j jsonNumber) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	b = encoding.AddJSONPathTerminator(b)
 	var dec = apd.Decimal(j)
 	return [][]byte{encoding.EncodeDecimalAscending(b, &dec)}, nil
 }
-func (j jsonArray) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
-	var outKeys [][]byte
+func (j jsonArray) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	// Checking for an empty array.
+	if len(j) == 0 {
+		return [][]byte{encoding.EncodeJSONEmptyArray(b)}, nil
+	}
 
+	var outKeys [][]byte
 	for i := range j {
-		children, err := j[i].EncodeInvertedIndexKeys(nil)
+		children, err := j[i].encodeInvertedIndexKeys(nil)
 		if err != nil {
 			return nil, err
 		}
@@ -685,24 +715,99 @@ func (j jsonArray) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 	return outKeys, nil
 }
 
-func (j jsonObject) EncodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+func (j jsonObject) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
+	// Checking for an empty object.
+	if len(j) == 0 {
+		return [][]byte{encoding.EncodeJSONEmptyObject(b)}, nil
+	}
+
 	var outKeys [][]byte
 	for i := range j {
-		children, err := j[i].v.EncodeInvertedIndexKeys(nil)
+		children, err := j[i].v.encodeInvertedIndexKeys(nil)
 		if err != nil {
 			return nil, err
 		}
+
+		// We're trying to see if this is the end of the JSON path. If it is, then we don't want to
+		// add an extra separator.
+		end := true
+		switch j[i].v.(type) {
+		case jsonArray, jsonObject:
+			if j[i].v.Len() != 0 {
+				end = false
+			}
+		}
+
 		for _, childBytes := range children {
 			encodedKey := bytes.Join([][]byte{b,
-				encoding.EncodeNotNullAscending(nil),
-				encoding.EncodeStringAscending(nil, string(j[i].k)),
+				encoding.EncodeJSONKeyStringAscending(nil, string(j[i].k), end),
 				childBytes}, nil)
 
 			outKeys = append(outKeys, encodedKey)
 		}
 	}
-
 	return outKeys, nil
+}
+
+// AllPaths returns a slice of new JSON documents, each a path to a leaf
+// through the input. Note that leaves include the empty object and array
+// in addition to scalars.
+func AllPaths(j JSON) ([]JSON, error) {
+	return j.allPaths()
+}
+
+func (j jsonNull) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonTrue) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonFalse) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonString) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonNumber) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonArray) allPaths() ([]JSON, error) {
+	if len(j) == 0 {
+		return []JSON{j}, nil
+	}
+	ret := make([]JSON, 0, len(j))
+	for i := range j {
+		paths, err := j[i].allPaths()
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range paths {
+			ret = append(ret, jsonArray{path})
+		}
+	}
+	return ret, nil
+}
+
+func (j jsonObject) allPaths() ([]JSON, error) {
+	if len(j) == 0 {
+		return []JSON{j}, nil
+	}
+	ret := make([]JSON, 0, len(j))
+	for i := range j {
+		paths, err := j[i].v.allPaths()
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range paths {
+			ret = append(ret, jsonObject{jsonKeyValuePair{k: j[i].k, v: path}})
+		}
+	}
+	return ret, nil
 }
 
 // FromDecimal returns a JSON value given a apd.Decimal.
@@ -833,23 +938,28 @@ func MakeJSON(d interface{}) (JSON, error) {
 // place to start doing binary search over a linear scan.
 const bsearchCutoff = 20
 
-func (j jsonObject) FetchValKey(key string) (JSON, error) {
+func findPairIndexByKey(j jsonObject, key string) (int, bool) {
 	// For small objects, the overhead of binary search is significant and so
 	// it's faster to just do a linear scan.
+	var i int
 	if len(j) < bsearchCutoff {
-		for i := range j {
-			if string(j[i].k) == key {
-				return j[i].v, nil
-			}
-			if string(j[i].k) > key {
+		for i = range j {
+			if string(j[i].k) >= key {
 				break
 			}
 		}
-		return nil, nil
+	} else {
+		i = sort.Search(len(j), func(i int) bool { return string(j[i].k) >= key })
 	}
-
-	i := sort.Search(len(j), func(i int) bool { return string(j[i].k) >= key })
 	if i < len(j) && string(j[i].k) == key {
+		return i, true
+	}
+	return -1, false
+}
+
+func (j jsonObject) FetchValKey(key string) (JSON, error) {
+	i, ok := findPairIndexByKey(j, key)
+	if ok {
 		return j[i].v, nil
 	}
 	return nil, nil
@@ -1032,32 +1142,38 @@ func (jsonNumber) FetchValKeyOrIdx(string) (JSON, error) { return nil, nil }
 var errCannotDeleteFromScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from scalar")
 var errCannotDeleteFromObject = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from object using integer index")
 
-func (j jsonArray) RemoveKey(key string) (JSON, error) {
-	return j, nil
+func (j jsonArray) RemoveKey(key string) (JSON, bool, error) {
+	return j, false, nil
 }
 
-func (j jsonObject) RemoveKey(key string) (JSON, error) {
-	newVal := make([]jsonKeyValuePair, 0, len(j))
-	for i := range j {
-		if string(j[i].k) != key {
-			newVal = append(newVal, j[i])
-		}
+func (j jsonObject) RemoveKey(key string) (JSON, bool, error) {
+	idx, ok := findPairIndexByKey(j, key)
+	if !ok {
+		return j, false, nil
 	}
-	return jsonObject(newVal), nil
+
+	newVal := make([]jsonKeyValuePair, len(j)-1)
+	for i, elem := range j[:idx] {
+		newVal[i] = elem
+	}
+	for i, elem := range j[idx+1:] {
+		newVal[idx+i] = elem
+	}
+	return jsonObject(newVal), true, nil
 }
 
-func (jsonNull) RemoveKey(string) (JSON, error)   { return nil, errCannotDeleteFromScalar }
-func (jsonTrue) RemoveKey(string) (JSON, error)   { return nil, errCannotDeleteFromScalar }
-func (jsonFalse) RemoveKey(string) (JSON, error)  { return nil, errCannotDeleteFromScalar }
-func (jsonString) RemoveKey(string) (JSON, error) { return nil, errCannotDeleteFromScalar }
-func (jsonNumber) RemoveKey(string) (JSON, error) { return nil, errCannotDeleteFromScalar }
+func (jsonNull) RemoveKey(string) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
+func (jsonTrue) RemoveKey(string) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
+func (jsonFalse) RemoveKey(string) (JSON, bool, error)  { return nil, false, errCannotDeleteFromScalar }
+func (jsonString) RemoveKey(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonNumber) RemoveKey(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
 
-func (j jsonArray) RemoveIndex(idx int) (JSON, error) {
+func (j jsonArray) RemoveIndex(idx int) (JSON, bool, error) {
 	if idx < 0 {
 		idx = len(j) + idx
 	}
 	if idx < 0 || idx >= len(j) {
-		return j, nil
+		return j, false, nil
 	}
 	result := make(jsonArray, len(j)-1)
 	for i := 0; i < idx; i++ {
@@ -1066,18 +1182,18 @@ func (j jsonArray) RemoveIndex(idx int) (JSON, error) {
 	for i := idx + 1; i < len(j); i++ {
 		result[i-1] = j[i]
 	}
-	return result, nil
+	return result, true, nil
 }
 
-func (j jsonObject) RemoveIndex(int) (JSON, error) {
-	return nil, errCannotDeleteFromObject
+func (j jsonObject) RemoveIndex(int) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromObject
 }
 
-func (jsonNull) RemoveIndex(int) (JSON, error)   { return nil, errCannotDeleteFromScalar }
-func (jsonTrue) RemoveIndex(int) (JSON, error)   { return nil, errCannotDeleteFromScalar }
-func (jsonFalse) RemoveIndex(int) (JSON, error)  { return nil, errCannotDeleteFromScalar }
-func (jsonString) RemoveIndex(int) (JSON, error) { return nil, errCannotDeleteFromScalar }
-func (jsonNumber) RemoveIndex(int) (JSON, error) { return nil, errCannotDeleteFromScalar }
+func (jsonNull) RemoveIndex(int) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
+func (jsonTrue) RemoveIndex(int) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
+func (jsonFalse) RemoveIndex(int) (JSON, bool, error)  { return nil, false, errCannotDeleteFromScalar }
+func (jsonString) RemoveIndex(int) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonNumber) RemoveIndex(int) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
 
 var errInvalidConcat = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "invalid concatenation of jsonb objects")
 
@@ -1380,3 +1496,137 @@ func Pretty(j JSON) (string, error) {
 	res, err := json.MarshalIndent(asGo, "", "    ")
 	return string(res), err
 }
+
+var errCannotDeletePathInScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete path in scalar")
+
+func (j jsonArray) RemovePath(path []string) (JSON, bool, error)  { return j.doRemovePath(path) }
+func (j jsonObject) RemovePath(path []string) (JSON, bool, error) { return j.doRemovePath(path) }
+func (jsonNull) RemovePath([]string) (JSON, bool, error) {
+	return nil, false, errCannotDeletePathInScalar
+}
+func (jsonTrue) RemovePath([]string) (JSON, bool, error) {
+	return nil, false, errCannotDeletePathInScalar
+}
+func (jsonFalse) RemovePath([]string) (JSON, bool, error) {
+	return nil, false, errCannotDeletePathInScalar
+}
+func (jsonString) RemovePath([]string) (JSON, bool, error) {
+	return nil, false, errCannotDeletePathInScalar
+}
+func (jsonNumber) RemovePath([]string) (JSON, bool, error) {
+	return nil, false, errCannotDeletePathInScalar
+}
+
+func (j jsonArray) doRemovePath(path []string) (JSON, bool, error) {
+	if len(path) == 0 {
+		return j, false, nil
+	}
+	// In path-deletion we have to attempt to parse numbers (this is different
+	// from the `-` operator, where strings just never match on arrays).
+	idx, err := strconv.Atoi(path[0])
+	if err != nil {
+		// If we couldn't parse the key as an integer, the array couldn't
+		// have had it (note that we don't propagate the error here).
+		return j, false, nil
+	}
+	if len(path) == 1 {
+		return j.RemoveIndex(idx)
+	}
+
+	if idx < -len(j) || idx >= len(j) {
+		return j, false, nil
+	}
+	if idx < 0 {
+		idx += len(j)
+	}
+	newVal, ok, err := j[idx].doRemovePath(path[1:])
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return j, false, nil
+	}
+
+	result := make(jsonArray, len(j))
+	for i := range j {
+		result[i] = j[i]
+	}
+	result[idx] = newVal
+
+	return result, true, nil
+}
+
+func (j jsonObject) doRemovePath(path []string) (JSON, bool, error) {
+	if len(path) == 0 {
+		return j, false, nil
+	}
+	if len(path) == 1 {
+		return j.RemoveKey(path[0])
+	}
+	idx, ok := findPairIndexByKey(j, path[0])
+	if !ok {
+		return j, false, nil
+	}
+
+	newVal, ok, err := j[idx].v.doRemovePath(path[1:])
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return j, false, nil
+	}
+
+	result := make(jsonObject, len(j))
+	for i := range j {
+		result[i] = j[i]
+	}
+	result[idx].v = newVal
+
+	return result, true, nil
+}
+
+// When we hit a scalar, we stop. #- only errors if there's a scalar at the
+// very top level.
+func (j jsonNull) doRemovePath([]string) (JSON, bool, error)   { return j, false, nil }
+func (j jsonTrue) doRemovePath([]string) (JSON, bool, error)   { return j, false, nil }
+func (j jsonFalse) doRemovePath([]string) (JSON, bool, error)  { return j, false, nil }
+func (j jsonString) doRemovePath([]string) (JSON, bool, error) { return j, false, nil }
+func (j jsonNumber) doRemovePath([]string) (JSON, bool, error) { return j, false, nil }
+
+func (j jsonObject) HasContainerLeaf() (bool, error) {
+	if j.Len() == 0 {
+		return true, nil
+	}
+	for _, c := range j {
+		child, err := c.v.HasContainerLeaf()
+		if err != nil {
+			return false, err
+		}
+		if child {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (j jsonArray) HasContainerLeaf() (bool, error) {
+	if j.Len() == 0 {
+		return true, nil
+	}
+	for _, c := range j {
+		child, err := c.HasContainerLeaf()
+		if err != nil {
+			return false, err
+		}
+		if child {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (j jsonNull) HasContainerLeaf() (bool, error)   { return false, nil }
+func (j jsonTrue) HasContainerLeaf() (bool, error)   { return false, nil }
+func (j jsonFalse) HasContainerLeaf() (bool, error)  { return false, nil }
+func (j jsonString) HasContainerLeaf() (bool, error) { return false, nil }
+func (j jsonNumber) HasContainerLeaf() (bool, error) { return false, nil }

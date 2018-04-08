@@ -19,10 +19,8 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"net/url"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,19 +30,15 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/codahale/hdrhistogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/tylertreat/hdrhistogram-writer"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils/workload"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/workload"
 )
-
-const crdbDefaultURI = `postgres://root@localhost:26257?sslmode=disable`
 
 var runCmd = &cobra.Command{
 	Use:   `run`,
@@ -52,14 +46,13 @@ var runCmd = &cobra.Command{
 }
 
 var runFlags = pflag.NewFlagSet(`run`, pflag.ContinueOnError)
-var concurrency = runFlags.Int(
-	"concurrency", 2*runtime.NumCPU(), "Number of concurrent writers inserting blocks")
 var tolerateErrors = runFlags.Bool("tolerate-errors", false, "Keep running on error")
 var maxRate = runFlags.Float64(
 	"max-rate", 0, "Maximum frequency of operations (reads/writes). If 0, no limit.")
 var maxOps = runFlags.Uint64("max-ops", 0, "Maximum number of operations to run")
 var duration = runFlags.Duration("duration", 0, "The duration to run. If 0, run forever.")
 var doInit = runFlags.Bool("init", false, "Automatically run init")
+var ramp = runFlags.Duration("ramp", 0*time.Second, "The duration over which to ramp up load.")
 
 var initCmd = &cobra.Command{
 	Use:   `init`,
@@ -78,20 +71,15 @@ var histFile = runFlags.String(
 func init() {
 	for _, meta := range workload.Registered() {
 		gen := meta.New()
-		genFlags := gen.Flags()
-		genHooks := gen.Hooks()
+		var genFlags *pflag.FlagSet
+		if f, ok := gen.(workload.Flagser); ok {
+			genFlags = f.Flags().FlagSet
+		}
 
 		genInitCmd := &cobra.Command{Use: meta.Name, Short: meta.Description}
 		genInitCmd.Flags().AddFlagSet(initFlags)
 		genInitCmd.Flags().AddFlagSet(genFlags)
-		genInitCmd.RunE = func(cmd *cobra.Command, args []string) error {
-			if genHooks.Validate != nil {
-				if err := genHooks.Validate(); err != nil {
-					return err
-				}
-			}
-			return runInit(gen, args)
-		}
+		genInitCmd.Run = cmdHelper(gen, runInit)
 		initCmd.AddCommand(genInitCmd)
 
 		genRunCmd := &cobra.Command{Use: meta.Name, Short: meta.Description}
@@ -103,61 +91,54 @@ func init() {
 			f.Usage += ` (implies --init)`
 			genRunCmd.Flags().AddFlag(&f)
 		})
-		genRunCmd.RunE = func(cmd *cobra.Command, args []string) error {
-			if genHooks.Validate != nil {
-				if err := genHooks.Validate(); err != nil {
-					return err
-				}
-			}
-			return runRun(gen, args)
-		}
+		genRunCmd.Run = cmdHelper(gen, runRun)
 		runCmd.AddCommand(genRunCmd)
 	}
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(runCmd)
 }
 
+func cmdHelper(
+	gen workload.Generator, fn func(gen workload.Generator, urls []string, dbName string) error,
+) func(*cobra.Command, []string) {
+	const crdbDefaultURL = `postgres://root@localhost:26257?sslmode=disable`
+
+	return handleErrs(func(cmd *cobra.Command, args []string) error {
+		if h, ok := gen.(workload.Hookser); ok {
+			if err := h.Hooks().Validate(); err != nil {
+				return err
+			}
+		}
+
+		// HACK: Steal the dbOverride out of flags. This should go away
+		// once more of run.go moves inside workload.
+		var dbOverride string
+		if dbFlag := cmd.Flag(`db`); dbFlag != nil {
+			dbOverride = dbFlag.Value.String()
+		}
+		urls := args
+		if len(urls) == 0 {
+			urls = []string{crdbDefaultURL}
+		}
+		dbName, err := workload.SanitizeUrls(gen, dbOverride, urls)
+		if err != nil {
+			return err
+		}
+		return fn(gen, urls, dbName)
+	})
+}
+
 // numOps keeps a global count of successful operations.
 var numOps uint64
 
-const (
-	minLatency = 100 * time.Microsecond
-	maxLatency = 10 * time.Second
-)
-
-func clampLatency(d, min, max time.Duration) time.Duration {
-	if d < min {
-		return min
-	}
-	if d > max {
-		return max
-	}
-	return d
-}
-
-type worker struct {
-	db      *gosql.DB
-	op      func(context.Context) error
-	latency struct {
-		syncutil.Mutex
-		*hdrhistogram.WindowedHistogram
-	}
-}
-
-func newWorker(db *gosql.DB, op func(context.Context) error) *worker {
-	w := &worker{
-		db: db,
-		op: op,
-	}
-	w.latency.WindowedHistogram = hdrhistogram.NewWindowed(1,
-		minLatency.Nanoseconds(), maxLatency.Nanoseconds(), 1)
-	return w
-}
-
-// run is an infinite loop in which the worker continuously attempts to
+// workerRun is an infinite loop in which the worker continuously attempts to
 // read / write blocks of random data into a table in cockroach DB.
-func (w *worker) run(
-	ctx context.Context, errCh chan<- error, wg *sync.WaitGroup, limiter *rate.Limiter,
+func workerRun(
+	ctx context.Context,
+	errCh chan<- error,
+	wg *sync.WaitGroup,
+	limiter *rate.Limiter,
+	workFn func(context.Context) error,
 ) {
 	defer wg.Done()
 
@@ -169,17 +150,11 @@ func (w *worker) run(
 			}
 		}
 
-		start := timeutil.Now()
-		if err := w.op(ctx); err != nil {
+		if err := workFn(ctx); err != nil {
 			errCh <- err
 			continue
 		}
-		elapsed := clampLatency(timeutil.Since(start), minLatency, maxLatency)
-		w.latency.Lock()
-		if err := w.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(ctx, err)
-		}
-		w.latency.Unlock()
+
 		v := atomic.AddUint64(&numOps, 1)
 		if *maxOps > 0 && v >= *maxOps {
 			return
@@ -187,113 +162,54 @@ func (w *worker) run(
 	}
 }
 
-func sanitizeDBURL(dbURL string) (string, error) {
-	parsedURL, err := url.Parse(dbURL)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimPrefix(parsedURL.Path, "/") != "" {
-		return "", fmt.Errorf(
-			`database URL specifies database %q, but database "test" is always used`, parsedURL.Path)
-	}
-	parsedURL.Path = "test"
+func runInit(gen workload.Generator, urls []string, dbName string) error {
+	ctx := context.Background()
 
-	switch parsedURL.Scheme {
-	case "postgres", "postgresql":
-		return parsedURL.String(), nil
-	default:
-		return "", fmt.Errorf("unsupported database: %s", parsedURL.Scheme)
-	}
-}
-
-func setupCockroach(dbURLs []string) (*gosql.DB, error) {
-	if len(dbURLs) == 0 {
-		dbURLs = []string{crdbDefaultURI}
-	}
-
-	var sanitizedURLs = make([]string, len(dbURLs))
-	for i, dbURL := range dbURLs {
-		var err error
-		sanitizedURLs[i], err = sanitizeDBURL(dbURL)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Open connection to server and create a database.
-	db, err := gosql.Open("cockroach", strings.Join(sanitizedURLs, " "))
-	if err != nil {
-		return nil, err
-	}
-
-	// Allow a maximum of concurrency+1 connections to the database.
-	db.SetMaxOpenConns(*concurrency + 1)
-	db.SetMaxIdleConns(*concurrency + 1)
-
-	return db, nil
-}
-
-func runInit(gen workload.Generator, args []string) error {
-	db, err := setupCockroach(args)
+	initDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return err
 	}
 
-	return runInitImpl(gen, db)
+	return runInitImpl(ctx, gen, initDB, dbName)
 }
 
-func runInitImpl(gen workload.Generator, db *gosql.DB) error {
+func runInitImpl(
+	ctx context.Context, gen workload.Generator, initDB *gosql.DB, dbName string,
+) error {
 	if *drop {
-		if _, err := db.Exec(`DROP DATABASE IF EXISTS test`); err != nil {
+		if _, err := initDB.ExecContext(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
 			return err
 		}
 	}
-	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS test"); err != nil {
+	if _, err := initDB.ExecContext(ctx, `CREATE DATABASE IF NOT EXISTS `+dbName); err != nil {
 		return err
 	}
 
 	const batchSize = -1
-	_, err := workload.Setup(db, gen, batchSize)
+	// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
+	// hooked up to a flag directly once once more of run.go moves inside
+	// workload.
+	const concurrency = 16
+	_, err := workload.Setup(ctx, initDB, gen, batchSize, concurrency)
 	return err
 }
 
-func runRun(gen workload.Generator, args []string) error {
+func runRun(gen workload.Generator, urls []string, dbName string) error {
 	ctx := context.Background()
 
-	if *concurrency < 1 {
-		return errors.Errorf(
-			"Value of 'concurrency' flag (%d) must be greater than or equal to 1", *concurrency)
+	initDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
+	if err != nil {
+		return err
 	}
-
-	var db *gosql.DB
-	{
-		var err error
-		for {
-			db, err = setupCockroach(args)
-			if err == nil {
-				break
-			}
-			if !*tolerateErrors {
-				return err
-			}
-		}
-	}
-
 	if *doInit || *drop {
-		var err error
 		for {
-			err = runInitImpl(gen, db)
+			err = runInitImpl(ctx, gen, initDB, dbName)
 			if err == nil {
 				break
 			}
 			if !*tolerateErrors {
 				return err
 			}
-		}
-	}
-	for _, table := range gen.Tables() {
-		if err := workload.Split(ctx, db, table, *concurrency); err != nil {
-			return err
 		}
 	}
 
@@ -304,28 +220,35 @@ func runRun(gen workload.Generator, args []string) error {
 		limiter = rate.NewLimiter(rate.Limit(*maxRate), 1)
 	}
 
-	ops := gen.Ops()
-	if len(ops) != 1 {
-		return errors.Errorf(`generators with more than one operation are not yet supported`)
+	o, ok := gen.(workload.Opser)
+	if !ok {
+		return errors.Errorf(`no operations defined for %s`, gen.Meta().Name)
 	}
-	op := ops[0]
+	reg := workload.NewHistogramRegistry()
+	ops, err := o.Ops(urls, reg)
+	if err != nil {
+		return err
+	}
 
-	lastNow := timeutil.Now()
-	start := lastNow
-	var lastOps uint64
-	workers := make([]*worker, *concurrency)
-
-	errCh := make(chan error)
-	var wg sync.WaitGroup
-	for i := range workers {
-		wg.Add(1)
-		opFn, err := op.Fn(db)
-		if err != nil {
+	for _, table := range gen.Tables() {
+		splitConcurrency := len(ops.WorkerFns)
+		if err := workload.Split(ctx, initDB, table, splitConcurrency); err != nil {
 			return err
 		}
-		workers[i] = newWorker(db, opFn)
-		go workers[i].run(ctx, errCh, &wg, limiter)
 	}
+
+	start := timeutil.Now()
+	errCh := make(chan error)
+	var wg sync.WaitGroup
+	sleepTime := *ramp / time.Duration(len(ops.WorkerFns))
+	wg.Add(len(ops.WorkerFns))
+	go func() {
+		for _, workFn := range ops.WorkerFns {
+			workFn := workFn
+			go workerRun(ctx, errCh, &wg, limiter, workFn)
+			time.Sleep(sleepTime)
+		}
+	}()
 
 	var numErr int
 	tick := time.Tick(time.Second)
@@ -344,28 +267,6 @@ func runRun(gen workload.Generator, args []string) error {
 		}()
 	}
 
-	defer func() {
-		// Output results that mimic Go's built-in benchmark format.
-		benchmarkName := strings.Join([]string{
-			"BenchmarkWorkload",
-			fmt.Sprintf("generator=%s", gen.Meta().Name),
-			fmt.Sprintf("concurrency=%d", *concurrency),
-			fmt.Sprintf("duration=%s", *duration),
-		}, "/")
-		// NB: This visits in a deterministic order.
-		gen.Flags().Visit(func(f *pflag.Flag) {
-			benchmarkName += fmt.Sprintf(`/%s=%s`, f.Name, f.Value)
-		})
-
-		result := testing.BenchmarkResult{
-			N: int(numOps),
-			T: timeutil.Since(start),
-		}
-		fmt.Printf("%s\t%s\n", benchmarkName, result)
-	}()
-
-	cumLatency := hdrhistogram.New(minLatency.Nanoseconds(), maxLatency.Nanoseconds(), 1)
-
 	for i := 0; ; {
 		select {
 		case err := <-errCh:
@@ -377,77 +278,95 @@ func runRun(gen workload.Generator, args []string) error {
 			return err
 
 		case <-tick:
-			var h *hdrhistogram.Histogram
-			for _, w := range workers {
-				w.latency.Lock()
-				m := w.latency.Merge()
-				w.latency.Rotate()
-				w.latency.Unlock()
-				if h == nil {
-					h = m
-				} else {
-					h.Merge(m)
+			startElapsed := timeutil.Since(start)
+			reg.Tick(func(t workload.HistogramTick) {
+				if i%20 == 0 {
+					fmt.Println("_elapsed___errors__ops/sec(inst)___ops/sec(cum)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)")
+				}
+				i++
+				fmt.Printf("%8s %8d %14.1f %14.1f %8.1f %8.1f %8.1f %8.1f %s\n",
+					time.Duration(startElapsed.Seconds()+0.5)*time.Second,
+					numErr,
+					float64(t.Ops-t.LastOps)/t.Elapsed.Seconds(),
+					float64(t.Ops)/startElapsed.Seconds(),
+					time.Duration(t.Hist.ValueAtQuantile(50)).Seconds()*1000,
+					time.Duration(t.Hist.ValueAtQuantile(95)).Seconds()*1000,
+					time.Duration(t.Hist.ValueAtQuantile(99)).Seconds()*1000,
+					time.Duration(t.Hist.ValueAtQuantile(100)).Seconds()*1000,
+					t.Name,
+				)
+			})
+
+		case <-done:
+			const totalHeader = "\n_elapsed___errors_____ops(total)___ops/sec(cum)__avg(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)"
+			fmt.Println(totalHeader + `__total`)
+			startElapsed := timeutil.Since(start)
+			printTotalHist := func(t workload.HistogramTick) {
+				if t.Ops == 0 {
+					return
+				}
+				fmt.Printf("%7.1fs %8d %14d %14.1f %8.1f %8.1f %8.1f %8.1f %8.1f  %s\n",
+					startElapsed.Seconds(), numErr,
+					t.Ops, float64(t.Ops)/startElapsed.Seconds(),
+					time.Duration(t.Cumulative.Mean()).Seconds()*1000,
+					time.Duration(t.Cumulative.ValueAtQuantile(50)).Seconds()*1000,
+					time.Duration(t.Cumulative.ValueAtQuantile(95)).Seconds()*1000,
+					time.Duration(t.Cumulative.ValueAtQuantile(99)).Seconds()*1000,
+					time.Duration(t.Cumulative.ValueAtQuantile(100)).Seconds()*1000,
+					t.Name,
+				)
+			}
+
+			resultTick := workload.HistogramTick{Name: ops.ResultHist}
+			reg.Tick(func(t workload.HistogramTick) {
+				printTotalHist(t)
+				if ops.ResultHist == `` || ops.ResultHist == t.Name {
+					resultTick.Ops += t.Ops
+					if resultTick.Cumulative == nil {
+						resultTick.Cumulative = t.Cumulative
+					} else {
+						resultTick.Cumulative.Merge(t.Cumulative)
+					}
+				}
+			})
+
+			fmt.Println(totalHeader + `__result`)
+			printTotalHist(resultTick)
+
+			if h, ok := gen.(workload.Hookser); ok {
+				if h.Hooks().PostRun != nil {
+					if err := h.Hooks().PostRun(start); err != nil {
+						fmt.Printf("failed post-run hook: %v\n", err)
+					}
 				}
 			}
 
-			cumLatency.Merge(h)
-			p50 := h.ValueAtQuantile(50)
-			p95 := h.ValueAtQuantile(95)
-			p99 := h.ValueAtQuantile(99)
-			pMax := h.ValueAtQuantile(100)
-
-			now := timeutil.Now()
-			elapsed := now.Sub(lastNow)
-			ops := atomic.LoadUint64(&numOps)
-			if i%20 == 0 {
-				fmt.Println("_elapsed___errors__ops/sec(inst)___ops/sec(cum)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)")
+			// Output results that mimic Go's built-in benchmark format.
+			benchmarkName := strings.Join([]string{
+				"BenchmarkWorkload",
+				fmt.Sprintf("generator=%s", gen.Meta().Name),
+			}, "/")
+			if *duration != time.Duration(0) {
+				benchmarkName += `/duration=` + duration.String()
 			}
-			i++
-			fmt.Printf("%8s %8d %14.1f %14.1f %8.1f %8.1f %8.1f %8.1f\n",
-				time.Duration(timeutil.Since(start).Seconds()+0.5)*time.Second,
-				numErr,
-				float64(ops-lastOps)/elapsed.Seconds(),
-				float64(ops)/timeutil.Since(start).Seconds(),
-				time.Duration(p50).Seconds()*1000,
-				time.Duration(p95).Seconds()*1000,
-				time.Duration(p99).Seconds()*1000,
-				time.Duration(pMax).Seconds()*1000)
-			lastOps = ops
-			lastNow = now
-
-		case <-done:
-			for _, w := range workers {
-				w.latency.Lock()
-				m := w.latency.Merge()
-				w.latency.Rotate()
-				w.latency.Unlock()
-				cumLatency.Merge(m)
+			if f, ok := gen.(workload.Flagser); ok {
+				// NB: This visits in a deterministic order.
+				f.Flags().Visit(func(f *pflag.Flag) {
+					benchmarkName += fmt.Sprintf(`/%s=%s`, f.Name, f.Value)
+				})
 			}
+			result := testing.BenchmarkResult{N: int(resultTick.Ops), T: startElapsed}
+			fmt.Printf("\n%s\t%s\n", benchmarkName, result)
 
-			avg := cumLatency.Mean()
-			p50 := cumLatency.ValueAtQuantile(50)
-			p95 := cumLatency.ValueAtQuantile(95)
-			p99 := cumLatency.ValueAtQuantile(99)
-			pMax := cumLatency.ValueAtQuantile(100)
-
-			ops := atomic.LoadUint64(&numOps)
-			elapsed := timeutil.Since(start).Seconds()
-			fmt.Println("\n_elapsed___errors_____ops(total)___ops/sec(cum)__avg(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)")
-			fmt.Printf("%7.1fs %8d %14d %14.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n\n",
-				timeutil.Since(start).Seconds(), numErr,
-				ops, float64(ops)/elapsed,
-				time.Duration(avg).Seconds()*1000,
-				time.Duration(p50).Seconds()*1000,
-				time.Duration(p95).Seconds()*1000,
-				time.Duration(p99).Seconds()*1000,
-				time.Duration(pMax).Seconds()*1000)
 			if *histFile == "-" {
-				if err := histwriter.WriteDistribution(cumLatency, nil, 1, os.Stdout); err != nil {
+				if err := histwriter.WriteDistribution(
+					resultTick.Cumulative, nil, 1, os.Stdout,
+				); err != nil {
 					fmt.Printf("failed to write histogram to stdout: %v\n", err)
 				}
 			} else if *histFile != "" {
 				if err := histwriter.WriteDistributionFile(
-					cumLatency, nil, 1, *histFile,
+					resultTick.Cumulative, nil, 1, *histFile,
 				); err != nil {
 					fmt.Printf("failed to write histogram file: %v\n", err)
 				}

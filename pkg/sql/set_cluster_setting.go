@@ -46,7 +46,7 @@ func (p *planner) SetClusterSetting(
 		return nil, err
 	}
 
-	name := strings.ToLower(tree.AsStringWithFlags(n.Name, tree.FmtBareIdentifiers))
+	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
 	setting, ok := settings.Lookup(name)
 	if !ok {
@@ -130,11 +130,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 		EventLogSetClusterSetting,
 		0, /* no target */
 		int32(params.extendedEvalCtx.NodeID),
-		struct {
-			SettingName string
-			Value       string
-			User        string
-		}{n.name, reportedValue, params.SessionData().User},
+		EventLogSetClusterSettingDetail{n.name, reportedValue, params.SessionData().User},
 	)
 }
 

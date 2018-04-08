@@ -23,33 +23,81 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang"
 )
 
-func generateOps(compiled *lang.CompiledExpr, w io.Writer) {
-	fmt.Fprintf(w, "const (\n")
-	fmt.Fprintf(w, "  UnknownOp Operator = iota\n\n")
+// opsGen generates the operator enumeration used by the optimizer.
+type opsGen struct {
+	compiled *lang.CompiledExpr
+	w        io.Writer
+}
 
-	for _, define := range compiled.Defines {
-		fmt.Fprintf(w, "  %sOp\n", define.Name)
-	}
+func (g *opsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
+	g.compiled = compiled
+	g.w = w
 
-	fmt.Fprintf(w, ")\n\n")
+	fmt.Fprintf(g.w, "package opt\n\n")
 
-	// Generate op names and indexes.
+	g.genOperatorEnum()
+	g.genOperatorNames()
+	g.genOperatorsByTag()
+}
+
+func (g *opsGen) genOperatorEnum() {
+	fmt.Fprintf(g.w, "const (\n")
+	fmt.Fprintf(g.w, "  UnknownOp Operator = iota\n\n")
+
+	g.genOperatorEnumByTag("Enforcer")
+	g.genOperatorEnumByTag("Relational")
+	g.genOperatorEnumByTag("Scalar")
+
+	fmt.Fprintf(g.w, "  // NumOperators tracks the total count of operators.\n")
+	fmt.Fprintf(g.w, "  NumOperators\n")
+	fmt.Fprintf(g.w, ")\n\n")
+}
+
+func (g *opsGen) genOperatorNames() {
 	var names bytes.Buffer
 	var indexes bytes.Buffer
+
+	genByTag := func(tag string) {
+		for _, define := range g.compiled.Defines.WithTag(tag) {
+			fmt.Fprintf(&indexes, "%d, ", names.Len())
+
+			// Trim the Op suffix and convert to "dash case".
+			fmt.Fprint(&names, dashCase(string(define.Name)))
+		}
+	}
 
 	fmt.Fprint(&names, "unknown")
 	fmt.Fprint(&indexes, "0, ")
 
-	for _, define := range compiled.Defines {
-		fmt.Fprintf(&indexes, "%d, ", names.Len())
+	genByTag("Enforcer")
+	genByTag("Relational")
+	genByTag("Scalar")
 
-		// Trim the Op suffix and convert to "dash case".
-		fmt.Fprint(&names, dashCase(string(define.Name)))
+	fmt.Fprintf(g.w, "const opNames = \"%s\"\n\n", names.String())
+
+	fmt.Fprintf(g.w, "var opIndexes = [...]uint32{%s%d}\n\n", indexes.String(), names.Len())
+}
+
+func (g *opsGen) genOperatorEnumByTag(tag string) {
+	fmt.Fprintf(g.w, "  // ------------------------------------------------------------ \n")
+	fmt.Fprintf(g.w, "  // %s Operators\n", tag)
+	fmt.Fprintf(g.w, "  // ------------------------------------------------------------ \n")
+	for _, define := range g.compiled.Defines.WithTag(tag) {
+		fmt.Fprintf(g.w, "\n")
+		generateDefineComments(g.w, define, string(define.Name)+"Op")
+		fmt.Fprintf(g.w, "  %sOp\n", define.Name)
 	}
+	fmt.Fprintf(g.w, "\n")
+}
 
-	fmt.Fprintf(w, "const opNames = \"%s\"\n\n", names.String())
-
-	fmt.Fprintf(w, "var opIndexes = [...]uint32{%s%d}\n\n", indexes.String(), names.Len())
+func (g *opsGen) genOperatorsByTag() {
+	for _, tag := range g.compiled.DefineTags {
+		fmt.Fprintf(g.w, "var %sOperators = [...]Operator{\n", tag)
+		for _, define := range g.compiled.Defines.WithTag(tag) {
+			fmt.Fprintf(g.w, "  %sOp,\n", define.Name)
+		}
+		fmt.Fprintf(g.w, "}\n\n")
+	}
 }
 
 // dashCase converts camel-case identifiers into "dash case", where uppercase

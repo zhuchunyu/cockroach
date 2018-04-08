@@ -17,45 +17,42 @@ protobuf.configure();
 import React from "react";
 import * as ReactDOM from "react-dom";
 import { Provider } from "react-redux";
-import { Router, Route, IndexRoute, IndexRedirect } from "react-router";
+import { Router, Route, IndexRoute, IndexRedirect, Redirect } from "react-router";
 
 import {
   tableNameAttr, databaseNameAttr, nodeIDAttr, dashboardNameAttr, rangeIDAttr,
 } from "src/util/constants";
 
+import { alertDataSync } from "src/redux/alerts";
 import "src/redux/analytics";
 import { store, history } from "src/redux/state";
 
-import Layout from "src/views/app/containers/layout";
+import visualizationRoutes from "src/routes/visualization";
 
+import NotFound from "src/views/app/components/NotFound";
+import Layout from "src/views/app/containers/layout";
 import { DatabaseTablesList, DatabaseGrantsList } from "src/views/databases/containers/databases";
 import TableDetails from "src/views/databases/containers/tableDetails";
-
-import JobsPage from "src/views/jobs";
-
-import ClusterOverview from "src/views/cluster/containers/clusterOverview";
-import NodesOverview from "src/views/cluster/containers/nodesOverview";
-import NodeOverview from "src/views/cluster/containers/nodeOverview";
-import NodeGraphs from "src/views/cluster/containers/nodeGraphs";
-import NodeLogs from "src/views/cluster/containers/nodeLogs";
 import { EventPage } from "src/views/cluster/containers/events";
-
 import Raft from "src/views/devtools/containers/raft";
 import RaftRanges from "src/views/devtools/containers/raftRanges";
 import RaftMessages from "src/views/devtools/containers/raftMessages";
+import NodeGraphs from "src/views/cluster/containers/nodeGraphs";
+import NodesOverview from "src/views/cluster/containers/nodesOverview";
+import NodeOverview from "src/views/cluster/containers/nodeOverview";
+import NodeLogs from "src/views/cluster/containers/nodeLogs";
+import JobsPage from "src/views/jobs";
+import Certificates from "src/views/reports/containers/certificates";
+import CommandQueue from "src/views/reports/containers/commandQueue";
+import CustomChart from "src/views/reports/containers/customChart";
+import Debug from "src/views/reports/containers/debug";
 import ProblemRanges from "src/views/reports/containers/problemRanges";
 import Localities from "src/views/reports/containers/localities";
 import Network from "src/views/reports/containers/network";
 import Nodes from "src/views/reports/containers/nodes";
-import Certificates from "src/views/reports/containers/certificates";
+import ReduxDebug from "src/views/reports/containers/redux";
 import Range from "src/views/reports/containers/range";
-import CommandQueue from "src/views/reports/containers/commandQueue";
-import Debug from "src/views/reports/containers/debug";
-import NotFound from "src/views/app/components/NotFound";
-
-import { alertDataSync } from "src/redux/alerts";
-
-import visualizationRoutes from "src/routes/visualization";
+import Settings from "src/views/reports/containers/settings";
 
 // NOTE: If you are adding a new path to the router, and that path contains any
 // components that are personally identifying information, you MUST update the
@@ -71,36 +68,72 @@ ReactDOM.render(
     <Router history={history}>
       <Route path="/" component={Layout}>
         <IndexRedirect to="overview" />
-        <Route path="overview">
-          <IndexRoute component={ClusterOverview} />
-        </Route>
-        <Route path="cluster">
-          <IndexRedirect to="all/overview" />
-          <Route path={`all/:${dashboardNameAttr}`} component={NodeGraphs} />
-          <Route path={ `node/:${nodeIDAttr}/:${dashboardNameAttr}` } component={NodeGraphs} />
-          <Route path="nodes">
-            <IndexRoute component={NodesOverview} />
-            <Route path={`:${nodeIDAttr}`}>
-              <IndexRoute component={NodeOverview} />
-              <Route path="logs" component={ NodeLogs } />
+
+        { /* overview page */ }
+        { visualizationRoutes() }
+
+        { /* time series metrics */ }
+        <Route path="metrics">
+          <IndexRedirect to="overview/cluster" />
+          <Route path={ `:${dashboardNameAttr}` }>
+            <IndexRedirect to="cluster" />
+            <Route path="cluster" component={ NodeGraphs } />
+            <Route path="node">
+              <IndexRedirect to={ `/metrics/:${dashboardNameAttr}/cluster` } />
+              <Route path={ `:${nodeIDAttr}` } component={ NodeGraphs } />
             </Route>
           </Route>
-          <Route path="events" component={ EventPage } />
         </Route>
+
+        { /* node details */ }
+        <Route path="nodes">
+          <IndexRoute component={ NodesOverview } />
+        </Route>
+        <Route path="node">
+          <IndexRedirect to="/nodes" />
+          <Route path={ `:${nodeIDAttr}` }>
+            <IndexRoute component={ NodeOverview } />
+            <Route path="logs" component={ NodeLogs } />
+          </Route>
+        </Route>
+
+        { /* events & jobs */ }
+        <Route path="events" component={ EventPage } />
+        <Route path="jobs" component={ JobsPage } />
+
+        { /* databases */ }
         <Route path="databases">
           <IndexRedirect to="tables" />
           <Route path="tables" component={ DatabaseTablesList } />
           <Route path="grants" component={ DatabaseGrantsList } />
-          <Route path={ `database/:${databaseNameAttr}/table/:${tableNameAttr}` } component={ TableDetails } />
+          <Redirect
+            from={ `database/:${databaseNameAttr}/table/:${tableNameAttr}` }
+            to={ `/database/:${databaseNameAttr}/table/:${tableNameAttr}` }
+          />
         </Route>
-        <Route path="jobs" component={ JobsPage } />
+        <Route path="database">
+          <IndexRedirect to="/databases" />
+          <Route path={ `:${databaseNameAttr}` }>
+            <IndexRedirect to="/databases" />
+            <Route path="table">
+              <IndexRedirect to="/databases" />
+              <Route path={ `:${tableNameAttr}` } component={ TableDetails } />
+            </Route>
+          </Route>
+        </Route>
+
+        { /* debug pages */ }
+        <Route path="debug">
+          <IndexRoute component={Debug} />
+          <Route path="redux" component={ReduxDebug} />
+          <Route path="chart" component={CustomChart} />
+        </Route>
         <Route path="raft" component={ Raft }>
           <IndexRedirect to="ranges" />
           <Route path="ranges" component={ RaftRanges } />
           <Route path="messages/all" component={ RaftMessages } />
           <Route path={`messages/node/:${nodeIDAttr}`} component={ RaftMessages } />
         </Route>
-        <Route path="debug" component={ Debug } />
         <Route path="reports">
           <Route path="problemranges" component={ ProblemRanges }>
             <Route path={`:${nodeIDAttr}`} component={ ProblemRanges }/>
@@ -108,11 +141,34 @@ ReactDOM.render(
           <Route path="localities" component={ Localities } />
           <Route path="network" component={ Network } />
           <Route path="nodes" component={ Nodes } />
+          <Route path="settings" component={ Settings } />
           <Route path={`certificates/:${nodeIDAttr}`} component={ Certificates } />
           <Route path={`range/:${rangeIDAttr}`} component={ Range } />
           <Route path={`range/:${rangeIDAttr}/cmdqueue`} component={ CommandQueue } />
         </Route>
-        { visualizationRoutes() }
+
+        { /* old route redirects */ }
+        <Route path="cluster">
+          <IndexRedirect to="/metrics/overview/cluster" />
+          <Redirect
+            from={`all/:${dashboardNameAttr}`}
+            to={ `/metrics/:${dashboardNameAttr}/cluster` }
+          />
+          <Redirect
+            from={ `node/:${nodeIDAttr}/:${dashboardNameAttr}` }
+            to={ `/metrics/:${dashboardNameAttr}/node/:${nodeIDAttr}` }
+          />
+          <Route path="nodes">
+            <IndexRedirect to="/nodes" />
+            <Route path={`:${nodeIDAttr}`}>
+              <IndexRedirect to={ `/node/:${nodeIDAttr}` } />
+              <Redirect from="logs" to={ `/node/:${nodeIDAttr}/logs` } />
+            </Route>
+          </Route>
+          <Redirect from="events" to="/events" />
+        </Route>
+
+        { /* 404 */ }
         <Route path="*" component={ NotFound } />
       </Route>
     </Router>

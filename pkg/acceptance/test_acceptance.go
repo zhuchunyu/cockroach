@@ -22,15 +22,38 @@
 package acceptance
 
 import (
-	"fmt"
+	"context"
 	"os"
+	"os/signal"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 func MainTest(m *testing.M) {
-	if *flagRemote {
-		fmt.Fprintln(os.Stderr, "use `make test [...]` instead of `make acceptance [...]` when running remote cluster")
-		os.Exit(1)
-	}
-	RunTests(m)
+	os.Exit(RunTests(m))
+}
+
+// RunTests runs the tests in a package while gracefully handling interrupts.
+func RunTests(m *testing.M) int {
+	randutil.SeedForTests()
+
+	ctx := context.Background()
+	defer cluster.GenerateCerts(ctx)()
+
+	go func() {
+		// Shut down tests when interrupted (for example CTRL+C).
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		<-sig
+		select {
+		case <-stopper.ShouldStop():
+		default:
+			// There is a very tiny race here: the cluster might be closing
+			// the stopper simultaneously.
+			stopper.Stop(ctx)
+		}
+	}()
+	return m.Run()
 }

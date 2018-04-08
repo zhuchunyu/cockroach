@@ -103,6 +103,13 @@ func NewInvalidSchemaDefinitionError(err error) error {
 	return pgerror.NewError(pgerror.CodeInvalidSchemaDefinitionError, err.Error())
 }
 
+// NewUnsupportedSchemaUsageError creates an error for an invalid
+// schema use, e.g. mydb.someschema.tbl.
+func NewUnsupportedSchemaUsageError(name string) error {
+	return pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
+		"unsupported schema specification: %q", name)
+}
+
 // NewCCLRequiredError creates an error for when a CCL feature is used in an OSS
 // binary.
 func NewCCLRequiredError(err error) error {
@@ -117,10 +124,20 @@ func IsCCLRequiredError(err error) bool {
 // IsPermanentSchemaChangeError returns true if the error results in
 // a permanent failure of a schema change.
 func IsPermanentSchemaChangeError(err error) bool {
-	return errHasCode(err, pgerror.CodeNotNullViolationError) ||
-		errHasCode(err, pgerror.CodeUniqueViolationError) ||
-		errHasCode(err, pgerror.CodeInvalidSchemaDefinitionError) ||
-		errHasCode(err, CodeCCLRequired)
+	if errHasCode(err,
+		pgerror.CodeNotNullViolationError,
+		pgerror.CodeUniqueViolationError,
+		pgerror.CodeInvalidSchemaDefinitionError,
+		CodeCCLRequired,
+	) {
+		return true
+	}
+	switch err.(type) {
+	case *roachpb.BatchTimestampBeforeGCError:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewUndefinedDatabaseError creates an error that represents a missing database.
@@ -134,9 +151,12 @@ func NewUndefinedDatabaseError(name string) error {
 		pgerror.CodeInvalidCatalogNameError, "database %q does not exist", name)
 }
 
-// IsUndefinedDatabaseError returns true if the error is for an undefined database.
-func IsUndefinedDatabaseError(err error) bool {
-	return errHasCode(err, pgerror.CodeInvalidCatalogNameError)
+// NewInvalidWildcardError creates an error that represents the result of expanding
+// a table wildcard over an invalid database or schema prefix.
+func NewInvalidWildcardError(name string) error {
+	return pgerror.NewErrorf(
+		pgerror.CodeInvalidCatalogNameError,
+		"%q does not match any valid database or schema", name)
 }
 
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
@@ -145,9 +165,9 @@ func NewUndefinedRelationError(name tree.NodeFormatter) error {
 		"relation %q does not exist", tree.ErrString(name))
 }
 
-// IsUndefinedRelationError returns true if the error is for an undefined table.
-func IsUndefinedRelationError(err error) bool {
-	return errHasCode(err, pgerror.CodeUndefinedTableError)
+// NewUndefinedColumnError creates an error that represents a missing database column.
+func NewUndefinedColumnError(name string) error {
+	return pgerror.NewErrorf(pgerror.CodeUndefinedColumnError, "column %q does not exist", name)
 }
 
 // NewDatabaseAlreadyExistsError creates an error for a preexisting database.
@@ -209,40 +229,47 @@ func NewWindowingError(in string) error {
 // conditions under which Postgres returns this code, nor its relationship to
 // code CodeTransactionResolutionUnknownError. I couldn't find good
 // documentation on these codes.
-func NewStatementCompletionUnknownError(err *roachpb.AmbiguousResultError) error {
+func NewStatementCompletionUnknownError(err error) error {
 	return pgerror.NewErrorf(pgerror.CodeStatementCompletionUnknownError, err.Error())
 }
 
-// NewQueryCanceledError creates a query cancellation error.
-func NewQueryCanceledError() error {
-	return pgerror.NewErrorf(pgerror.CodeQueryCanceledError, "query execution canceled")
-}
+// QueryCanceledError is an error representing query cancellation.
+var QueryCanceledError = pgerror.NewErrorf(
+	pgerror.CodeQueryCanceledError, "query execution canceled")
+
+// QueryTimeoutError is an error representing a query timeout.
+var QueryTimeoutError = pgerror.NewErrorf(
+	pgerror.CodeQueryCanceledError, "query execution canceled due to statement timeout")
 
 // IsQueryCanceledError checks whether this is a query canceled error.
 func IsQueryCanceledError(err error) bool {
-	return errHasCode(err, pgerror.CodeQueryCanceledError) || strings.Contains(err.Error(), "query execution canceled")
+	return errHasCode(err, pgerror.CodeQueryCanceledError)
 }
 
-func errHasCode(err error, code string) bool {
+func errHasCode(err error, code ...string) bool {
 	if pgErr, ok := pgerror.GetPGCause(err); ok {
-		return pgErr.Code == code
+		for _, c := range code {
+			if pgErr.Code == c {
+				return true
+			}
+		}
 	}
 	return false
 }
 
 // singleKVFetcher is a kvFetcher that returns a single kv.
 type singleKVFetcher struct {
-	kv   roachpb.KeyValue
+	kvs  [1]roachpb.KeyValue
 	done bool
 }
 
-// nextKV implements the kvFetcher interface.
-func (f *singleKVFetcher) nextKV(ctx context.Context) (bool, roachpb.KeyValue, error) {
+// nextBatch implements the kvFetcher interface.
+func (f *singleKVFetcher) nextBatch(_ context.Context) (bool, []roachpb.KeyValue, error) {
 	if f.done {
-		return false, roachpb.KeyValue{}, nil
+		return false, nil, nil
 	}
 	f.done = true
-	return true, f.kv, nil
+	return true, f.kvs[:], nil
 }
 
 // getRangesInfo implements the kvFetcher interface.
@@ -303,9 +330,9 @@ func ConvertBatchError(ctx context.Context, tableDesc *TableDescriptor, b *clien
 		); err != nil {
 			return err
 		}
-		f := singleKVFetcher{kv: roachpb.KeyValue{Key: key}}
+		f := singleKVFetcher{kvs: [1]roachpb.KeyValue{{Key: key}}}
 		if cErr.ActualValue != nil {
-			f.kv.Value = *cErr.ActualValue
+			f.kvs[0].Value = *cErr.ActualValue
 		}
 		// Use the RowFetcher to decode the single kv pair above by passing in
 		// this singleKVFetcher implementation, which doesn't actually hit KV.

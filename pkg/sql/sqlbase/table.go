@@ -138,7 +138,9 @@ func populateTypeAttrs(base ColumnType, typ coltypes.T) (ColumnType, error) {
 			return ColumnType{}, err
 		}
 	case *coltypes.TVector:
-		if _, ok := t.ParamType.(*coltypes.TInt); !ok {
+		switch t.ParamType.(type) {
+		case *coltypes.TInt, *coltypes.TOid:
+		default:
 			return ColumnType{}, errors.Errorf("vectors of type %s are unsupported", t.ParamType)
 		}
 	case *coltypes.TOid:
@@ -437,7 +439,8 @@ func MakeKeyFromEncDatums(
 	alloc *DatumAlloc,
 ) (roachpb.Key, error) {
 	dirs := index.ColumnDirections
-	if len(values) != len(dirs) {
+	// Values may be a prefix of the index columns.
+	if len(values) > len(dirs) {
 		return nil, errors.Errorf("%d values, %d directions", len(values), len(dirs))
 	}
 	if len(values) != len(types) {
@@ -1591,9 +1594,12 @@ func EncodeInvertedIndexKeys(
 // a list of buffers per path. The encoded values is guaranteed to be lexicographically sortable, but not
 // guaranteed to be round-trippable during decoding.
 func EncodeInvertedIndexTableKeys(val tree.Datum, inKey []byte) (key [][]byte, err error) {
+	if val == tree.DNull {
+		return [][]byte{encoding.EncodeNullAscending(inKey)}, nil
+	}
 	switch t := tree.UnwrapDatum(nil, val).(type) {
 	case *tree.DJSON:
-		return (t.JSON).EncodeInvertedIndexKeys(inKey)
+		return json.EncodeInvertedIndexKeys(inKey, (t.JSON))
 	}
 	return nil, pgerror.NewError(pgerror.CodeInternalError, "trying to apply inverted index to non JSON type")
 }
@@ -1705,16 +1711,20 @@ func EncodeSecondaryIndexes(
 	values []tree.Datum,
 	secondaryIndexEntries []IndexEntry,
 ) ([]IndexEntry, error) {
+	if len(secondaryIndexEntries) != len(indexes) {
+		panic("Length of secondaryIndexEntries is not equal to the number of indexes.")
+	}
 	for i := range indexes {
 		entries, err := EncodeSecondaryIndex(tableDesc, &indexes[i], colMap, values)
 		if err != nil {
 			return secondaryIndexEntries, err
 		}
+		secondaryIndexEntries[i] = entries[0]
+
+		// This is specifically for inverted indexes which can have more than one entry
+		// associated with them.
 		if len(entries) > 1 {
 			secondaryIndexEntries = append(secondaryIndexEntries, entries[1:]...)
-		}
-		if len(entries) > 0 {
-			secondaryIndexEntries[i] = entries[0]
 		}
 	}
 	return secondaryIndexEntries, nil
@@ -1724,7 +1734,7 @@ func EncodeSecondaryIndexes(
 // with the type requested by the column. If the value is a
 // placeholder, the type of the placeholder gets populated.
 func CheckColumnType(col ColumnDescriptor, typ types.T, pmap *tree.PlaceholderInfo) error {
-	if typ == types.Null {
+	if typ == types.Unknown {
 		return nil
 	}
 
@@ -1912,7 +1922,9 @@ func encodeArray(d *tree.DArray, scratch []byte) ([]byte, error) {
 		return scratch, err
 	}
 	scratch = scratch[0:0]
-	elementType, err := parserTypeToEncodingType(d.ParamTyp)
+	unwrapped := types.UnwrapType(d.ParamTyp)
+	elementType, err := parserTypeToEncodingType(unwrapped)
+
 	if err != nil {
 		return nil, err
 	}
@@ -2236,7 +2248,7 @@ type ConstraintDetail struct {
 type tableLookupFn func(ID) (*TableDescriptor, error)
 
 // GetConstraintInfo returns a summary of all constraints on the table.
-func (desc TableDescriptor) GetConstraintInfo(
+func (desc *TableDescriptor) GetConstraintInfo(
 	ctx context.Context, txn *client.Txn,
 ) (map[string]ConstraintDetail, error) {
 	var tableLookup tableLookupFn
@@ -2250,7 +2262,7 @@ func (desc TableDescriptor) GetConstraintInfo(
 
 // GetConstraintInfoWithLookup returns a summary of all constraints on the
 // table using the provided function to fetch a TableDescriptor from an ID.
-func (desc TableDescriptor) GetConstraintInfoWithLookup(
+func (desc *TableDescriptor) GetConstraintInfoWithLookup(
 	tableLookup tableLookupFn,
 ) (map[string]ConstraintDetail, error) {
 	return desc.collectConstraintInfo(tableLookup)
@@ -2258,14 +2270,14 @@ func (desc TableDescriptor) GetConstraintInfoWithLookup(
 
 // CheckUniqueConstraints returns a non-nil error if a descriptor contains two
 // constraints with the same name.
-func (desc TableDescriptor) CheckUniqueConstraints() error {
+func (desc *TableDescriptor) CheckUniqueConstraints() error {
 	_, err := desc.collectConstraintInfo(nil)
 	return err
 }
 
 // if `tableLookup` is non-nil, provide a full summary of constraints, otherwise just
 // check that constraints have unique names.
-func (desc TableDescriptor) collectConstraintInfo(
+func (desc *TableDescriptor) collectConstraintInfo(
 	tableLookup tableLookupFn,
 ) (map[string]ConstraintDetail, error) {
 	info := make(map[string]ConstraintDetail)
@@ -2329,13 +2341,13 @@ func (desc TableDescriptor) collectConstraintInfo(
 			if tableLookup != nil {
 				other, err := tableLookup(index.ForeignKey.Table)
 				if err != nil {
-					return nil, errors.Errorf("error resolving table %d referenced in foreign key",
+					return nil, errors.Wrapf(err, "error resolving table %d referenced in foreign key",
 						index.ForeignKey.Table)
 				}
 				otherIdx, err := other.FindIndexByID(index.ForeignKey.Index)
 				if err != nil {
-					return nil, errors.Errorf("error resolving index %d in table %s referenced in foreign key",
-						index.ForeignKey.Index, other.Name)
+					return nil, errors.Wrapf(err, "error resolving index %d in table %s referenced "+
+						"in foreign key", index.ForeignKey.Index, other.Name)
 				}
 				detail.Details = fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames)
 				detail.FK = &index.ForeignKey
@@ -2355,6 +2367,18 @@ func (desc TableDescriptor) collectConstraintInfo(
 		if tableLookup != nil {
 			detail.Details = c.Expr
 			detail.CheckConstraint = c
+
+			colsUsed, err := c.ColumnsUsed(desc)
+			if err != nil {
+				return nil, errors.Wrapf(err, "error computing columns used in check constraint %q", c.Name)
+			}
+			for _, colID := range colsUsed {
+				col, err := desc.FindColumnByID(colID)
+				if err != nil {
+					return nil, errors.Wrapf(err, "error finding column %d in table %s", colID, desc.Name)
+				}
+				detail.Columns = append(detail.Columns, col.Name)
+			}
 		}
 		info[c.Name] = detail
 	}

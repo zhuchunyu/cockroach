@@ -111,6 +111,60 @@ func TestSorter(t *testing.T) {
 				{v[3], v[3], v[0]},
 			},
 		}, {
+			name: "SortOffset",
+			// No specified input ordering but specified offset and limit.
+			spec: SorterSpec{
+				OutputOrdering: convertToSpecOrdering(
+					sqlbase.ColumnOrdering{
+						{ColIdx: 0, Direction: asc},
+						{ColIdx: 1, Direction: asc},
+						{ColIdx: 2, Direction: asc},
+					}),
+			},
+			post:  PostProcessSpec{Offset: 2, Limit: 2},
+			types: threeIntCols,
+			input: sqlbase.EncDatumRows{
+				{v[3], v[3], v[0]},
+				{v[3], v[4], v[1]},
+				{v[1], v[0], v[4]},
+				{v[0], v[0], v[0]},
+				{v[4], v[4], v[4]},
+				{v[4], v[4], v[5]},
+				{v[3], v[2], v[0]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[3], v[2], v[0]},
+				{v[3], v[3], v[0]},
+			},
+		}, {
+			name: "SortFilterExpr",
+			// No specified input ordering but specified postprocess filter expression.
+			spec: SorterSpec{
+				OutputOrdering: convertToSpecOrdering(
+					sqlbase.ColumnOrdering{
+						{ColIdx: 0, Direction: asc},
+						{ColIdx: 1, Direction: asc},
+						{ColIdx: 2, Direction: asc},
+					}),
+			},
+			post:  PostProcessSpec{Filter: Expression{Expr: "@1 + @2 < 7"}},
+			types: threeIntCols,
+			input: sqlbase.EncDatumRows{
+				{v[3], v[3], v[0]},
+				{v[3], v[4], v[1]},
+				{v[1], v[0], v[4]},
+				{v[0], v[0], v[0]},
+				{v[4], v[4], v[4]},
+				{v[4], v[4], v[5]},
+				{v[3], v[2], v[0]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[0], v[0], v[0]},
+				{v[1], v[0], v[4]},
+				{v[3], v[2], v[0]},
+				{v[3], v[3], v[0]},
+			},
+		}, {
 			name: "SortMatchOrderingNoLimit",
 			// Specified match ordering length but no specified limit.
 			spec: SorterSpec{
@@ -180,17 +234,50 @@ func TestSorter(t *testing.T) {
 				{v[0], v[2], v[2], v[4]},
 				{v[1], v[2], v[2], v[5]},
 			},
+		}, {
+			name: "SortInputOrderingAlreadySorted",
+			spec: SorterSpec{
+				OrderingMatchLen: 2,
+				OutputOrdering: convertToSpecOrdering(
+					sqlbase.ColumnOrdering{
+						{ColIdx: 1, Direction: asc},
+						{ColIdx: 2, Direction: asc},
+						{ColIdx: 3, Direction: asc},
+					}),
+			},
+			types: []sqlbase.ColumnType{intType, intType, intType, intType},
+			input: sqlbase.EncDatumRows{
+				{v[1], v[1], v[2], v[2]},
+				{v[0], v[1], v[2], v[3]},
+				{v[0], v[1], v[2], v[4]},
+				{v[1], v[1], v[2], v[5]},
+				{v[1], v[2], v[2], v[2]},
+				{v[0], v[2], v[2], v[3]},
+				{v[0], v[2], v[2], v[4]},
+				{v[1], v[2], v[2], v[5]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[1], v[1], v[2], v[2]},
+				{v[0], v[1], v[2], v[3]},
+				{v[0], v[1], v[2], v[4]},
+				{v[1], v[1], v[2], v[5]},
+				{v[1], v[2], v[2], v[2]},
+				{v[0], v[2], v[2], v[3]},
+				{v[0], v[2], v[2], v[4]},
+				{v[1], v[2], v[2], v[5]},
+			},
 		},
 	}
 
 	ctx := context.Background()
-	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig())
+	st := cluster.MakeTestingClusterSettings()
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
-	evalCtx := tree.MakeTestingEvalContext()
+	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := mon.MakeMonitor(
 		"test-disk",
@@ -199,6 +286,7 @@ func TestSorter(t *testing.T) {
 		nil, /* maxHist */
 		-1,  /* increment: use default block size */
 		math.MaxInt64,
+		st,
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
@@ -217,42 +305,56 @@ func TestSorter(t *testing.T) {
 		// 1150: This is the memory used after we store a couple of rows in
 		// memory. Tests the transfer of rows from memory to disk on
 		// initialization.
-		// 2048: A memory limit that should not be hit; the strategy will not
+		// 2048: A memory limit that should not be hit; the processor will not
 		// use disk.
 		for _, memLimit := range []int64{0, 1, 1150, 2048} {
-			t.Run(fmt.Sprintf("%sMemLimit=%d", c.name, memLimit), func(t *testing.T) {
-				in := NewRowBuffer(c.types, c.input, RowBufferArgs{})
-				out := &RowBuffer{}
+			// In theory, SortAllProcessor should be able to handle all sorting
+			// strategies, as the other processors are optimizations.
+			for _, testingForceSortAll := range []bool{false, true} {
+				t.Run(fmt.Sprintf("MemLimit=%d", memLimit), func(t *testing.T) {
+					in := NewRowBuffer(c.types, c.input, RowBufferArgs{})
+					out := &RowBuffer{}
 
-				s, err := newSorter(&flowCtx, &c.spec, in, &c.post, out)
-				if err != nil {
-					t.Fatal(err)
-				}
-				// Override the default memory limit. This will result in using
-				// a memory row container which will hit this limit and fall
-				// back to using a disk row container.
-				s.flowCtx.testingKnobs.MemoryLimitBytes = memLimit
-				s.Run(nil)
-				if !out.ProducerClosed {
-					t.Fatalf("output RowReceiver not closed")
-				}
-
-				var retRows sqlbase.EncDatumRows
-				for {
-					row := out.NextNoMeta(t)
-					if row == nil {
-						break
+					var s Processor
+					if !testingForceSortAll {
+						var err error
+						s, err = newSorter(&flowCtx, &c.spec, in, &c.post, out)
+						if err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						var err error
+						s, err = newSortAllProcessor(&flowCtx, &c.spec, in, &c.post, out)
+						if err != nil {
+							t.Fatal(err)
+						}
 					}
-					retRows = append(retRows, row)
-				}
+					// Override the default memory limit. This will result in using
+					// a memory row container which will hit this limit and fall
+					// back to using a disk row container.
+					flowCtx.testingKnobs.MemoryLimitBytes = memLimit
+					s.Run(nil)
+					if !out.ProducerClosed {
+						t.Fatalf("output RowReceiver not closed")
+					}
 
-				expStr := c.expected.String(c.types)
-				retStr := retRows.String(c.types)
-				if expStr != retStr {
-					t.Errorf("invalid results; expected:\n   %s\ngot:\n   %s",
-						expStr, retStr)
-				}
-			})
+					var retRows sqlbase.EncDatumRows
+					for {
+						row := out.NextNoMeta(t)
+						if row == nil {
+							break
+						}
+						retRows = append(retRows, row)
+					}
+
+					expStr := c.expected.String(c.types)
+					retStr := retRows.String(c.types)
+					if expStr != retStr {
+						t.Errorf("invalid results; expected:\n   %s\ngot:\n   %s",
+							expStr, retStr)
+					}
+				})
+			}
 		}
 	}
 }
@@ -260,11 +362,12 @@ func TestSorter(t *testing.T) {
 // BenchmarkSortAll times how long it takes to sort an input of varying length.
 func BenchmarkSortAll(b *testing.B) {
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := FlowCtx{
 		Ctx:      ctx,
-		Settings: cluster.MakeTestingClusterSettings(),
+		Settings: st,
 		EvalCtx:  evalCtx,
 	}
 
@@ -304,11 +407,12 @@ func BenchmarkSortAll(b *testing.B) {
 // varying limits.
 func BenchmarkSortLimit(b *testing.B) {
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := FlowCtx{
 		Ctx:      ctx,
-		Settings: cluster.MakeTestingClusterSettings(),
+		Settings: st,
 		EvalCtx:  evalCtx,
 	}
 

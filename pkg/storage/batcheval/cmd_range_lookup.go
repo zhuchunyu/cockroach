@@ -29,17 +29,71 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.RangeLookup, declareKeysRangeLookup, RangeLookup)
+	RegisterCommand(roachpb.DeprecatedRangeLookup, declareKeysDeprecatedRangeLookup, DeprecatedRangeLookup)
 }
 
-func declareKeysRangeLookup(
+func declareKeysDeprecatedRangeLookup(
 	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
-	DefaultDeclareKeys(desc, header, req, spans)
+	lookupReq := req.(*roachpb.DeprecatedRangeLookupRequest)
+
+	if keys.IsLocal(lookupReq.Key) {
+		// Error will be thrown during evaluation.
+		return
+	}
+	key := roachpb.RKey(lookupReq.Key)
+
+	// RangeLookupRequests depend on the range descriptor because they need
+	// to determine which range descriptors are within the local range.
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
+
+	// Both forward and reverse RangeLookupRequests scan forward initially. We are
+	// unable to bound this initial scan any further than from the lookup key to
+	// the end of the current descriptor.
+	if !lookupReq.Reverse || key.Less(roachpb.RKey(keys.Meta2KeyMax)) {
+		scanBounds, err := rangeLookupScanBounds(&desc, key, false /* reverse */)
+		if err != nil {
+			// Errors will be caught during evaluation.
+			return
+		}
+		spans.Add(spanset.SpanReadOnly, roachpb.Span{
+			Key:    scanBounds.Key.AsRawKey(),
+			EndKey: scanBounds.EndKey.AsRawKey(),
+		})
+	}
+
+	// A reverse RangeLookupRequest also scans backwards.
+	if lookupReq.Reverse {
+		revScanBounds, err := rangeLookupScanBounds(&desc, key, true /* reverse */)
+		if err != nil {
+			// Errors will be caught during evaluation.
+			return
+		}
+		spans.Add(spanset.SpanReadOnly, roachpb.Span{
+			Key:    revScanBounds.Key.AsRawKey(),
+			EndKey: revScanBounds.EndKey.AsRawKey(),
+		})
+	}
 }
 
-// RangeLookup is used to look up RangeDescriptors - a RangeDescriptor
+// rangeLookupScanBounds returns the range [start,end) within the bounds of the
+// provided RangeDescriptor which the desired meta record can be found by means
+// of an engine scan.
+func rangeLookupScanBounds(
+	desc *roachpb.RangeDescriptor, key roachpb.RKey, reverse bool,
+) (roachpb.RSpan, error) {
+	boundsFn := keys.MetaScanBounds
+	if reverse {
+		boundsFn = keys.MetaReverseScanBounds
+	}
+	span, err := boundsFn(key)
+	if err != nil {
+		return roachpb.RSpan{}, err
+	}
+	return span.Intersect(desc)
+}
+
+// DeprecatedRangeLookup is used to look up RangeDescriptors - a RangeDescriptor
 // is a metadata structure which describes the key range and replica locations
 // of a distinct range in the cluster.
 //
@@ -72,22 +126,20 @@ func declareKeysRangeLookup(
 // are likely to be desired by their current workload. The Reverse flag
 // specifies whether descriptors are prefetched in descending or ascending
 // order.
-func RangeLookup(
+func DeprecatedRangeLookup(
 	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	log.Event(ctx, "RangeLookup")
-	args := cArgs.Args.(*roachpb.RangeLookupRequest)
+	args := cArgs.Args.(*roachpb.DeprecatedRangeLookupRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.RangeLookupResponse)
+	reply := resp.(*roachpb.DeprecatedRangeLookupResponse)
 
-	key, err := keys.Addr(args.Key)
-	if err != nil {
-		return result.Result{}, err
-	}
-	if !key.Equal(args.Key) {
+	if keys.IsLocal(args.Key) {
 		return result.Result{}, errors.Errorf("illegal lookup of range-local key %q", args.Key)
 	}
-	ts, txn, consistent, rangeCount := h.Timestamp, h.Txn, h.ReadConsistency != roachpb.INCONSISTENT, int64(args.MaxRanges)
+	key := roachpb.RKey(args.Key)
+
+	ts, txn, consistent, rangeCount := h.Timestamp, h.Txn, h.ReadConsistency == roachpb.CONSISTENT, int64(args.MaxRanges)
 	if rangeCount < 1 {
 		return result.Result{}, errors.Errorf("range lookup specified invalid maximum range count %d: must be > 0", rangeCount)
 	}
@@ -112,11 +164,7 @@ func RangeLookup(
 		// We want to search for the metadata key greater than
 		// args.Key. Scan for both the requested key and the keys immediately
 		// afterwards, up to MaxRanges.
-		span, err := keys.MetaScanBounds(key)
-		if err != nil {
-			return result.Result{}, err
-		}
-		span, err = span.Intersect(desc)
+		span, err := rangeLookupScanBounds(desc, key, false /* reverse */)
 		if err != nil {
 			return result.Result{}, err
 		}
@@ -167,11 +215,7 @@ func RangeLookup(
 		}
 
 		if key.Less(roachpb.RKey(keys.Meta2KeyMax)) {
-			span, err := keys.MetaScanBounds(key)
-			if err != nil {
-				return result.Result{}, err
-			}
-			span, err = span.Intersect(desc)
+			span, err := rangeLookupScanBounds(desc, key, false /* reverse */)
 			if err != nil {
 				return result.Result{}, err
 			}
@@ -186,11 +230,7 @@ func RangeLookup(
 		// We want to search for the metadata key just less or equal to
 		// args.Key. Scan in reverse order for both the requested key and the
 		// keys immediately backwards, up to MaxRanges.
-		span, err := keys.MetaReverseScanBounds(key)
-		if err != nil {
-			return result.Result{}, err
-		}
-		span, err = span.Intersect(desc)
+		span, err := rangeLookupScanBounds(desc, key, true /* reverse */)
 		if err != nil {
 			return result.Result{}, err
 		}

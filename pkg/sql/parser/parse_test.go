@@ -234,6 +234,11 @@ func TestParse(t *testing.T) {
 
 		{`CREATE SEQUENCE a`},
 		{`CREATE SEQUENCE IF NOT EXISTS a`},
+		{`CREATE SEQUENCE a CYCLE`},
+		{`CREATE SEQUENCE a NO CYCLE`},
+		{`CREATE SEQUENCE a CACHE 0`},
+		{`CREATE SEQUENCE a CACHE 1`},
+		{`CREATE SEQUENCE a CACHE 2`},
 		{`CREATE SEQUENCE a INCREMENT 5`},
 		{`CREATE SEQUENCE a INCREMENT BY 5`},
 		{`CREATE SEQUENCE a NO MAXVALUE`},
@@ -243,6 +248,7 @@ func TestParse(t *testing.T) {
 		{`CREATE SEQUENCE a START 1000`},
 		{`CREATE SEQUENCE a START WITH 1000`},
 		{`CREATE SEQUENCE a INCREMENT 5 NO MAXVALUE MINVALUE 1 START 3`},
+		{`CREATE SEQUENCE a INCREMENT 5 NO CYCLE NO MAXVALUE MINVALUE 1 START 3 CACHE 1`},
 
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`CREATE STATISTICS a ON col1, col2 FROM t`},
@@ -305,6 +311,9 @@ func TestParse(t *testing.T) {
 
 		{`CANCEL JOB a`},
 		{`CANCEL QUERY a`},
+		{`CANCEL SESSION a`},
+		{`CANCEL QUERY IF EXISTS a`},
+		{`CANCEL SESSION IF EXISTS a`},
 		{`RESUME JOB a`},
 		{`PAUSE JOB a`},
 
@@ -322,15 +331,18 @@ func TestParse(t *testing.T) {
 		{`SHOW CLUSTER SETTING all`},
 
 		{`SHOW DATABASES`},
+		{`SHOW SCHEMAS`},
+		{`SHOW SCHEMAS FROM a`},
 		{`SHOW TABLES`},
 		{`SHOW TABLES FROM a`},
+		{`SHOW TABLES FROM a.b`},
 		{`SHOW COLUMNS FROM a`},
 		{`SHOW COLUMNS FROM a.b.c`},
 		{`SHOW INDEXES FROM a`},
 		{`SHOW INDEXES FROM a.b.c`},
 		{`SHOW CONSTRAINTS FROM a`},
 		{`SHOW CONSTRAINTS FROM a.b.c`},
-		{`SHOW TABLES FROM a; SHOW COLUMNS FROM b`},
+		{`SHOW TABLES FROM a.b; SHOW COLUMNS FROM b`},
 		{`SHOW ROLES`},
 		{`SHOW USERS`},
 		{`SHOW JOBS`},
@@ -377,6 +389,12 @@ func TestParse(t *testing.T) {
 		{`SHOW GRANTS ON DATABASE foo FOR bar`},
 		{`SHOW GRANTS FOR bar, baz`},
 
+		{`SHOW GRANTS ON ROLE`},
+		{`SHOW GRANTS ON ROLE foo`},
+		{`SHOW GRANTS ON ROLE foo, bar`},
+		{`SHOW GRANTS ON ROLE foo FOR bar`},
+		{`SHOW GRANTS ON ROLE FOR bar, baz`},
+
 		{`SHOW TRANSACTION STATUS`},
 
 		{`SHOW SYNTAX 'select 1'`},
@@ -398,6 +416,12 @@ func TestParse(t *testing.T) {
 		{`PREPARE a (STRING) AS RESTORE DATABASE a FROM $1`},
 		{`PREPARE a AS CANCEL QUERY 1`},
 		{`PREPARE a (STRING) AS CANCEL QUERY $1`},
+		{`PREPARE a AS CANCEL QUERY IF EXISTS 1`},
+		{`PREPARE a (STRING) AS CANCEL QUERY IF EXISTS $1`},
+		{`PREPARE a AS CANCEL SESSION 1`},
+		{`PREPARE a (STRING) AS CANCEL SESSION $1`},
+		{`PREPARE a AS CANCEL SESSION IF EXISTS 1`},
+		{`PREPARE a (STRING) AS CANCEL SESSION IF EXISTS $1`},
 		{`PREPARE a AS CANCEL JOB 1`},
 		{`PREPARE a (INT) AS CANCEL JOB $1`},
 		{`PREPARE a AS PAUSE JOB 1`},
@@ -445,7 +469,6 @@ func TestParse(t *testing.T) {
 		{`INSERT INTO a VALUES (1, 2), (3, 4)`},
 		{`INSERT INTO a VALUES (a + 1, 2 * 3)`},
 		{`INSERT INTO a(a, b) VALUES (1, 2)`},
-		{`INSERT INTO a(a, a.b) VALUES (1, 2)`},
 		{`INSERT INTO a SELECT b, c FROM d`},
 		{`INSERT INTO a DEFAULT VALUES`},
 		{`INSERT INTO a VALUES (1) RETURNING a, b`},
@@ -460,7 +483,6 @@ func TestParse(t *testing.T) {
 		{`UPSERT INTO a VALUES (1, 2), (3, 4)`},
 		{`UPSERT INTO a VALUES (a + 1, 2 * 3)`},
 		{`UPSERT INTO a(a, b) VALUES (1, 2)`},
-		{`UPSERT INTO a(a, a.b) VALUES (1, 2)`},
 		{`UPSERT INTO a SELECT b, c FROM d`},
 		{`UPSERT INTO a DEFAULT VALUES`},
 		{`UPSERT INTO a DEFAULT VALUES RETURNING a, b`},
@@ -549,24 +571,37 @@ func TestParse(t *testing.T) {
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
 		{`SELECT * FROM t AS "of" AS OF SYSTEM TIME '2016-01-01'`},
 
-		{`SELECT '1':::INT`},
-
-		{`SELECT '1'::INT`},
 		{`SELECT BOOL 'foo'`},
 		{`SELECT INT 'foo'`},
 		{`SELECT REAL 'foo'`},
 		{`SELECT DECIMAL 'foo'`},
+		{`SELECT BIT '1'`},
+		{`SELECT CHAR 'foo'`},
+		{`SELECT VARCHAR 'foo'`},
+		{`SELECT STRING 'foo'`},
+		{`SELECT BYTES 'foo'`},
 		{`SELECT DATE 'foo'`},
 		{`SELECT TIME 'foo'`},
 		{`SELECT TIMESTAMP 'foo'`},
 		{`SELECT TIMESTAMP WITH TIME ZONE 'foo'`},
-		{`SELECT CHAR 'foo'`},
 
+		{`SELECT '1'::INT`},
+		{`SELECT '1'::SERIAL`},
+		{`SELECT '1':::INT`},
+		{`SELECT '1':::SERIAL`},
+		{`SELECT INT '1'`},
+		{`SELECT SERIAL '1'`},
+
+		{`SELECT 'foo'::JSON`},
+		{`SELECT 'foo'::JSONB`},
+		{`SELECT 'foo':::JSON`},
+		{`SELECT 'foo':::JSONB`},
 		{`SELECT JSON 'foo'`},
 		{`SELECT JSONB 'foo'`},
 
-		{`SELECT '192.168.0.1':::INET`},
 		{`SELECT '192.168.0.1'::INET`},
+		{`SELECT '192.168.0.1':::INET`},
+		{`SELECT INET '192.168.0.1'`},
 
 		{`SELECT 'a' AS "12345"`},
 		{`SELECT 'a' AS clnm`},
@@ -777,7 +812,6 @@ func TestParse(t *testing.T) {
 
 		{`UPDATE a SET b = 3`},
 		{`UPDATE a.b SET b = 3`},
-		{`UPDATE a SET b.c = 3`},
 		{`UPDATE a SET b = 3, c = DEFAULT`},
 		{`UPDATE a SET b = 3 + 4`},
 		{`UPDATE a SET (b, c) = (3, DEFAULT)`},
@@ -872,11 +906,14 @@ func TestParse(t *testing.T) {
 		{`ALTER INDEX i EXPERIMENTAL CONFIGURE ZONE 'foo'`},
 		{`ALTER TABLE t EXPERIMENTAL CONFIGURE ZONE b'foo'`},
 		{`ALTER TABLE t EXPERIMENTAL CONFIGURE ZONE NULL`},
+		{`ALTER TABLE t EXPERIMENTAL_AUDIT SET READ WRITE`},
+		{`ALTER TABLE t EXPERIMENTAL_AUDIT SET OFF`},
 
 		{`ALTER SEQUENCE a RENAME TO b`},
 		{`ALTER SEQUENCE IF EXISTS a RENAME TO b`},
 		{`ALTER SEQUENCE a INCREMENT BY 5 START WITH 1000`},
 		{`ALTER SEQUENCE IF EXISTS a INCREMENT BY 5 START WITH 1000`},
+		{`ALTER SEQUENCE IF EXISTS a NO CYCLE CACHE 1`},
 
 		{`EXPERIMENTAL SCRUB DATABASE x`},
 		{`EXPERIMENTAL SCRUB DATABASE x AS OF SYSTEM TIME 1`},
@@ -902,16 +939,21 @@ func TestParse(t *testing.T) {
 		{`RESTORE foo FROM $1`},
 		{`RESTORE foo FROM $1, $2, 'bar'`},
 		{`RESTORE foo, baz FROM 'bar'`},
-		{`RESTORE foo, baz FROM 'bar' EXPERIMENTAL AS OF SYSTEM TIME '1'`},
+		{`RESTORE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
 		{`RESTORE DATABASE foo FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar'`},
-		{`RESTORE DATABASE foo, baz FROM 'bar' EXPERIMENTAL AS OF SYSTEM TIME '1'`},
+		{`RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
 		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`},
 		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`},
 		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT PRIMARY KEY, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
 		{`SET ROW (1, true, NULL)`},
+
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT foo TO kafka`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT foo TO kafka WITH topic_prefix = 'bar'`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT DATABASE foo TO kafka`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT foo TO kafka AS OF SYSTEM TIME '1'`},
 
 		// Regression for #15926
 		{`SELECT * FROM ((t1 NATURAL JOIN t2 WITH ORDINALITY AS o1)) WITH ORDINALITY AS o2`},
@@ -953,6 +995,9 @@ func TestParse2(t *testing.T) {
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
 		{`SELECT CAST(1 AS "char")`, `SELECT CAST(1 AS CHAR)`},
+		{`SELECT CAST(1 AS "timestamp")`, `SELECT CAST(1 AS TIMESTAMP)`},
+		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT[])`},
+		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT[])`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
@@ -961,6 +1006,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT 'a' FROM t@{FORCE_INDEX=[123]}`, `SELECT 'a' FROM t@[123]`},
 		{`SELECT 'a' FROM [123 AS t]@{FORCE_INDEX=[456]}`, `SELECT 'a' FROM [123 AS t]@[456]`},
 
+		{`SELECT a FROM t WHERE a ISNULL`, `SELECT a FROM t WHERE a IS NULL`},
+		{`SELECT a FROM t WHERE a NOTNULL`, `SELECT a FROM t WHERE a IS NOT NULL`},
 		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
 
@@ -983,6 +1030,10 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t WHERE a = + b`, `SELECT a FROM t WHERE a = (+b)`},
 		{`SELECT a FROM t WHERE a = - b`, `SELECT a FROM t WHERE a = (-b)`},
 		{`SELECT a FROM t WHERE a = ~ b`, `SELECT a FROM t WHERE a = (~b)`},
+
+		{`SELECT b <<= c`, `SELECT inet_contained_by_or_equals(b, c)`},
+		{`SELECT b >>= c`, `SELECT inet_contains_or_equals(b, c)`},
+		{`SELECT b && c`, `SELECT inet_contains_or_contained_by(b, c)`},
 
 		// Escaped string literals are not always escaped the same because
 		// '''' and e'\'' scan to the same token. It's more convenient to
@@ -1028,6 +1079,8 @@ func TestParse2(t *testing.T) {
 		// Some functions are nearly keywords.
 		{`SELECT CURRENT_SCHEMA`,
 			`SELECT current_schema()`},
+		{`SELECT CURRENT_CATALOG`,
+			`SELECT current_database()`},
 		{`SELECT CURRENT_TIMESTAMP`,
 			`SELECT current_timestamp()`},
 		{`SELECT CURRENT_DATE`,
@@ -1043,6 +1096,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT TRIM(a, b)`,
 			`SELECT btrim(a, b)`},
 		{`SELECT CURRENT_USER`,
+			`SELECT current_user()`},
+		{`SELECT CURRENT_ROLE`,
 			`SELECT current_user()`},
 		{`SELECT SESSION_USER`,
 			`SELECT current_user()`},
@@ -1097,6 +1152,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT FAMILY(x)`,
 			`SELECT "family"(x)`},
 
+		{`SET SCHEMA 'public'`,
+			`SET search_path = 'public'`},
 		{`SET TIME ZONE 'pst8pdt'`,
 			`SET timezone = 'pst8pdt'`},
 		{`SET TIME ZONE 'Europe/Rome'`,
@@ -1226,6 +1283,9 @@ func TestParse2(t *testing.T) {
 		{`RESTORE DATABASE foo FROM bar`,
 			`RESTORE DATABASE foo FROM 'bar'`},
 
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT TABLE foo TO kafka`,
+			`CREATE EXPERIMENTAL_CHANGEFEED EMIT foo TO kafka`},
+
 		{`SHOW ALL CLUSTER SETTINGS`, `SHOW CLUSTER SETTING all`},
 
 		{`SHOW SESSIONS`, `SHOW CLUSTER SESSIONS`},
@@ -1337,10 +1397,6 @@ func TestParse2(t *testing.T) {
 		{
 			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT ON DELETE RESTRICT)`,
 			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE SET DEFAULT)`,
-		},
-		{
-			`CREATE INDEX a ON b (c) USING GIN`,
-			`CREATE INVERTED INDEX a ON b (c)`,
 		},
 	}
 	for _, d := range testData {
@@ -1539,7 +1595,7 @@ SELECT 1e-
        ^
 HINT: try \h SELECT`},
 		{"SELECT foo''",
-			`syntax error at or near ""
+			`type does not exist at or near ""
 SELECT foo''
           ^
 `},
@@ -1629,14 +1685,14 @@ HINT: try \h ALTER TABLE`,
 		},
 		{
 			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`syntax error at or near "notatype"
+			`type does not exist at or near "notatype"
 SELECT CAST(1.2+2.3 AS notatype)
                        ^
 `,
 		},
 		{
 			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`syntax error at or near "notatype"
+			`type does not exist at or near "notatype"
 SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
                               ^
 `,
@@ -1720,10 +1776,52 @@ SELECT 1 + ANY ARRAY[1, 2, 3]
 		},
 		{
 			`SELECT 'f'::"blah"`,
-			`syntax error at or near "blah"
+			`type does not exist at or near "blah"
 SELECT 'f'::"blah"
             ^
 `,
+		},
+		{
+			`INSERT INTO foo(a, a.b) VALUES (1,2)`,
+			`unimplemented at or near "b"
+INSERT INTO foo(a, a.b) VALUES (1,2)
+                     ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/8318`,
+		},
+		{
+			`UPSERT INTO foo(a, a.b) VALUES (1,2)`,
+			`unimplemented at or near "b"
+UPSERT INTO foo(a, a.b) VALUES (1,2)
+                     ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/8318`,
+		},
+		{
+			`UPDATE foo SET (a, a.b) = (1, 2)`,
+			`unimplemented at or near "b"
+UPDATE foo SET (a, a.b) = (1, 2)
+                     ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/8318`,
+		},
+		{
+			`UPDATE foo SET a.b = 1`,
+			`unimplemented at or near "b"
+UPDATE foo SET a.b = 1
+                 ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/8318`,
+		},
+		{
+			`SELECT * FROM ab, LATERAL (SELECT * FROM kv)`,
+			`unimplemented at or near "EOF"
+SELECT * FROM ab, LATERAL (SELECT * FROM kv)
+                                            ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/24560`,
+		},
+		{
+			`SELECT * FROM ab, LATERAL foo(a)`,
+			`unimplemented at or near "EOF"
+SELECT * FROM ab, LATERAL foo(a)
+                                ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/24560`,
 		},
 	}
 	for _, d := range testData {

@@ -783,9 +783,9 @@ func (n *windowNode) populateValues(ctx context.Context, evalCtx *tree.EvalConte
 				}
 				// Instead, we evaluate the current window render, which depends on at least
 				// one window function, at the given row.
-				evalCtx.IVarHelper = n.ivarHelper
+				evalCtx.PushIVarContainer(&n.colContainer)
 				res, err := curWindowRender.Eval(evalCtx)
-				evalCtx.IVarHelper = nil
+				evalCtx.PopIVarContainer()
 				if err != nil {
 					return err
 				}
@@ -979,12 +979,12 @@ type windowNodeColContainer struct {
 
 	// sourceInfo contains information on the for the IndexedVars from the
 	// source plan where they were originally created.
-	sourceInfo *dataSourceInfo
+	sourceInfo *sqlbase.DataSourceInfo
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
 func (cc *windowNodeColContainer) IndexedVarResolvedType(idx int) types.T {
-	return cc.sourceInfo.sourceColumns[idx].Typ
+	return cc.sourceInfo.SourceColumns[idx].Typ
 }
 
 // IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.

@@ -48,6 +48,9 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *limitNode:
 		setNeededColumns(n.plan, needed)
 
+	case *spoolNode:
+		setNeededColumns(n.source, needed)
+
 	case *indexJoinNode:
 		// Currently all the needed result columns are provided by the
 		// table sub-source; from the index sub-source we only need the PK
@@ -67,6 +70,7 @@ func setNeededColumns(plan planNode, needed []bool) {
 		}
 		setNeededColumns(n.left, needed)
 		setNeededColumns(n.right, needed)
+		markOmitted(n.columns, needed)
 
 	case *joinNode:
 		// Note: getNeededColumns takes into account both the columns
@@ -109,7 +113,7 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *filterNode:
 		// Detect which columns from the source are needed in addition to
 		// those needed by the context.
-		sourceNeeded := make([]bool, len(n.source.info.sourceColumns))
+		sourceNeeded := make([]bool, len(n.source.info.SourceColumns))
 		copy(sourceNeeded, needed)
 		for i := range sourceNeeded {
 			sourceNeeded[i] = sourceNeeded[i] || n.ivarHelper.IndexedVarUsed(i)
@@ -133,7 +137,7 @@ func setNeededColumns(plan planNode, needed []bool) {
 		}
 
 		// Now detect which columns from the source are still needed.
-		sourceNeeded := make([]bool, len(n.source.info.sourceColumns))
+		sourceNeeded := make([]bool, len(n.source.info.SourceColumns))
 		for i := range sourceNeeded {
 			sourceNeeded[i] = n.ivarHelper.IndexedVarUsed(i)
 		}
@@ -184,6 +188,12 @@ func setNeededColumns(plan planNode, needed []bool) {
 		// foreign key relations and that are not needed for RETURNING.
 		setNeededColumns(n.run.rows, allColumns(n.run.rows))
 
+	case *upsertNode:
+		// TODO(knz): This can be optimized by omitting the columns that
+		// are not part of the primary key, do not participate in
+		// foreign key relations and that are not needed for RETURNING.
+		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+
 	case *splitNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
@@ -195,6 +205,7 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
 	case *cancelQueryNode:
+	case *cancelSessionNode:
 	case *controlJobNode:
 	case *scrubNode:
 	case *createDatabaseNode:

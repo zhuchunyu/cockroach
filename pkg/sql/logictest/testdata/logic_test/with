@@ -1,6 +1,6 @@
 # LogicTest: default parallel-stmts distsql
 
-query error CTE clauses can currently only be used once per statement
+query error unsupported multiple use of CTE clause "a"
 WITH a AS (SELECT 1) SELECT * FROM a CROSS JOIN a
 
 statement ok
@@ -49,7 +49,7 @@ query error source "t" has 1 columns available but 2 columns specified
 WITH t(b, c) AS (SELECT a FROM x) SELECT b, t.b FROM t
 
 # Ensure you can't reference the original table name
-query error source name "x" not found in FROM clause
+query error no data source matches prefix: x
 WITH t AS (SELECT a FROM x) SELECT a, x.t FROM t
 
 # Nested WITH, name shadowing
@@ -60,7 +60,7 @@ WITH t(x) AS (WITH t(x) AS (SELECT 1) SELECT x * 10 FROM t) SELECT x + 2 FROM t
 
 # CTEs with DMLs
 
-query error relation "t" does not exist
+query error pgcode 42P01 relation "t" does not exist
 WITH t AS (SELECT * FROM x) INSERT INTO t VALUES (1)
 
 query I rowsort
@@ -119,3 +119,10 @@ SELECT * FROM t
 query I rowsort
 SELECT * from x
 ----
+
+# #22420: ensure okay error message for CTE clause without output columns
+query error WITH clause "t" does not have a RETURNING clause
+WITH t AS (
+    INSERT INTO x(a) VALUES(0)
+)
+SELECT * FROM t

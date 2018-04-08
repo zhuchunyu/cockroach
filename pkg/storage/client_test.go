@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
+	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -649,7 +650,7 @@ func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 	ambient := log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}
 	m.distSenders[idx] = kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ambient,
-		Clock:      m.clock,
+		Clock:      m.clocks[idx],
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
 			ds:               &m.distSenders[idx],
@@ -663,12 +664,12 @@ func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 		ambient,
 		m.storeConfig.Settings,
 		m.distSenders[idx],
-		m.clock,
+		m.clocks[idx],
 		false,
 		stopper,
 		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	m.dbs[idx] = client.NewDB(tcsFactory, m.clock)
+	m.dbs[idx] = client.NewDB(tcsFactory, m.clocks[idx])
 }
 
 func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.NodeLiveness) {
@@ -677,7 +678,7 @@ func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.Node
 		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer},
 		m.storeConfig.Settings,
 		m.gossips[idx],
-		m.clock,
+		m.clocks[idx],
 		storage.MakeStorePoolNodeLivenessFunc(nodeLiveness),
 		/* deterministic */ false,
 	)
@@ -830,7 +831,7 @@ func (m *multiTestContext) addStore(idx int) {
 		ch: make(chan struct{}),
 	}
 	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, func(ctx context.Context) {
-		now := m.clock.Now()
+		now := clock.Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
 			log.Warning(ctx, err)
 		}
@@ -923,7 +924,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Reset()
 	m.mu.Unlock()
 	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
-		now := m.clock.Now()
+		now := m.clocks[i].Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
 			log.Warning(ctx, err)
 		}
@@ -993,15 +994,13 @@ func (m *multiTestContext) restart() {
 	}
 }
 
-// changeReplicasLocked performs a ChangeReplicas operation, retrying
-// until the destination store has been addded or removed. m.mu must
-// be locked in read mode. Returns the range's NextReplicaID, which
-// is the ID of the newly-added replica if this is an add.
-func (m *multiTestContext) changeReplicasLocked(
-	rangeID roachpb.RangeID, dest int, changeType roachpb.ReplicaChangeType,
+// changeReplicas performs a ChangeReplicas operation, retrying until the
+// destination store has been addded or removed. Returns the range's
+// NextReplicaID, which is the ID of the newly-added replica if this is an add.
+func (m *multiTestContext) changeReplicas(
+	startKey roachpb.RKey, dest int, changeType roachpb.ReplicaChangeType,
 ) (roachpb.ReplicaID, error) {
 	ctx := context.Background()
-	startKey := m.findStartKeyLocked(rangeID)
 
 	// Perform a consistent read to get the updated range descriptor (as
 	// opposed to just going to one of the stores), to make sure we have
@@ -1055,6 +1054,7 @@ func (m *multiTestContext) changeReplicasLocked(
 
 // replicateRange replicates the given range onto the given stores.
 func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int) {
+	m.t.Helper()
 	if err := m.replicateRangeNonFatal(rangeID, dests...); err != nil {
 		m.t.Fatal(err)
 	}
@@ -1063,14 +1063,13 @@ func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int)
 // replicateRangeNonFatal replicates the given range onto the given stores.
 func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests ...int) error {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	startKey := m.findStartKeyLocked(rangeID)
+	m.mu.RUnlock()
 
 	expectedReplicaIDs := make([]roachpb.ReplicaID, len(dests))
 	for i, dest := range dests {
 		var err error
-		expectedReplicaIDs[i], err = m.changeReplicasLocked(rangeID, dest, roachpb.ADD_REPLICA)
+		expectedReplicaIDs[i], err = m.changeReplicas(startKey, dest, roachpb.ADD_REPLICA)
 		if err != nil {
 			return err
 		}
@@ -1100,6 +1099,7 @@ func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests
 
 // unreplicateRange removes a replica of the range from the dest store.
 func (m *multiTestContext) unreplicateRange(rangeID roachpb.RangeID, dest int) {
+	m.t.Helper()
 	if err := m.unreplicateRangeNonFatal(rangeID, dest); err != nil {
 		m.t.Fatal(err)
 	}
@@ -1109,9 +1109,10 @@ func (m *multiTestContext) unreplicateRange(rangeID roachpb.RangeID, dest int) {
 // Returns an error rather than calling m.t.Fatal upon error.
 func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, dest int) error {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	startKey := m.findStartKeyLocked(rangeID)
+	m.mu.RUnlock()
 
-	_, err := m.changeReplicasLocked(rangeID, dest, roachpb.REMOVE_REPLICA)
+	_, err := m.changeReplicas(startKey, dest, roachpb.REMOVE_REPLICA)
 	return err
 }
 
@@ -1121,7 +1122,7 @@ func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, des
 func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 	results := make([]int64, len(m.engines))
 	for i, eng := range m.engines {
-		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clock.Now(), true, nil)
+		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clocks[i].Now(), true, nil)
 		if err != nil {
 			log.VEventf(context.TODO(), 1, "engine %d: error reading from key %s: %s", i, key, err)
 		} else if val == nil {
@@ -1156,9 +1157,21 @@ func (m *multiTestContext) waitForValues(key roachpb.Key, expected []int64) {
 func (m *multiTestContext) transferLease(
 	ctx context.Context, rangeID roachpb.RangeID, source int, dest int,
 ) {
+	if err := m.transferLeaseNonFatal(ctx, rangeID, source, dest); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// transferLease transfers the lease for the given range from the source
+// replica to the target replica. Assumes that the caller knows who the
+// current leaseholder is.
+// Returns an error rather than calling m.t.Fatal upon error.
+func (m *multiTestContext) transferLeaseNonFatal(
+	ctx context.Context, rangeID roachpb.RangeID, source int, dest int,
+) error {
 	live := m.stores[dest] != nil && !m.stores[dest].IsDraining()
 	if !live {
-		m.t.Fatalf("can't transfer lease to down or draining node at index %d", dest)
+		return errors.Errorf("can't transfer lease to down or draining node at index %d", dest)
 	}
 
 	// Heartbeat the liveness record of the destination node to make sure that the
@@ -1173,19 +1186,21 @@ func (m *multiTestContext) transferLease(
 	m.mu.RUnlock()
 	l, err := nl.Self()
 	if err != nil {
-		m.t.Fatal(err)
+		return err
 	}
 	if err := nl.Heartbeat(ctx, l); err != nil {
-		m.t.Fatal(err)
+		return err
 	}
 
 	sourceRepl, err := m.stores[source].GetReplica(rangeID)
 	if err != nil {
-		m.t.Fatal(err)
+		return err
 	}
 	if err := sourceRepl.AdminTransferLease(context.Background(), m.idents[dest].StoreID); err != nil {
-		m.t.Fatal(err)
+		return err
 	}
+
+	return nil
 }
 
 // advanceClock advances the mtc's manual clock such that all
@@ -1222,7 +1237,7 @@ func (m *multiTestContext) getRaftLeader(rangeID roachpb.RangeID) *storage.Repli
 				// status yet.
 				continue
 			}
-			if raftStatus.Term > latestTerm {
+			if raftStatus.Term > latestTerm || (raftLeaderRepl == nil && raftStatus.Term == latestTerm) {
 				// If we find any newer term, it means any previous election is
 				// invalid.
 				raftLeaderRepl = nil
@@ -1344,7 +1359,7 @@ func TestSortRangeDescByAge(t *testing.T) {
 }
 
 func verifyRangeStats(eng engine.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats) error {
-	ms, err := engine.MVCCGetRangeStats(context.Background(), eng, rangeID)
+	ms, err := stateloader.Make(nil /* st */, rangeID).LoadMVCCStats(context.Background(), eng)
 	if err != nil {
 		return err
 	}

@@ -23,18 +23,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
-func testInitDummySelectNode(p *planner, desc *sqlbase.TableDescriptor) *renderNode {
+func testInitDummySelectNode(t *testing.T, p *planner, desc *sqlbase.TableDescriptor) *renderNode {
 	scan := &scanNode{}
 	scan.desc = desc
-	// Note: scan.initDescDefaults only returns an error if its 2nd argument is not nil.
-	_ = scan.initDescDefaults(p.curPlan.deps, publicColumns, nil)
+	if err := scan.initDescDefaults(p.curPlan.deps, publicColumnsCfg); err != nil {
+		t.Fatal(err)
+	}
 
 	sel := &renderNode{}
 	sel.source.plan = scan
-	testName := tree.TableName{TableName: tree.Name(desc.Name), DatabaseName: tree.Name("test")}
+	testName := tree.MakeTableName("test", tree.Name(desc.Name))
 	cols := planColumns(scan)
-	sel.source.info = newSourceInfoForSingleTable(testName, cols)
-	sel.sourceInfo = multiSourceInfo{sel.source.info}
+	sel.source.info = sqlbase.NewSourceInfoForSingleTable(testName, cols)
+	sel.sourceInfo = sqlbase.MakeMultiSourceInfo(sel.source.info)
 	sel.ivarHelper = tree.MakeIndexedVarHelper(sel, len(cols))
 
 	return sel
@@ -52,7 +53,7 @@ func TestRetryResolveNames(t *testing.T) {
 
 	desc := testTableDesc()
 	p := makeTestPlanner()
-	s := testInitDummySelectNode(p, desc)
+	s := testInitDummySelectNode(t, p, desc)
 	if err := desc.AllocateIDs(); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestRetryResolveNames(t *testing.T) {
 			t.Fatal(err)
 		}
 		count := 0
-		for iv := 0; iv < len(s.sourceInfo[0].sourceColumns); iv++ {
+		for iv := 0; iv < len(s.sourceInfo[0].SourceColumns); iv++ {
 			if s.ivarHelper.IndexedVarUsed(iv) {
 				count++
 			}

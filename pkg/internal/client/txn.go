@@ -109,15 +109,24 @@ type Txn struct {
 //   If 0 is passed, then no value is going to be filled in the batches sent
 //   through this txn. This will have the effect that the DistSender will fill
 //   in the batch with the current node's ID.
+//   If the gatewayNodeID is set and this is a root transaction, we optimize
+//   away any clock uncertainty for our own node, as our clock is accessible.
 func NewTxn(db *DB, gatewayNodeID roachpb.NodeID, typ TxnType) *Txn {
-	return NewTxnWithProto(db, gatewayNodeID, typ, roachpb.MakeTransaction(
+	now := db.clock.Now()
+	txn := roachpb.MakeTransaction(
 		"unnamed",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
 		enginepb.SERIALIZABLE,
-		db.clock.Now(),
+		now,
 		db.clock.MaxOffset().Nanoseconds(),
-	))
+	)
+	// Ensure the gateway node ID is marked as free from clock offset
+	// if this is a root transaction.
+	if gatewayNodeID != 0 && typ == RootTxn {
+		txn.UpdateObservedTimestamp(gatewayNodeID, now)
+	}
+	return NewTxnWithProto(db, gatewayNodeID, typ, txn)
 }
 
 // NewTxnWithProto is like NewTxn, except it returns a new txn with the provided
@@ -268,9 +277,24 @@ func (txn *Txn) Isolation() enginepb.IsolationType {
 }
 
 // OrigTimestamp returns the transaction's starting timestamp.
+// Note a transaction can be internally pushed forward in time before
+// committing so this is not guaranteed to be the commit timestamp.
+// Use CommitTimestamp() when needed.
 func (txn *Txn) OrigTimestamp() hlc.Timestamp {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
+	return txn.mu.Proto.OrigTimestamp
+}
+
+// CommitTimestamp returns the transaction's start timestamp.
+// The start timestamp can get pushed but the use of this
+// method will guarantee that the caller of this method sees
+// the push and thus calls this method again to receive the new
+// timestamp.
+func (txn *Txn) CommitTimestamp() hlc.Timestamp {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	txn.mu.Proto.OrigTimestampWasObserved = true
 	return txn.mu.Proto.OrigTimestamp
 }
 
@@ -313,26 +337,6 @@ func (txn *Txn) SetSystemConfigTrigger() error {
 // this clone, but we currently have no situations where this is needed.
 func (txn *Txn) Proto() *roachpb.Transaction {
 	return &txn.mu.Proto
-}
-
-// IsSerializableRestart returns true if the transaction is serializable and
-// its timestamp has been pushed. Used to detect whether the txn will be
-// allowed to commit.
-//
-// Note that this method allows for false negatives: sometimes the client only
-// figures out that it's been pushed when it sends an EndTransaction - i.e. it's
-// possible for the txn to have been pushed asynchoronously by some other
-// operation (usually, but not exclusively, by a high-priority txn with
-// conflicting writes).
-func (txn *Txn) IsSerializableRestart() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	// TODO(andrei): The Walltime != 0 test is necessary but it feels like it
-	// shouldn't be. Hopefully the proto initialization can be improved such that
-	// Timestamp is always set.
-	isTxnPushed := txn.Proto().Timestamp.WallTime != 0 &&
-		txn.Proto().Timestamp != txn.Proto().OrigTimestamp
-	return txn.Proto().Isolation == enginepb.SERIALIZABLE && isTxnPushed
 }
 
 // NewBatch creates and returns a new empty batch object for use with the Txn.
@@ -585,8 +589,8 @@ func (txn *Txn) UpdateDeadlineMaybe(ctx context.Context, deadline hlc.Timestamp)
 	return false
 }
 
-// ResetDeadline resets the deadline.
-func (txn *Txn) ResetDeadline() {
+// resetDeadline resets the deadline.
+func (txn *Txn) resetDeadline() {
 	txn.deadline = nil
 }
 
@@ -645,7 +649,8 @@ func (txn *Txn) maybeFinishReadonly(commit bool, deadline *hlc.Timestamp) (bool,
 		//     4. new timestamp violates deadline
 		//     5. txn retries the read
 		//     6. commit fails - only thanks to this code path?
-		return false, roachpb.NewErrorWithTxn(roachpb.NewTransactionAbortedError(), &txn.mu.Proto)
+		return false, roachpb.NewErrorWithTxn(roachpb.NewTransactionStatusError(
+			"deadline exceeded before transaction finalization"), &txn.mu.Proto)
 	}
 	if commit {
 		txn.mu.Proto.Status = roachpb.COMMITTED
@@ -1006,14 +1011,6 @@ func (txn *Txn) Send(
 				// this Txn object has already aborted and restarted the txn.
 				txn.updateStateOnRetryableErrLocked(ctx, retryErr)
 			}
-		case *roachpb.TransactionReplayError:
-			if pErr.GetTxn().ID != txn.mu.Proto.ID {
-				// It is possible that a concurrent request through this Txn
-				// object has already aborted and restarted the txn. In this
-				// case, we may see a TransactionReplayError if the abort
-				// beats the original BeginTxn request to the txn record.
-				return nil, roachpb.NewError(&roachpb.TxnPrevAttemptError{})
-			}
 		}
 		// Note that unhandled retryable txn errors are allowed from leaf
 		// transactions. We pass them up through distributed SQL flows to
@@ -1049,7 +1046,8 @@ func (txn *Txn) Send(
 				// NB: The returned error contains a pointer to txn.mu.Proto, but
 				// that's ok because we can't have concurrent operations going on while
 				// committing/aborting.
-				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionAbortedError(), &txn.mu.Proto)
+				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionStatusError(
+					"deadline exceeded before transaction finalization"), &txn.mu.Proto)
 			}
 		}
 		// This normally happens on the server and sent back in response
@@ -1139,6 +1137,7 @@ func (txn *Txn) UpdateStateOnRemoteRetryableErr(ctx context.Context, pErr *roach
 func (txn *Txn) updateStateOnRetryableErrLocked(
 	ctx context.Context, retryErr *roachpb.HandledRetryableTxnError,
 ) {
+	txn.resetDeadline()
 	newTxn := &retryErr.Transaction
 
 	abortErr := txn.mu.Proto.ID != newTxn.ID
@@ -1188,27 +1187,59 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
 	txn.mu.Proto.Timestamp = ts
 	txn.mu.Proto.OrigTimestamp = ts
 	txn.mu.Proto.MaxTimestamp = ts
+	txn.mu.Proto.OrigTimestampWasObserved = true
 	txn.mu.Unlock()
-	// The deadline-checking code checks that the `Timestamp` field of the proto
-	// hasn't exceeded the deadline. Since we set the Timestamp field each retry,
-	// it won't ever exceed the deadline, and thus setting the deadline here is
-	// not strictly needed. However, it doesn't do anything incorrect and it will
-	// possibly find problems if things change in the future, so it is left in.
-	txn.UpdateDeadlineMaybe(ctx, ts)
 }
 
 // GenerateForcedRetryableError returns a HandledRetryableTxnError that will
 // cause the txn to be retried.
+//
+// The transaction's epoch is bumped, simulating to an extent what the
+// TxnCoordSender does on retriable errors. The transaction's timestamp is only
+// bumped to the extent that txn.OrigTimestamp is racheted up to txn.Timestamp.
+// TODO(andrei): This method should take in an up-to-date timestamp, but
+// unfortunately its callers don't currently have that handy.
 func (txn *Txn) GenerateForcedRetryableError(msg string) error {
+	txn.Proto().Restart(txn.UserPriority(), 0 /* upgradePriority */, txn.Proto().Timestamp)
+	txn.resetDeadline()
 	return roachpb.NewHandledRetryableTxnError(
 		msg,
 		txn.ID(),
 		roachpb.MakeTransaction(
 			txn.DebugName(),
-			nil, // baseKey
+			nil, // aseKey
 			txn.UserPriority(),
 			txn.Isolation(),
 			txn.db.clock.Now(),
 			txn.db.clock.MaxOffset().Nanoseconds(),
 		))
+}
+
+// IsSerializablePushAndRefreshNotPossible returns true if the transaction is
+// serializable, its timestamp has been pushed and there's no chance that
+// refreshing the read spans will succeed later (thus allowing the transaction
+// to commit and not be restarted). Used to detect whether the txn is guaranteed
+// to get a retriable error later.
+//
+// Note that this method allows for false negatives: sometimes the client only
+// figures out that it's been pushed when it sends an EndTransaction - i.e. it's
+// possible for the txn to have been pushed asynchoronously by some other
+// operation (usually, but not exclusively, by a high-priority txn with
+// conflicting writes).
+func (txn *Txn) IsSerializablePushAndRefreshNotPossible() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	origTimestamp := txn.Proto().OrigTimestamp
+	origTimestamp.Forward(txn.Proto().RefreshedTimestamp)
+	isTxnPushed := txn.Proto().Timestamp != origTimestamp
+	// We check OrigTimestampWasObserved here because, if that's set, refreshing
+	// of reads is not performed.
+	return txn.Proto().Isolation == enginepb.SERIALIZABLE &&
+		isTxnPushed && txn.mu.Proto.OrigTimestampWasObserved
+}
+
+// Type returns the transaction's type.
+func (txn *Txn) Type() TxnType {
+	return txn.typ
 }

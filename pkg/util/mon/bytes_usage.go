@@ -22,6 +22,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -219,8 +220,10 @@ type BytesMonitor struct {
 	// become reported in the logs.
 	noteworthyUsageBytes int64
 
-	curBytesCount *metric.Counter
+	curBytesCount *metric.Gauge
 	maxBytesHist  *metric.Histogram
+
+	settings *cluster.Settings
 }
 
 // maxAllocatedButUnusedBlocks determines the maximum difference between the
@@ -257,12 +260,14 @@ var DefaultPoolAllocationSize = envutil.EnvOrDefaultInt64("COCKROACH_ALLOCATION_
 func MakeMonitor(
 	name string,
 	res Resource,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	increment int64,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
-	return MakeMonitorWithLimit(name, res, math.MaxInt64, curCount, maxHist, increment, noteworthy)
+	return MakeMonitorWithLimit(
+		name, res, math.MaxInt64, curCount, maxHist, increment, noteworthy, settings)
 }
 
 // MakeMonitorWithLimit creates a new monitor with a limit local to this
@@ -271,10 +276,11 @@ func MakeMonitorWithLimit(
 	name string,
 	res Resource,
 	limit int64,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	increment int64,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
 	if increment <= 0 {
 		increment = DefaultPoolAllocationSize
@@ -290,6 +296,7 @@ func MakeMonitorWithLimit(
 		curBytesCount:        curCount,
 		maxBytesHist:         maxHist,
 		poolAllocationSize:   increment,
+		settings:             settings,
 	}
 }
 
@@ -304,6 +311,7 @@ func MakeMonitorInheritWithLimit(name string, limit int64, m *BytesMonitor) Byte
 		m.maxBytesHist,
 		m.poolAllocationSize,
 		m.noteworthyUsageBytes,
+		m.settings,
 	)
 }
 
@@ -343,9 +351,10 @@ func MakeUnlimitedMonitor(
 	ctx context.Context,
 	name string,
 	res Resource,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
 	if log.V(2) {
 		log.InfofDepth(ctx, 1, "%s: starting unlimited monitor", name)
@@ -360,6 +369,7 @@ func MakeUnlimitedMonitor(
 		maxBytesHist:         maxHist,
 		poolAllocationSize:   DefaultPoolAllocationSize,
 		reserved:             MakeStandaloneBudget(math.MaxInt64),
+		settings:             settings,
 	}
 }
 
@@ -384,9 +394,12 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	}
 
 	if check && mm.mu.curAllocated != 0 {
-		panic(fmt.Sprintf("%s: unexpected %d leftover bytes",
-			mm.name,
-			mm.mu.curAllocated))
+		var reportables []interface{}
+		log.ReportOrPanic(
+			ctx, &mm.settings.SV,
+			fmt.Sprintf("%s: unexpected %d leftover bytes", mm.name, mm.mu.curAllocated),
+			reportables)
+		mm.releaseBytes(ctx, mm.mu.curAllocated)
 	}
 
 	mm.releaseBudget(ctx)
@@ -427,7 +440,7 @@ func (mm *BytesMonitor) MaximumBytes() int64 {
 type BoundAccount struct {
 	used int64
 	// reserved is a small buffer to amortize the cost of growing an account. It
-	// decreases as curAllocated increases (and vice-versa).
+	// decreases as used increases (and vice-versa).
 	reserved int64
 	mon      *BytesMonitor
 }

@@ -111,7 +111,7 @@ func helpWithFunction(sqllex sqlLexer, f tree.ResolvableFunctionReference) int {
 	// together.
 	lastInfo := ""
 	for i, overload := range d.Definition {
-		b := overload.(tree.Builtin)
+		b := overload.(*tree.Builtin)
 		if b.Info != "" && b.Info != lastInfo {
 			if i > 0 {
 				fmt.Fprintln(w, "---")
@@ -135,9 +135,8 @@ func helpWithFunction(sqllex sqlLexer, f tree.ResolvableFunctionReference) int {
 }
 
 func helpWithFunctionByName(sqllex sqlLexer, s string) int {
-	n := tree.Name(s)
-	un := tree.UnresolvedName{&n}
-	return helpWithFunction(sqllex, tree.ResolvableFunctionReference{FunctionReference: &un})
+	un := &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{s}}
+	return helpWithFunction(sqllex, tree.ResolvableFunctionReference{FunctionReference: un})
 }
 
 const (

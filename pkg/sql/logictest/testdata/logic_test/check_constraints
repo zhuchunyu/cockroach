@@ -79,6 +79,9 @@ CREATE TABLE t4 (a INT, b INT CHECK (EXISTS (SELECT * FROM t2)))
 statement error pq: expected CHECK expression to have type bool, but '1' has type int
 CREATE TABLE t4 (a INT CHECK(1))
 
+statement error pq: expected CHECK expression to have type bool, but 'a' has type int
+CREATE TABLE t4 (a INT CHECK(a))
+
 # Function calls in CHECK are okay.
 statement ok
 CREATE TABLE calls_func (a INT CHECK(abs(a) < 2))
@@ -226,3 +229,47 @@ t7  CREATE TABLE t7 (
       CONSTRAINT check_y_z1 CHECK ((y + z) = 0),
       CONSTRAINT named_constraint CHECK (z = 1)
     )
+
+# Check that table references are dequalified in their stored representation.
+
+statement error no data source matches prefix: different_table
+CREATE TABLE t8 (
+  a INT,
+  CHECK (different_table.a > 0)
+)
+
+statement error no data source matches prefix: different_database.t8
+CREATE TABLE t8 (
+  a INT,
+  CHECK (different_database.t8.a > 0)
+)
+
+statement ok
+CREATE TABLE t8 (
+  a INT,
+  CHECK (a > 0),
+  CHECK (t8.a > 0),
+  CHECK (test.t8.a > 0)
+)
+
+query TT
+SHOW CREATE TABLE t8
+----
+t8  CREATE TABLE t8 (
+      a INT NULL,
+      FAMILY "primary" (a, rowid),
+      CONSTRAINT check_a CHECK (a > 0),
+      CONSTRAINT check_a1 CHECK (a > 0),
+      CONSTRAINT check_a2 CHECK (a > 0)
+    )
+
+statement ok
+CREATE DATABASE test2
+
+statement ok
+CREATE TABLE test2.t (
+  a INT,
+  CHECK (a > 0),
+  CHECK (t.a > 0),
+  CHECK (test2.t.a > 0)
+)

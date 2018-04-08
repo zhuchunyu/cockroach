@@ -218,7 +218,8 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	rangeCache := kv.NewRangeDescriptorCache(st, nil /* db */, size)
 	leaseCache := kv.NewLeaseHolderCache(size)
 	r := makeDistSQLReceiver(
-		context.TODO(), nil /* sink */, rangeCache, leaseCache, nil /* txn */, nil /* updateClock */)
+		context.TODO(), nil /* resultWriter */, tree.Rows,
+		rangeCache, leaseCache, nil /* txn */, nil /* updateClock */)
 
 	descs := []roachpb.RangeDescriptor{
 		{RangeID: 1, StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("c")},
@@ -508,7 +509,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	}
 
 	// Verify distribution.
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJy8kTFr8zAQhvfvV3zclIKGyEkXTSmdMtQujkOHYoJqHcZgS-YkQUvwfy-2htQmdpuhHXXS8z4vpzNoozCWDVoQr8CBQQQ5g5ZMgdYa6sfh0V69g1gzqHTrXT_OGRSGEMQZXOVqBAGZfKsxRamQgIFCJ6t6CG6paiR97LRvLDBIvBP_Ie8YGO8ucdbJEkHwjv1c-VCWhKV0ZmJ8TI5xdkqTl8PqbtYUzZouAq8NKSRUo_y8u6HL4fh02sfZasfnq2xGVfjf7_kb5S_t-YopRdsabXGy7-vJ6_4fUJUYPs0aTwU-kykGTTgmAzcMFFoXbnk47HW46gt-hfkiHI1gPoWjRfh-2bxZhLfL8Pam2nn37zMAAP__HutTsw=="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJzEkTFr8zAQhvfvV3zclIKGyEkXTSmdMtQujkOHYoJqHcZgS-YkQUvwfy-2htQmdpuhdNRJz_u8nM6gjcJYNmhBvAIHBhHkDFoyBVprqB-HR3v1DmLNoNKtd_04Z1AYQhBncJWrEQRk8q3GFKVCAgYKnazqIbilqpH0sdO-scAg8U78j41GyDsGxrtLpHWyRBC8Yz_XPpQlYSmdmVgfk2OcndLk5bC6mzVFs6aLwGtDCgnVKD_vbuhyOD6d9nG22vH5KptRFf43u_5G-0u7vmJK0bZGW5zs_Hryuv8LVCWGj7PGU4HPZIpBE47JwA0DhdaFWx4Oex2u-oJfYb4IRyOYT-FoEb5fNm8W4e0yvL2pdt79-wwAAP__GRdW0w=="}})
 
 	// Drain the second node and expect the query to be planned on only the
 	// first node.
@@ -516,7 +517,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	distServer.ServerConfig.TestingKnobs.DrainFast = true
 	distServer.Drain(ctx, 0 /* flowDrainWait */)
 
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkEFLxDAQhe_-CnknhRy2e8xJ8bSXrdQVD1IkNkMotEmZmYCy9L9Lm4O6sOIe502-94U5IiZPezeSwL6iQmswcepIJPESlQc7_wG7MejjlHWJW4MuMcEeob0OBIuDex-oIeeJYeBJXT-spRP3o-PPu5hHgUGd1V6jnQ1S1u86URcItprN_5X3ITAFp-nE-FA_7w9vTf3ydHN71rS9xNSQTCkK_fKca97MrQH5QOWAkjJ39MipWzVlrFduDTyJlm1Vhl0sq-WDP-HqT3h7Arfz1VcAAAD__yAGnrU="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkEFLxDAQhe_-CnknhRy2e8xJ8bSXVuqKBwkSmyEU2kxJJqAs_e_S5qAuVNzjvMn3vjAnBHZU25ES9CsqGIUpckcpcVyi8uDgPqB3Cn2YsiyxUeg4EvQJ0stA0Dja94Faso4iFByJ7Ye1dIr9aOPnXchjgkKTRV_XHAhmVuAs35VJrCfoalb_1957H8lb4TPrQ_NcH9_a5uXp5nbTtL_E1FKaOCT65dlq3s1GgZyncsTEOXb0GLlbNWVsVm4NHCUp26oMh1BWywd_wtWf8P4MNvPVVwAAAP__856gRQ=="}})
 
 	// Verify correctness.
 	var res int
@@ -1066,4 +1067,94 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	if !reflect.DeepEqual(resMap, expectedPartitions) {
 		t.Errorf("expected partitions:\n  %v\ngot:\n  %v", expectedPartitions, resMap)
 	}
+}
+
+func TestCheckNodeHealth(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+
+	const nodeID = roachpb.NodeID(5)
+
+	mockGossip := gossip.NewTest(nodeID, nil /* rpcContext */, nil, /* grpcServer */
+		stopper, metric.NewRegistry())
+
+	desc := &roachpb.NodeDescriptor{
+		NodeID:  nodeID,
+		Address: util.UnresolvedAddr{NetworkField: "tcp", AddressField: "testaddr"},
+	}
+	if err := mockGossip.SetNodeDescriptor(desc); err != nil {
+		t.Fatal(err)
+	}
+	if err := mockGossip.AddInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(nodeID),
+		&distsqlrun.DistSQLVersionGossipInfo{
+			MinAcceptedVersion: distsqlrun.MinAcceptedVersion,
+			Version:            distsqlrun.Version,
+		},
+		0, // ttl - no expiration
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	errLive := func(roachpb.NodeID) (bool, error) {
+		return false, errors.New("injected liveness error")
+	}
+	notLive := func(roachpb.NodeID) (bool, error) {
+		return false, nil
+	}
+	live := func(roachpb.NodeID) (bool, error) {
+		return true, nil
+	}
+
+	connHealthy := func(string) error {
+		return nil
+	}
+	connUnhealthy := func(string) error {
+		return errors.New("injected conn health error")
+	}
+	_ = connUnhealthy
+
+	livenessTests := []struct {
+		isLive func(roachpb.NodeID) (bool, error)
+		exp    string
+	}{
+		{live, ""},
+		{errLive, "not using n5 due to liveness: injected liveness error"},
+		{notLive, "not using n5 due to liveness: node is not live"},
+	}
+
+	for _, test := range livenessTests {
+		t.Run("liveness", func(t *testing.T) {
+			if err := checkNodeHealth(
+				context.Background(), nodeID, desc.Address.AddressField,
+				DistSQLPlannerTestingKnobs{}, /* knobs */
+				mockGossip, connHealthy, test.isLive,
+			); !testutils.IsError(err, test.exp) {
+				t.Fatalf("expected %v, got %v", test.exp, err)
+			}
+		})
+	}
+
+	connHealthTests := []struct {
+		connHealth func(string) error
+		exp        string
+	}{
+		{connHealthy, ""},
+		{connUnhealthy, "injected conn health error"},
+	}
+
+	for _, test := range connHealthTests {
+		t.Run("connHealth", func(t *testing.T) {
+			if err := checkNodeHealth(
+				context.Background(), nodeID, desc.Address.AddressField,
+				DistSQLPlannerTestingKnobs{}, /* knobs */
+				mockGossip, test.connHealth, live,
+			); !testutils.IsError(err, test.exp) {
+				t.Fatalf("expected %v, got %v", test.exp, err)
+			}
+		})
+	}
+
 }

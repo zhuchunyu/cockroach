@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+// https://golang.org/cl/38533 and https://golang.org/cl/91115 changed the
+// validation message.
+func wrongArgCountString(want, got int) string {
+	if strings.HasPrefix(runtime.Version(), "go1.10") {
+		return fmt.Sprintf("sql: expected %d arguments, got %d", want, got)
+	}
+	return fmt.Sprintf("sql: statement expects %d inputs; got %d", want, got)
+}
 
 func trivialQuery(pgURL url.URL) error {
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -86,7 +96,6 @@ func TestPGWire(t *testing.T) {
 	for _, insecure := range [...]bool{true, false} {
 		params := base.TestServerArgs{Insecure: insecure}
 		s, _, _ := serverutils.StartServer(t, params)
-
 		host, port, err := net.SplitHostPort(s.ServingAddr())
 		if err != nil {
 			t.Fatal(err)
@@ -208,6 +217,7 @@ func TestPGWireDrainClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
+
 	ctx := context.TODO()
 	defer s.Stopper().Stop(ctx)
 
@@ -228,6 +238,7 @@ func TestPGWireDrainClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+
 	txn, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -643,7 +654,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Error(
 				"pq: no value provided for placeholder: $1",
 			).PreparedError(
-				"sql: statement expects 1 inputs; got 0",
+				wrongArgCountString(1, 0),
 			),
 		},
 		"SELECT $1::int > $2::float": {
@@ -705,25 +716,28 @@ func TestPGPreparedQuery(t *testing.T) {
 				Results("isRole", "BOOL", false, false, "{}"),
 		},
 		"SHOW DATABASES": {
-			baseTest.Results("crdb_internal").Results("d").Results("information_schema").Results("pg_catalog").Results("system"),
+			baseTest.Results("d").Results("system"),
 		},
 		"SHOW GRANTS ON system.users": {
-			baseTest.Results("system", "users", sqlbase.AdminRole, "DELETE").
-				Results("system", "users", sqlbase.AdminRole, "GRANT").
-				Results("system", "users", sqlbase.AdminRole, "INSERT").
-				Results("system", "users", sqlbase.AdminRole, "SELECT").
-				Results("system", "users", sqlbase.AdminRole, "UPDATE").
-				Results("system", "users", security.RootUser, "DELETE").
-				Results("system", "users", security.RootUser, "GRANT").
-				Results("system", "users", security.RootUser, "INSERT").
-				Results("system", "users", security.RootUser, "SELECT").
-				Results("system", "users", security.RootUser, "UPDATE"),
+			baseTest.Results("system", "public", "users", sqlbase.AdminRole, "DELETE").
+				Results("system", "public", "users", sqlbase.AdminRole, "GRANT").
+				Results("system", "public", "users", sqlbase.AdminRole, "INSERT").
+				Results("system", "public", "users", sqlbase.AdminRole, "SELECT").
+				Results("system", "public", "users", sqlbase.AdminRole, "UPDATE").
+				Results("system", "public", "users", security.RootUser, "DELETE").
+				Results("system", "public", "users", security.RootUser, "GRANT").
+				Results("system", "public", "users", security.RootUser, "INSERT").
+				Results("system", "public", "users", security.RootUser, "SELECT").
+				Results("system", "public", "users", security.RootUser, "UPDATE"),
 		},
 		"SHOW INDEXES FROM system.users": {
 			baseTest.Results("users", "primary", true, 1, "username", "ASC", false, false),
 		},
 		"SHOW TABLES FROM system": {
 			baseTest.Results("descriptor").Others(13),
+		},
+		"SHOW SCHEMAS FROM system": {
+			baseTest.Results("crdb_internal").Others(3),
 		},
 		"SHOW CONSTRAINTS FROM system.users": {
 			baseTest.Results("users", "primary", "PRIMARY KEY", "username", gosql.NullString{}),
@@ -810,7 +824,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Error(
 				"pq: no value provided for placeholders: $1, $2",
 			).PreparedError(
-				"sql: statement expects 2 inputs; got 0",
+				wrongArgCountString(2, 0),
 			),
 		},
 		"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) LIMIT $1 OFFSET $2": {
@@ -825,7 +839,8 @@ func TestPGPreparedQuery(t *testing.T) {
 		"SELECT DATE '2001-01-02' + ($1 + $1:::int)": {
 			baseTest.SetArgs(12).Results("2001-01-26T00:00:00Z"),
 		},
-		"SELECT TO_HEX(~(~$1))": {
+		// Hint for INT type to distinguish from ~INET functionality.
+		"SELECT TO_HEX(~(~$1:::INT))": {
 			baseTest.SetArgs(12).Results("c"),
 		},
 		"SELECT $1::INT": {
@@ -883,7 +898,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs("1").Results(true),
 			baseTest.SetArgs("2").Results(false),
 		},
-		"SELECT * FROM pg_catalog.pg_class WHERE relnamespace = $1": {
+		"SELECT * FROM d.pg_catalog.pg_class WHERE relnamespace = $1": {
 			baseTest.SetArgs(1),
 		},
 		"SELECT $1::UUID": {
@@ -1103,88 +1118,94 @@ func TestPGPreparedExec(t *testing.T) {
 			},
 		},
 		{
-			"CREATE TABLE d.t (i INT, s STRING, d INT)",
+			"CREATE TABLE d.public.t (i INT, s STRING, d INT)",
 			[]preparedExecTest{
 				baseTest,
 				baseTest.Error(`pq: relation "t" already exists`),
 			},
 		},
 		{
-			"INSERT INTO d.t VALUES ($1, $2, $3)",
+			"INSERT INTO d.public.t VALUES ($1, $2, $3)",
 			[]preparedExecTest{
 				baseTest.SetArgs(1, "one", 2).RowsAffected(1),
 				baseTest.SetArgs("two", 2, 2).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "two": invalid syntax`),
 			},
 		},
 		{
-			"UPDATE d.t SET s = $1, i = i + $2, d = 1 + $3 WHERE i = $4",
+			"UPDATE d.public.t SET s = $1, i = i + $2, d = 1 + $3 WHERE i = $4",
 			[]preparedExecTest{
 				baseTest.SetArgs(4, 3, 2, 1).RowsAffected(1),
 			},
 		},
 		{
-			"UPDATE d.t SET i = $1 WHERE (i, s) = ($2, $3)",
+			"UPDATE d.public.t SET i = $1 WHERE (i, s) = ($2, $3)",
 			[]preparedExecTest{
 				baseTest.SetArgs(8, 4, "4").RowsAffected(1),
 			},
 		},
 		{
-			"DELETE FROM d.t WHERE s = $1 and i = $2 and d = 2 + $3",
+			"DELETE FROM d.public.t WHERE s = $1 and i = $2 and d = 2 + $3",
 			[]preparedExecTest{
 				baseTest.SetArgs(1, 2, 3).RowsAffected(0),
 			},
 		},
 		{
-			"INSERT INTO d.t VALUES ($1), ($2)",
+			"INSERT INTO d.public.t VALUES ($1), ($2)",
 			[]preparedExecTest{
 				baseTest.SetArgs(1, 2).RowsAffected(2),
 			},
 		},
 		{
-			"INSERT INTO d.t VALUES ($1), ($2) RETURNING $3 + 1",
+			"INSERT INTO d.public.t VALUES ($1), ($2) RETURNING $3 + 1",
 			[]preparedExecTest{
 				baseTest.SetArgs(3, 4, 5).RowsAffected(2),
 			},
 		},
 		{
-			"UPDATE d.t SET i = CASE WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
+			"UPDATE d.public.t SET i = CASE WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
 			[]preparedExecTest{
 				baseTest.SetArgs(true, true, 3).RowsAffected(5),
 			},
 		},
 		{
-			"UPDATE d.t SET i = CASE i WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
+			"UPDATE d.public.t SET i = CASE i WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
 			[]preparedExecTest{
 				baseTest.SetArgs(1, 2, 3).RowsAffected(5),
 			},
 		},
 		{
-			"UPDATE d.t SET d = CASE WHEN TRUE THEN $1 END",
+			"UPDATE d.public.t SET d = CASE WHEN TRUE THEN $1 END",
 			[]preparedExecTest{
 				baseTest.SetArgs(2).RowsAffected(5),
 			},
 		},
 		{
-			"DELETE FROM d.t RETURNING $1+1",
+			"DELETE FROM d.public.t RETURNING $1+1",
 			[]preparedExecTest{
 				baseTest.SetArgs(1).RowsAffected(5),
 			},
 		},
 		{
-			"DROP TABLE d.t",
+			"DROP TABLE d.public.t",
 			[]preparedExecTest{
 				baseTest,
-				baseTest.Error(`pq: relation "d.t" does not exist`),
+				baseTest.Error(`pq: relation "d.public.t" does not exist`),
 			},
 		},
 		{
-			"CREATE TABLE d.types (i int, f float, s string, b bytes, d date, m timestamp, z timestamp with time zone, n interval, o bool, e decimal)",
+			"CREATE TABLE d.public.t AS SELECT $1+1 AS x",
+			[]preparedExecTest{
+				baseTest.SetArgs(1).RowsAffected(1),
+			},
+		},
+		{
+			"CREATE TABLE d.public.types (i int, f float, s string, b bytes, d date, m timestamp, z timestamp with time zone, n interval, o bool, e decimal)",
 			[]preparedExecTest{
 				baseTest,
 			},
 		},
 		{
-			"INSERT INTO d.types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+			"INSERT INTO d.public.types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 			[]preparedExecTest{
 				baseTest.RowsAffected(1).SetArgs(
 					int64(0),

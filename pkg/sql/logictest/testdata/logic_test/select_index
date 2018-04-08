@@ -195,8 +195,7 @@ SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a > 1 AND b > 'b']
 query TTT
 EXPLAIN SELECT * FROM t WHERE a > 1 AND a < 2
 ----
-render       ·  ·
- └── norows  ·  ·
+norows  ·  ·
 
 query T
 SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a = 1 AND 'a' < b AND 'c' > b]
@@ -314,20 +313,17 @@ output row: [3 4]
 query TTT
 EXPLAIN SELECT * FROM t WHERE a = 1 AND false
 ----
-render       ·  ·
- └── norows  ·  ·
+norows  ·  ·
 
 query TTT
 EXPLAIN SELECT * FROM t WHERE a = 1 AND NULL
 ----
-render       ·  ·
- └── norows  ·  ·
+norows  ·  ·
 
 query TTT
 EXPLAIN SELECT * FROM t WHERE a = NULL AND a != NULL
 ----
-render       ·  ·
- └── norows  ·  ·
+norows  ·  ·
 
 # Make sure that mixed type comparison operations are not used
 # for selecting indexes.
@@ -541,7 +537,7 @@ query TITTTTT
 EXPLAIN (VERBOSE) SELECT k FROM tab0 WHERE (a IN (6) AND a > 6) OR b >= 4
 ----
 render     0  render  ·         ·                                     (k)        k!=NULL; key(k)
- │         0  ·       render 0  test.tab0.k                           ·          ·
+ │         0  ·       render 0  test.public.tab0.k                    ·          ·
  └── scan  1  scan    ·         ·                                     (k, a, b)  k!=NULL; key(k)
 ·          1  ·       table     tab0@primary                          ·          ·
 ·          1  ·       spans     ALL                                   ·          ·
@@ -731,14 +727,16 @@ AND   f1.resource_key IN ('ts', 'ts2', 'ts3')
 GROUP BY resource_key
 ORDER BY total DESC
 ----
-sort                 ·         ·
- │                   order     -total
- └── group           ·         ·
-      │              group by  @1-@1
-      └── render     ·         ·
-           └── scan  ·         ·
-·                    table     favorites@favorites_glob_fav_idx
-·                    spans     /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts"/PrefixEnd /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts2"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts2"/PrefixEnd /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts3"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts3"/PrefixEnd
+sort                 ·            ·
+ │                   order        -total
+ └── group           ·            ·
+      │              aggregate 0  resource_key
+      │              aggregate 1  count(resource_key)
+      │              group by     @1
+      └── render     ·            ·
+           └── scan  ·            ·
+·                    table        favorites@favorites_glob_fav_idx
+·                    spans        /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts"/PrefixEnd /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts2"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts2"/PrefixEnd /"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts3"-/"GAME"/"web"/"MT"/"xxx"/"en_GB"/"ts3"/PrefixEnd
 
 query TI rowsort
 SELECT
@@ -797,14 +795,14 @@ INSERT INTO abcd VALUES
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abcd@abcd WHERE a IS NULL AND b > 5
 ----
-render     0  render  ·         ·               (a, b, c, d)                         a=CONST; b!=NULL
- │         0  ·       render 0  test.abcd.a     ·                                    ·
- │         0  ·       render 1  test.abcd.b     ·                                    ·
- │         0  ·       render 2  test.abcd.c     ·                                    ·
- │         0  ·       render 3  test.abcd.d     ·                                    ·
- └── scan  1  scan    ·         ·               (a, b, c, d, rowid[hidden,omitted])  a=CONST; b!=NULL; rowid!=NULL; weak-key(b,c,d,rowid)
-·          1  ·       table     abcd@abcd       ·                                    ·
-·          1  ·       spans     /NULL/6-/!NULL  ·                                    ·
+render     0  render  ·         ·                   (a, b, c, d)                         a=CONST; b!=NULL
+ │         0  ·       render 0  test.public.abcd.a  ·                                    ·
+ │         0  ·       render 1  test.public.abcd.b  ·                                    ·
+ │         0  ·       render 2  test.public.abcd.c  ·                                    ·
+ │         0  ·       render 3  test.public.abcd.d  ·                                    ·
+ └── scan  1  scan    ·         ·                   (a, b, c, d, rowid[hidden,omitted])  a=CONST; b!=NULL; rowid!=NULL; weak-key(b,c,d,rowid)
+·          1  ·       table     abcd@abcd           ·                                    ·
+·          1  ·       spans     /NULL/6-/!NULL      ·                                    ·
 
 query IIII rowsort
 SELECT * FROM abcd@abcd WHERE a IS NULL AND b > 5
@@ -818,10 +816,10 @@ query TITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abcd@abcd WHERE a IS NULL AND b < 5
 ----
 render     0  render  ·         ·                    (a, b, c, d)                         a=CONST; b!=NULL
- │         0  ·       render 0  test.abcd.a          ·                                    ·
- │         0  ·       render 1  test.abcd.b          ·                                    ·
- │         0  ·       render 2  test.abcd.c          ·                                    ·
- │         0  ·       render 3  test.abcd.d          ·                                    ·
+ │         0  ·       render 0  test.public.abcd.a   ·                                    ·
+ │         0  ·       render 1  test.public.abcd.b   ·                                    ·
+ │         0  ·       render 2  test.public.abcd.c   ·                                    ·
+ │         0  ·       render 3  test.public.abcd.d   ·                                    ·
  └── scan  1  scan    ·         ·                    (a, b, c, d, rowid[hidden,omitted])  a=CONST; b!=NULL; rowid!=NULL; weak-key(b,c,d,rowid)
 ·          1  ·       table     abcd@abcd            ·                                    ·
 ·          1  ·       spans     /NULL/!NULL-/NULL/5  ·                                    ·
@@ -837,14 +835,14 @@ NULL  1  10    NULL
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abcd@abcd WHERE a IS NULL ORDER BY b
 ----
-render     0  render  ·         ·             (a, b, c, d)                         a=CONST; +b
- │         0  ·       render 0  test.abcd.a   ·                                    ·
- │         0  ·       render 1  test.abcd.b   ·                                    ·
- │         0  ·       render 2  test.abcd.c   ·                                    ·
- │         0  ·       render 3  test.abcd.d   ·                                    ·
- └── scan  1  scan    ·         ·             (a, b, c, d, rowid[hidden,omitted])  a=CONST; rowid!=NULL; weak-key(b,c,d,rowid); +b
-·          1  ·       table     abcd@abcd     ·                                    ·
-·          1  ·       spans     /NULL-/!NULL  ·                                    ·
+render     0  render  ·         ·                   (a, b, c, d)                         a=CONST; +b
+ │         0  ·       render 0  test.public.abcd.a  ·                                    ·
+ │         0  ·       render 1  test.public.abcd.b  ·                                    ·
+ │         0  ·       render 2  test.public.abcd.c  ·                                    ·
+ │         0  ·       render 3  test.public.abcd.d  ·                                    ·
+ └── scan  1  scan    ·         ·                   (a, b, c, d, rowid[hidden,omitted])  a=CONST; rowid!=NULL; weak-key(b,c,d,rowid); +b
+·          1  ·       table     abcd@abcd           ·                                    ·
+·          1  ·       spans     /NULL-/!NULL        ·                                    ·
 
 query IIII partialsort(1,2)
 SELECT * FROM abcd@abcd WHERE a IS NULL ORDER BY b
@@ -870,43 +868,59 @@ query TITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abcd@abcd WHERE a = 1 AND b IS NULL AND c > 0 AND c < 10 ORDER BY c
 ----
 render     0  render  ·         ·                     (a, b, c, d)                         a=CONST; b=CONST; c!=NULL; +c
- │         0  ·       render 0  test.abcd.a           ·                                    ·
- │         0  ·       render 1  test.abcd.b           ·                                    ·
- │         0  ·       render 2  test.abcd.c           ·                                    ·
- │         0  ·       render 3  test.abcd.d           ·                                    ·
+ │         0  ·       render 0  test.public.abcd.a    ·                                    ·
+ │         0  ·       render 1  test.public.abcd.b    ·                                    ·
+ │         0  ·       render 2  test.public.abcd.c    ·                                    ·
+ │         0  ·       render 3  test.public.abcd.d    ·                                    ·
  └── scan  1  scan    ·         ·                     (a, b, c, d, rowid[hidden,omitted])  a=CONST; b=CONST; c!=NULL; rowid!=NULL; weak-key(c,d,rowid); +c
 ·          1  ·       table     abcd@abcd             ·                                    ·
 ·          1  ·       spans     /1/NULL/1-/1/NULL/10  ·                                    ·
 
-query IIII 
+query IIII
 SELECT * FROM abcd@abcd WHERE a = 1 AND b IS NULL AND c > 0 AND c < 10 ORDER BY c
 ----
 1  NULL  1  NULL
 1  NULL  5  NULL
 
-# Regression test for #3548: verify we create constraints on implicit columns.
+# Regression test for #3548: verify we create constraints on implicit columns
+# when they are part of the key (non-unique index).
 statement ok
 CREATE TABLE abc (a INT, b INT, c INT, PRIMARY KEY(a,b), INDEX(c))
 
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT c FROM abc WHERE c = 1 and a = 3
 ----
-render     0  render  ·         ·              (c)                          c=CONST
- │         0  ·       render 0  test.abc.c     ·                            ·
- └── scan  1  scan    ·         ·              (a[omitted], b[omitted], c)  a=CONST; c=CONST; b!=NULL; key(b)
-·          1  ·       table     abc@abc_c_idx  ·                            ·
-·          1  ·       spans     /1/3-/1/4      ·                            ·
+render     0  render  ·         ·                  (c)                          c=CONST
+ │         0  ·       render 0  test.public.abc.c  ·                            ·
+ └── scan  1  scan    ·         ·                  (a[omitted], b[omitted], c)  a=CONST; c=CONST; b!=NULL; key(b)
+·          1  ·       table     abc@abc_c_idx      ·                            ·
+·          1  ·       spans     /1/3-/1/4          ·                            ·
+
+# Verify we don't create constraints on implicit columns when they are not part
+# of the key (unique index).
+statement ok
+CREATE TABLE def (d INT, e INT, f INT, PRIMARY KEY(d,e), UNIQUE INDEX(f))
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT f FROM def WHERE f = 1 and d = 3
+----
+render     0  render  ·         ·                  (f)                 f=CONST; key()
+ │         0  ·       render 0  test.public.def.f  ·                   ·
+ └── scan  1  scan    ·         ·                  (d, e[omitted], f)  d=CONST; f=CONST; key()
+·          1  ·       table     def@def_f_key      ·                   ·
+·          1  ·       spans     /1-/2              ·                   ·
+·          1  ·       filter    d = 3              ·                   ·
 
 # Regression test for #20504.
 query TITTTTT
 EXPLAIN (VERBOSE) SELECT a, b FROM abc WHERE (a, b) BETWEEN (1, 2) AND (3, 4)
 ----
-render     0  render  ·         ·            (a, b)              a!=NULL; b!=NULL; key(a,b)
- │         0  ·       render 0  test.abc.a   ·                   ·
- │         0  ·       render 1  test.abc.b   ·                   ·
- └── scan  1  scan    ·         ·            (a, b, c[omitted])  a!=NULL; b!=NULL; key(a,b)
-·          1  ·       table     abc@primary  ·                   ·
-·          1  ·       spans     /1/2-/3/4/#  ·                   ·
+render     0  render  ·         ·                  (a, b)              a!=NULL; b!=NULL; key(a,b)
+ │         0  ·       render 0  test.public.abc.a  ·                   ·
+ │         0  ·       render 1  test.public.abc.b  ·                   ·
+ └── scan  1  scan    ·         ·                  (a, b, c[omitted])  a!=NULL; b!=NULL; key(a,b)
+·          1  ·       table     abc@primary        ·                   ·
+·          1  ·       spans     /1/2-/3/4/#        ·                   ·
 
 # Regression test for #21831.
 statement ok
@@ -956,3 +970,97 @@ SELECT k, v FROM str WHERE v SIMILAR TO 'ABC_*'
 2  ABC
 5  ABCD
 3  ABCDEZ
+
+# Test that we generate spans for IS (NOT) DISTINCT FROM.
+statement ok
+CREATE TABLE xy (x INT, y INT, INDEX (y))
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS NOT DISTINCT FROM NULL
+----
+render           0  render      ·         ·                 (x, y)                                   y=CONST
+ │               0  ·           render 0  test.public.xy.x  ·                                        ·
+ │               0  ·           render 1  test.public.xy.y  ·                                        ·
+ └── index-join  1  index-join  ·         ·                 (x, y, rowid[hidden,omitted])            y=CONST; rowid!=NULL; key(rowid)
+      ├── scan   2  scan        ·         ·                 (x[omitted], y[omitted], rowid[hidden])  y=CONST; rowid!=NULL; key(rowid)
+      │          2  ·           table     xy@xy_y_idx       ·                                        ·
+      │          2  ·           spans     /NULL-/!NULL      ·                                        ·
+      └── scan   2  scan        ·         ·                 (x, y, rowid[hidden,omitted])            ·
+·                2  ·           table     xy@primary        ·                                        ·
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS NOT DISTINCT FROM 4
+----
+render           0  render      ·         ·                 (x, y)                                   y=CONST
+ │               0  ·           render 0  test.public.xy.x  ·                                        ·
+ │               0  ·           render 1  test.public.xy.y  ·                                        ·
+ └── index-join  1  index-join  ·         ·                 (x, y, rowid[hidden,omitted])            y=CONST; rowid!=NULL; key(rowid)
+      ├── scan   2  scan        ·         ·                 (x[omitted], y[omitted], rowid[hidden])  y=CONST; rowid!=NULL; key(rowid)
+      │          2  ·           table     xy@xy_y_idx       ·                                        ·
+      │          2  ·           spans     /4-/5             ·                                        ·
+      └── scan   2  scan        ·         ·                 (x, y, rowid[hidden,omitted])            ·
+·                2  ·           table     xy@primary        ·                                        ·
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS DISTINCT FROM NULL
+----
+render           0  render      ·         ·                 (x, y)                                   y!=NULL
+ │               0  ·           render 0  test.public.xy.x  ·                                        ·
+ │               0  ·           render 1  test.public.xy.y  ·                                        ·
+ └── index-join  1  index-join  ·         ·                 (x, y, rowid[hidden,omitted])            y!=NULL; rowid!=NULL; key(y,rowid)
+      ├── scan   2  scan        ·         ·                 (x[omitted], y[omitted], rowid[hidden])  y!=NULL; rowid!=NULL; key(y,rowid)
+      │          2  ·           table     xy@xy_y_idx       ·                                        ·
+      │          2  ·           spans     /!NULL-           ·                                        ·
+      └── scan   2  scan        ·         ·                 (x, y, rowid[hidden,omitted])            ·
+·                2  ·           table     xy@primary        ·                                        ·
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS DISTINCT FROM 4
+----
+render           0  render      ·         ·                 (x, y)                                   y!=NULL
+ │               0  ·           render 0  test.public.xy.x  ·                                        ·
+ │               0  ·           render 1  test.public.xy.y  ·                                        ·
+ └── index-join  1  index-join  ·         ·                 (x, y, rowid[hidden,omitted])            y!=NULL; rowid!=NULL; key(y,rowid)
+      ├── scan   2  scan        ·         ·                 (x[omitted], y[omitted], rowid[hidden])  y!=NULL; rowid!=NULL; key(y,rowid)
+      │          2  ·           table     xy@xy_y_idx       ·                                        ·
+      │          2  ·           spans     /!NULL-/4 /5-     ·                                        ·
+      └── scan   2  scan        ·         ·                 (x, y, rowid[hidden,omitted])            ·
+·                2  ·           table     xy@primary        ·                                        ·
+
+# Regression tests for #22670.
+statement ok
+CREATE INDEX xy_idx ON xy (x, y)
+
+statement ok
+INSERT INTO xy VALUES (NULL, NULL), (1, NULL), (NULL, 1), (1, 1)
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE x IN (NULL, 1, 2)
+----
+render     0  render  ·         ·                 (x, y)                         x!=NULL
+ │         0  ·       render 0  test.public.xy.x  ·                              ·
+ │         0  ·       render 1  test.public.xy.y  ·                              ·
+ └── scan  1  scan    ·         ·                 (x, y, rowid[hidden,omitted])  x!=NULL; rowid!=NULL; weak-key(x,y,rowid)
+·          1  ·       table     xy@xy_idx         ·                              ·
+·          1  ·       spans     /1-/3             ·                              ·
+
+query II rowsort
+SELECT * FROM xy WHERE x IN (NULL, 1, 2)
+----
+1  NULL
+1  1
+
+query TITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM xy WHERE (x, y) IN ((NULL, NULL), (1, NULL), (NULL, 1), (1, 1), (1, 2))
+----
+render     0  render  ·         ·                 (x, y)                         x=CONST; y!=NULL
+ │         0  ·       render 0  test.public.xy.x  ·                              ·
+ │         0  ·       render 1  test.public.xy.y  ·                              ·
+ └── scan  1  scan    ·         ·                 (x, y, rowid[hidden,omitted])  x=CONST; y!=NULL; rowid!=NULL; key(y,rowid)
+·          1  ·       table     xy@xy_idx         ·                              ·
+·          1  ·       spans     /1/1-/1/3         ·                              ·
+
+query II
+SELECT * FROM xy WHERE (x, y) IN ((NULL, NULL), (1, NULL), (NULL, 1), (1, 1), (1, 2))
+----
+1  1

@@ -3,10 +3,10 @@
 statement ok
 SET DATABASE = ""
 
-statement error no database specified
+statement error invalid target name: "a"
 CREATE TABLE a (id INT PRIMARY KEY)
 
-statement error empty table name
+statement error invalid table name: test.""
 CREATE TABLE test."" (id INT PRIMARY KEY)
 
 statement ok
@@ -18,7 +18,7 @@ CREATE TABLE test.a (id INT PRIMARY KEY)
 statement ok
 SET DATABASE = test
 
-statement error empty table name
+statement error invalid table name: ""
 CREATE TABLE "" (id INT PRIMARY KEY)
 
 statement error pgcode 42P07 relation "a" already exists
@@ -127,22 +127,16 @@ f
 statement ok
 SET DATABASE = ""
 
-query error no database specified
+query error pgcode 42P01 relation "users" does not exist
 SHOW COLUMNS FROM users
 
-query error database "foo" does not exist
-SHOW COLUMNS FROM foo.users
-
-query error relation "test.users" does not exist
+query error pgcode 42P01 relation "test.users" does not exist
 SHOW COLUMNS FROM test.users
 
-query error no database specified
+query error pgcode 42P01 relation "users" does not exist
 SHOW INDEXES FROM users
 
-query error database "foo" does not exist
-SHOW INDEXES FROM foo.users
-
-query error relation "test.users" does not exist
+query error pgcode 42P01 relation "test.users" does not exist
 SHOW INDEXES FROM test.users
 
 statement ok
@@ -195,22 +189,22 @@ CREATE TABLE test.precision (x DECIMAL(2, 4))
 query TT
 SHOW CREATE TABLE test.users
 ----
-test.users  CREATE TABLE users (
-            id INT NOT NULL,
-            "name" STRING NOT NULL,
-            title STRING NULL,
-            nickname STRING NULL,
-            username STRING(10) NULL,
-            email STRING(100) NULL,
-            CONSTRAINT "primary" PRIMARY KEY (id ASC),
-            INDEX foo ("name" ASC),
-            UNIQUE INDEX bar (id ASC, "name" ASC),
-            FAMILY "primary" (id, "name"),
-            FAMILY fam_1_title (title),
-            FAMILY fam_2_nickname (nickname),
-            FAMILY fam_3_username_email (username, email),
-            CONSTRAINT check_nickname_name CHECK (length(nickname) < length("name")),
-            CONSTRAINT check_nickname CHECK (length(nickname) < 10)
+test.public.users  CREATE TABLE users (
+                   id INT NOT NULL,
+                   name STRING NOT NULL,
+                   title STRING NULL,
+                   nickname STRING NULL,
+                   username STRING(10) NULL,
+                   email STRING(100) NULL,
+                   CONSTRAINT "primary" PRIMARY KEY (id ASC),
+                   INDEX foo (name ASC),
+                   UNIQUE INDEX bar (id ASC, name ASC),
+                   FAMILY "primary" (id, name),
+                   FAMILY fam_1_title (title),
+                   FAMILY fam_2_nickname (nickname),
+                   FAMILY fam_3_username_email (username, email),
+                   CONSTRAINT check_nickname_name CHECK (length(nickname) < length(name)),
+                   CONSTRAINT check_nickname CHECK (length(nickname) < 10)
 )
 
 statement ok
@@ -225,15 +219,15 @@ query TTTTT colnames
 SHOW CONSTRAINTS FROM test.dupe_generated
 ----
 Table           Name        Type         Column(s)   Details
-dupe_generated  check_bar   CHECK        NULL       bar > 2
-dupe_generated  check_foo   CHECK        NULL       foo > 2
-dupe_generated  check_foo1  CHECK        NULL       foo < 10
-dupe_generated  check_foo2  CHECK        NULL       foo > 1
+dupe_generated  check_bar   CHECK        bar        bar > 2
+dupe_generated  check_foo   CHECK        foo        foo > 2
+dupe_generated  check_foo1  CHECK        foo        foo < 10
+dupe_generated  check_foo2  CHECK        foo        foo > 1
 
 statement ok
 CREATE TABLE test.named_constraints (
   id        INT CONSTRAINT pk PRIMARY KEY,
-  name      VARCHAR CONSTRAINT notnull NOT NULL,
+  name      VARCHAR CONSTRAINT nn NOT NULL,
   title     VARCHAR  CONSTRAINT def DEFAULT 'VP of Something',
   nickname  STRING CONSTRAINT ck1 CHECK (LENGTH(nickname) < 10),
   username  STRING(10) CONSTRAINT nl NULL,
@@ -251,36 +245,36 @@ CREATE TABLE test.named_constraints (
 query TT
 SHOW CREATE TABLE test.named_constraints
 ----
-test.named_constraints  CREATE TABLE named_constraints (
-                        id INT NOT NULL,
-                        "name" STRING NOT NULL,
-                        title STRING NULL DEFAULT 'VP of Something':::STRING,
-                        nickname STRING NULL,
-                        username STRING(10) NULL,
-                        email STRING(100) NULL,
-                        CONSTRAINT pk PRIMARY KEY (id ASC),
-                        UNIQUE INDEX uq (email ASC),
-                        INDEX foo ("name" ASC),
-                        UNIQUE INDEX uq2 (username ASC),
-                        UNIQUE INDEX bar (id ASC, "name" ASC),
-                        FAMILY "primary" (id, "name"),
-                        FAMILY fam_1_title (title),
-                        FAMILY fam_2_nickname (nickname),
-                        FAMILY fam_3_username_email (username, email),
-                        CONSTRAINT ck2 CHECK (length(nickname) < length("name")),
-                        CONSTRAINT ck1 CHECK (length(nickname) < 10)
+test.public.named_constraints  CREATE TABLE named_constraints (
+                               id INT NOT NULL,
+                               name STRING NOT NULL,
+                               title STRING NULL DEFAULT 'VP of Something':::STRING,
+                               nickname STRING NULL,
+                               username STRING(10) NULL,
+                               email STRING(100) NULL,
+                               CONSTRAINT pk PRIMARY KEY (id ASC),
+                               UNIQUE INDEX uq (email ASC),
+                               INDEX foo (name ASC),
+                               UNIQUE INDEX uq2 (username ASC),
+                               UNIQUE INDEX bar (id ASC, name ASC),
+                               FAMILY "primary" (id, name),
+                               FAMILY fam_1_title (title),
+                               FAMILY fam_2_nickname (nickname),
+                               FAMILY fam_3_username_email (username, email),
+                               CONSTRAINT ck2 CHECK (length(nickname) < length(name)),
+                               CONSTRAINT ck1 CHECK (length(nickname) < 10)
 )
 
 query TTTTT colnames
 SHOW CONSTRAINTS FROM test.named_constraints
 ----
-Table              Name  Type         Column(s)  Details
-named_constraints  bar   UNIQUE       id, name   NULL
-named_constraints  ck1   CHECK        NULL       length(nickname) < 10
-named_constraints  ck2   CHECK        NULL       length(nickname) < length("name")
-named_constraints  pk    PRIMARY KEY  id         NULL
-named_constraints  uq    UNIQUE       email      NULL
-named_constraints  uq2   UNIQUE       username   NULL
+Table              Name  Type         Column(s)       Details
+named_constraints  bar   UNIQUE       id, name        NULL
+named_constraints  ck1   CHECK        nickname        length(nickname) < 10
+named_constraints  ck2   CHECK        name, nickname  length(nickname) < length(name)
+named_constraints  pk    PRIMARY KEY  id              NULL
+named_constraints  uq    UNIQUE       email           NULL
+named_constraints  uq2   UNIQUE       username        NULL
 
 statement error duplicate constraint name: "pk"
 CREATE TABLE test.dupe_named_constraints (
@@ -453,10 +447,9 @@ CREATE TABLE test.null_default (
 query TT
 SHOW CREATE TABLE test.null_default
 ----
-test.null_default CREATE TABLE null_default
-(
-  ts  TIMESTAMP NULL DEFAULT NULL,
-  FAMILY "primary" (ts, rowid)
+test.public.null_default  CREATE TABLE null_default (
+                          ts TIMESTAMP NULL DEFAULT NULL,
+                          FAMILY "primary" (ts, rowid)
 )
 
 # Issue #13873: don't permit invalid default columns
@@ -465,3 +458,11 @@ CREATE TABLE test.t1 (a DECIMAL DEFAULT (DECIMAL 'blah'));
 
 statement error could not parse "blah" as type decimal
 create table test.t1 (c decimal default if(false, 1, 'blah'::decimal));
+
+statement ok
+CREATE DATABASE a; CREATE TABLE a.c(d INT); INSERT INTO a.public.c(d) VALUES (1)
+
+query I
+SELECT a.public.c.d FROM a.public.c
+----
+1

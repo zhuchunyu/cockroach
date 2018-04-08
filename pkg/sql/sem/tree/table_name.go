@@ -14,206 +14,152 @@
 
 package tree
 
-import (
-	"fmt"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-)
-
-// Table names are used in statements like CREATE TABLE,
-// INSERT INTO, etc.
-// General syntax:
-//    [ <database-name> '.' ] <table-name>
+// TableName corresponds to the name of a table in a FROM clause,
+// INSERT or UPDATE statement, etc.
 //
-// The other syntax nodes hold a mutable NormalizableTableName
-// attribute.  This is populated during parsing with an
-// UnresolvedName, and gets assigned an actual TableName upon the first
-// call to its Normalize() method.
+// This is constructed for incoming SQL queries by normalizing an
+// UnresolvedName via NormalizableTableName. See
+// normalizable_table_name.go.
+//
+// Internal uses of this struct should not construct instances of
+// TableName directly, and instead use the NewTableName /
+// MakeTableName functions underneath.
+//
+// TableName is the public type for tblName. It exposes the fields
+// and can be default-constructed but cannot be instantiated with a
+// non-default value; this encourages the use of the constructors below.
+type TableName struct {
+	tblName
+}
 
-// NormalizableTableName implements an editable table name.
-type NormalizableTableName struct {
-	TableNameReference
+type tblName struct {
+	// TableName is the unqualified name for the object
+	// (table/view/sequence/function/type).
+	TableName Name
+
+	// TableNamePrefix is the path to the object.  This can be modified
+	// further by name resolution, see name_resolution.go.
+	TableNamePrefix
+}
+
+// TableNamePrefix corresponds to the path prefix of a table name.
+type TableNamePrefix struct {
+	CatalogName Name
+	SchemaName  Name
+
+	// ExplicitCatalog is true iff the catalog was explicitly specified
+	// or it needs to be rendered during pretty-printing.
+	ExplicitCatalog bool
+	// ExplicitSchema is true iff the schema was explicitly specified
+	// or it needs to be rendered during pretty-printing.
+	ExplicitSchema bool
 }
 
 // Format implements the NodeFormatter interface.
-func (nt *NormalizableTableName) Format(ctx *FmtCtx) {
-	if ctx.tableNameFormatter != nil {
-		ctx.tableNameFormatter(ctx, nt)
-	} else {
-		ctx.FormatNode(nt.TableNameReference)
-	}
-}
-func (nt *NormalizableTableName) String() string { return AsString(nt) }
-
-// Normalize checks if the table name is already normalized and
-// normalizes it as necessary.
-func (nt *NormalizableTableName) Normalize() (*TableName, error) {
-	switch t := nt.TableNameReference.(type) {
-	case *TableName:
-		return t, nil
-	case *UnresolvedName:
-		tn, err := t.NormalizeTableName()
-		if err != nil {
-			return nil, err
+func (tp *TableNamePrefix) Format(ctx *FmtCtx) {
+	alwaysFormat := ctx.alwaysFormatTablePrefix()
+	if tp.ExplicitSchema || alwaysFormat {
+		if tp.ExplicitCatalog || alwaysFormat {
+			ctx.FormatNode(&tp.CatalogName)
+			ctx.WriteByte('.')
 		}
-		nt.TableNameReference = tn
-		return tn, nil
-	default:
-		panic(fmt.Sprintf("unsupported table name reference: %+v (%T)",
-			nt.TableNameReference, nt.TableNameReference))
+		ctx.FormatNode(&tp.SchemaName)
 	}
 }
 
-// NormalizeWithDatabaseName combines Normalize and QualifyWithDatabase.
-func (nt *NormalizableTableName) NormalizeWithDatabaseName(database string) (*TableName, error) {
-	tn, err := nt.Normalize()
-	if err != nil {
-		return nil, err
-	}
-	if err := tn.QualifyWithDatabase(database); err != nil {
-		return nil, err
-	}
-	return tn, nil
+func (tp *TableNamePrefix) String() string { return AsString(tp) }
+
+// Schema retrieves the unqualified schema name.
+func (tp *TableNamePrefix) Schema() string {
+	return string(tp.SchemaName)
 }
 
-// TableName asserts that the table name has been previously normalized.
-func (nt *NormalizableTableName) TableName() *TableName {
-	return nt.TableNameReference.(*TableName)
-}
-
-// tableExpr implements the TableExpr interface.
-func (*NormalizableTableName) tableExpr() {}
-
-// TableNameReference implements the editable cell of a TableExpr that
-// refers to a single table.
-type TableNameReference interface {
-	fmt.Stringer
-	NodeFormatter
-	NormalizeTableName() (*TableName, error)
-}
-
-// TableName corresponds to the name of a table in a FROM clause,
-// INSERT or UPDATE statement (and possibly other places).
-type TableName struct {
-	PrefixName   Name
-	DatabaseName Name
-	TableName    Name
-
-	// OmitDBNameDuringFormatting, when set to true, causes the
-	// String()/Format() methods to omit the database name even if one
-	// is set. This is used to ensure that pretty-printing
-	// a TableName normalized from a parser input yields back
-	// the original syntax.
-	OmitDBNameDuringFormatting bool
-
-	// PrefixOriginallySpecified indicates whether a prefix was
-	// explicitly indicated in the input syntax.
-	PrefixOriginallySpecified bool
+// Catalog retrieves the unqualified catalog name.
+func (tp *TableNamePrefix) Catalog() string {
+	return string(tp.CatalogName)
 }
 
 // Format implements the NodeFormatter interface.
 func (t *TableName) Format(ctx *FmtCtx) {
-	f := ctx.flags
-	if !t.OmitDBNameDuringFormatting ||
-		f.HasFlags(FmtAlwaysQualifyTableNames) || ctx.tableNameFormatter != nil {
-		if t.PrefixOriginallySpecified {
-			ctx.FormatNode(&t.PrefixName)
-			ctx.WriteByte('.')
-		}
-		ctx.FormatNode(&t.DatabaseName)
+	t.TableNamePrefix.Format(ctx)
+	if t.ExplicitSchema || ctx.alwaysFormatTablePrefix() {
 		ctx.WriteByte('.')
 	}
 	ctx.FormatNode(&t.TableName)
 }
 func (t *TableName) String() string { return AsString(t) }
 
-// NormalizeTableName implements the TableNameReference interface.
-func (t *TableName) NormalizeTableName() (*TableName, error) { return t, nil }
+// FQString renders the table name in full, not omitting the prefix
+// schema and catalog names. Suitable for logging, etc.
+func (t *TableName) FQString() string {
+	return AsStringWithFlags(t, FmtAlwaysQualifyTableNames)
+}
 
 // Table retrieves the unqualified table name.
 func (t *TableName) Table() string {
 	return string(t.TableName)
 }
 
-// Database retrieves the unqualified database name.
-func (t *TableName) Database() string {
-	return string(t.DatabaseName)
+// MakeTableName creates a new table name qualified with just a schema.
+func MakeTableName(db, tbl Name) TableName {
+	return TableName{tblName{
+		TableName: tbl,
+		TableNamePrefix: TableNamePrefix{
+			CatalogName:     db,
+			SchemaName:      PublicSchemaName,
+			ExplicitSchema:  true,
+			ExplicitCatalog: true,
+		},
+	}}
 }
 
-// NewInvalidNameErrorf initializes an error carrying the pg code CodeInvalidNameError.
-func NewInvalidNameErrorf(fmt string, args ...interface{}) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidNameError, fmt, args...)
+// NewTableName creates a new table name qualified with a given
+// catalog and the public schema.
+func NewTableName(db, tbl Name) *TableName {
+	tn := MakeTableName(db, tbl)
+	return &tn
 }
 
-// normalizeTableNameAsValue transforms an UnresolvedName to a TableName.
-// The resulting TableName may lack a db qualification. This is
-// valid if e.g. the name refers to a in-query table alias
-// (AS) or is qualified later using the QualifyWithDatabase method.
-func (n *UnresolvedName) normalizeTableNameAsValue() (res TableName, err error) {
-	if len(*n) == 0 || len(*n) > 3 {
-		return res, NewInvalidNameErrorf("invalid table name: %q", ErrString(n))
-	}
-
-	name, ok := (*n)[len(*n)-1].(*Name)
-	if !ok {
-		return res, NewInvalidNameErrorf("invalid table name: %q", ErrString(n))
-	}
-
-	if len(*name) == 0 {
-		return res, NewInvalidNameErrorf("empty table name: %q", ErrString(n))
-	}
-
-	res = TableName{TableName: *name, OmitDBNameDuringFormatting: true}
-
-	if len(*n) > 1 {
-		ndb, ok := (*n)[len(*n)-2].(*Name)
-		if !ok {
-			return res, NewInvalidNameErrorf("invalid database name: %q", ErrString((*n)[len(*n)-2]))
-		}
-		res.DatabaseName = *ndb
-
-		if len(res.DatabaseName) == 0 {
-			return res, NewInvalidNameErrorf("empty database name: %q", ErrString(n))
-		}
-
-		res.OmitDBNameDuringFormatting = false
-
-		if len(*n) > 2 {
-			pn, ok := (*n)[len(*n)-3].(*Name)
-			if !ok {
-				return res, NewInvalidNameErrorf("invalid prefix: %q", ErrString((*n)[len(*n)-3]))
-			}
-			res.PrefixName = *pn
-
-			res.PrefixOriginallySpecified = true
-		}
-	}
-
-	return res, nil
+// MakeTableNameWithSchema creates a new fully qualified table name.
+func MakeTableNameWithSchema(db, schema, tbl Name) TableName {
+	return TableName{tblName{
+		TableName: tbl,
+		TableNamePrefix: TableNamePrefix{
+			CatalogName:     db,
+			SchemaName:      schema,
+			ExplicitSchema:  true,
+			ExplicitCatalog: true,
+		},
+	}}
 }
 
-// NormalizeTableName implements the TableNameReference interface.
-func (n *UnresolvedName) NormalizeTableName() (*TableName, error) {
-	tn, err := n.normalizeTableNameAsValue()
-	if err != nil {
-		return nil, err
-	}
-	return &tn, nil
+// MakeUnqualifiedTableName creates a new base table name.
+func MakeUnqualifiedTableName(tbl Name) TableName {
+	return TableName{tblName{
+		TableName: tbl,
+	}}
 }
 
-// QualifyWithDatabase adds an indirection for the database, if it's missing.
-// It transforms:
-// table       -> database.table
-// table@index -> database.table@index
-func (t *TableName) QualifyWithDatabase(database string) error {
-	if !t.OmitDBNameDuringFormatting {
-		return nil
+// NewUnqualifiedTableName creates a new base table name.
+func NewUnqualifiedTableName(tbl Name) *TableName {
+	tn := MakeUnqualifiedTableName(tbl)
+	return &tn
+}
+
+func makeTableNameFromUnresolvedName(n *UnresolvedName) TableName {
+	return TableName{tblName{
+		TableName:       Name(n.Parts[0]),
+		TableNamePrefix: makeTableNamePrefixFromUnresolvedName(n),
+	}}
+}
+
+func makeTableNamePrefixFromUnresolvedName(n *UnresolvedName) TableNamePrefix {
+	return TableNamePrefix{
+		SchemaName:      Name(n.Parts[1]),
+		CatalogName:     Name(n.Parts[2]),
+		ExplicitSchema:  n.NumParts >= 2,
+		ExplicitCatalog: n.NumParts >= 3,
 	}
-	if database == "" {
-		return pgerror.NewErrorf(pgerror.CodeUndefinedTableError, "no database specified: %q", t)
-	}
-	t.DatabaseName = Name(database)
-	return nil
 }
 
 // TableNames represents a comma separated list (see the Format method)
@@ -222,63 +168,11 @@ type TableNames []TableName
 
 // Format implements the NodeFormatter interface.
 func (ts *TableNames) Format(ctx *FmtCtx) {
+	sep := ""
 	for i := range *ts {
-		if i > 0 {
-			ctx.WriteString(", ")
-		}
+		ctx.WriteString(sep)
 		ctx.FormatNode(&(*ts)[i])
+		sep = ", "
 	}
 }
 func (ts *TableNames) String() string { return AsString(ts) }
-
-// TableNameReferences corresponds to a comma-delimited
-// list of table name references.
-type TableNameReferences []TableNameReference
-
-// Format implements the NodeFormatter interface.
-func (t *TableNameReferences) Format(ctx *FmtCtx) {
-	for i, tr := range *t {
-		if i > 0 {
-			ctx.WriteString(", ")
-		}
-		ctx.FormatNode(tr)
-	}
-}
-
-// TableNameWithIndex represents a "table@index", used in statements that
-// specifically refer to an index.
-type TableNameWithIndex struct {
-	Table NormalizableTableName
-	Index UnrestrictedName
-
-	// SearchTable indicates that we have just an index (no table name); we will
-	// need to search for a table that has an index with the given name.
-	//
-	// To allow schema-qualified index names in this case, the index is actually
-	// specified in Table as the table name, and Index is empty.
-	SearchTable bool
-}
-
-// Format implements the NodeFormatter interface.
-func (n *TableNameWithIndex) Format(ctx *FmtCtx) {
-	ctx.FormatNode(&n.Table)
-	if n.Index != "" {
-		ctx.WriteByte('@')
-		ctx.FormatNode(&n.Index)
-	}
-}
-
-func (n *TableNameWithIndex) String() string { return AsString(n) }
-
-// TableNameWithIndexList is a list of indexes.
-type TableNameWithIndexList []*TableNameWithIndex
-
-// Format implements the NodeFormatter interface.
-func (n *TableNameWithIndexList) Format(ctx *FmtCtx) {
-	for i, e := range *n {
-		if i > 0 {
-			ctx.WriteString(", ")
-		}
-		ctx.FormatNode(e)
-	}
-}

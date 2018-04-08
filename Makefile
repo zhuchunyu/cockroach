@@ -107,10 +107,11 @@ help: ## Print help for targets with comments.
 
 # Possible values:
 # <empty>: use the default toolchain
-# release-linux-gnu:  target Linux 2.6.32, dynamically link GLIBC 2.12.2
-# release-linux-musl: target Linux 2.6.32, statically link musl 1.1.16
-# release-darwin:     target OS X 10.9
-# release-windows:    target Windows 8, statically link all non-Windows libraries
+# release-linux-gnu:     target Linux 2.6.32, dynamically link GLIBC 2.12.2
+# release-linux-musl:    target Linux 2.6.32, statically link musl 1.1.16
+# release-aarch64-linux: target aarch64 Linux 3.7.10, dynamically link GLIBC 2.12.2
+# release-darwin:        target OS X 10.9
+# release-windows:       target Windows 8, statically link all non-Windows libraries
 #
 # All non-empty variants only work in the cockroachdb/builder docker image, as
 # they depend on cross-compilation toolchains available there.
@@ -142,43 +143,50 @@ export CGO_LDFLAGS
 override CFLAGS += $(MSAN_CPPFLAGS)
 override CXXFLAGS += $(MSAN_CPPFLAGS)
 override LDFLAGS += $(MSAN_LDFLAGS)
-export CFLAGS
-export CXXFLAGS
-export LDFLAGS
-else ifeq ($(TYPE),portable)
-override LINKFLAGS += -s -w -extldflags "-static-libgcc -static-libstdc++"
 else ifeq ($(TYPE),release-linux-gnu)
 # We use a custom toolchain to target old Linux and glibc versions. However,
 # this toolchain's libstdc++ version is quite recent and must be statically
 # linked to avoid depending on the target's available libstdc++.
 XHOST_TRIPLE := x86_64-unknown-linux-gnu
-override LINKFLAGS += -s -w -extldflags "-static-libgcc -static-libstdc++"
-override GOFLAGS += -installsuffix release-gnu
+override LINKFLAGS += -extldflags "-static-libgcc -static-libstdc++"
 override SUFFIX := $(SUFFIX)-linux-2.6.32-gnu-amd64
-BUILD_TYPE := release-gnu
+BUILD_TYPE := release
 else ifeq ($(TYPE),release-linux-musl)
-BUILD_TYPE := release-musl
 XHOST_TRIPLE := x86_64-unknown-linux-musl
-override LINKFLAGS += -s -w -extldflags "-static"
-override GOFLAGS += -installsuffix release-musl
+override LINKFLAGS += -extldflags "-static"
 override SUFFIX := $(SUFFIX)-linux-2.6.32-musl-amd64
+BUILD_TYPE := release
+else ifeq ($(TYPE),release-aarch64-linux)
+XGOARCH := arm64
+export CGO_ENABLED := 1
+XHOST_TRIPLE := aarch64-unknown-linux-gnueabi
+override LINKFLAGS += -extldflags "-static-libgcc -static-libstdc++"
+override SUFFIX := $(SUFFIX)-linux-3.7.10-gnu-aarch64
+BUILD_TYPE := release
 else ifeq ($(TYPE),release-darwin)
 XGOOS := darwin
 export CGO_ENABLED := 1
 XHOST_TRIPLE := x86_64-apple-darwin13
 override SUFFIX := $(SUFFIX)-darwin-10.9-amd64
-override LINKFLAGS += -s -w
 BUILD_TYPE := release
 else ifeq ($(TYPE),release-windows)
 XGOOS := windows
 export CGO_ENABLED := 1
 XHOST_TRIPLE := x86_64-w64-mingw32
 override SUFFIX := $(SUFFIX)-windows-6.2-amd64
-override LINKFLAGS += -s -w -extldflags "-static"
+override LINKFLAGS += -extldflags "-static"
 BUILD_TYPE := release
 else
 $(error unknown build type $(TYPE))
 endif
+
+# Build C/C++ with basic debugging information.
+CFLAGS += -g1
+CXXFLAGS += -g1
+
+export CFLAGS
+export CXXFLAGS
+export LDFLAGS
 
 override LINKFLAGS += -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILD_TYPE)
 
@@ -193,11 +201,22 @@ UI_ROOT        := $(PKG_ROOT)/ui
 SQLPARSER_ROOT := $(PKG_ROOT)/sql/parser
 
 # Ensure we have an unambiguous GOPATH.
-export GOPATH := $(realpath ../../../..)
-#                           ^  ^  ^  ^~ GOPATH
-#                           |  |  |~ GOPATH/src
-#                           |  |~ GOPATH/src/github.com
-#                           |~ GOPATH/src/github.com/cockroachdb
+GOPATH := $(realpath $(shell $(GO) env GOPATH))
+ifeq ($(strip $(GOPATH)),)
+$(error GOPATH is not set and could not be automatically determined, build cannot continue)
+endif
+
+ifneq "$(or $(findstring :,$(GOPATH)),$(findstring ;,$(GOPATH)))" ""
+$(error GOPATHs with multiple entries are not supported)
+endif
+
+ifeq "$(filter $(GOPATH)%,$(CURDIR))" ""
+$(error Current directory "$(CURDIR)" is not within GOPATH "$(GOPATH)")
+endif
+
+ifeq "$(GOPATH)" "/"
+$(error GOPATH=/ is not supported)
+endif
 
 # Avoid printing twice if Make restarts (because a Makefile was changed) or is
 # called recursively from another Makefile.
@@ -336,9 +355,14 @@ BOOTSTRAP_TARGET := bin/.bootstrap
 
 SUBMODULES_TARGET := bin/.submodules-initialized
 
+GO_PROTOS_TARGET := bin/.go_protobuf_sources
+GW_PROTOS_TARGET := bin/.gw_protobuf_sources
+CPP_PROTOS_TARGET := bin/.cpp_protobuf_sources
+CPP_PROTOS_CCL_TARGET := bin/.cpp_ccl_protobuf_sources
+
 # Update the git hooks and install commands from dependencies whenever they
 # change.
-$(BOOTSTRAP_TARGET): $(GITHOOKS) Gopkg.lock bin/returncheck | $(SUBMODULES_TARGET)
+$(BOOTSTRAP_TARGET): $(GITHOOKS) Gopkg.lock | $(SUBMODULES_TARGET)
 	@$(GO_INSTALL) -v \
 		./vendor/github.com/golang/dep/cmd/dep \
 		./vendor/github.com/client9/misspell/cmd/misspell \
@@ -355,9 +379,7 @@ $(BOOTSTRAP_TARGET): $(GITHOOKS) Gopkg.lock bin/returncheck | $(SUBMODULES_TARGE
 		./vendor/golang.org/x/perf/cmd/benchstat \
 		./vendor/golang.org/x/tools/cmd/goimports \
 		./vendor/golang.org/x/tools/cmd/goyacc \
-		./vendor/golang.org/x/tools/cmd/stringer \
-		./pkg/sql/opt/optgen/cmd/langgen \
-		./pkg/sql/opt/optgen/cmd/optgen
+		./vendor/golang.org/x/tools/cmd/stringer
 	touch $@
 
 $(SUBMODULES_TARGET):
@@ -415,10 +437,9 @@ CMAKE_FLAGS += -DCMAKE_TARGET_MESSAGES=OFF
 override USE_STDMALLOC := $(findstring stdmalloc,$(TAGS))
 STDMALLOC_SUFFIX := $(if $(USE_STDMALLOC),_stdmalloc)
 
-# TODO(benesch): Give TYPE clearer semantics to avoid this spaghetti.
-PORTABLE := $(or $(findstring portable,$(TYPE)),$(findstring release,$(TYPE)))
-
 ENABLE_ROCKSDB_ASSERTIONS := $(findstring race,$(TAGS))
+
+XCMAKE_FLAGS := $(CMAKE_FLAGS)
 
 ifdef XHOST_TRIPLE
 
@@ -448,7 +469,11 @@ CMAKE_SYSTEM_NAME := Windows
 endif
 
 CONFIGURE_FLAGS += --host=$(XHOST_TRIPLE) CC=$(CC_PATH) CXX=$(CXX_PATH)
-CMAKE_FLAGS += -DCMAKE_C_COMPILER=$(CC_PATH) -DCMAKE_CXX_COMPILER=$(CXX_PATH) -DCMAKE_SYSTEM_NAME=$(CMAKE_SYSTEM_NAME)
+
+# Use XCMAKE_FLAGS when invoking CMake on libraries/binaries for the target
+# platform (i.e., the cross-compiled platform, if specified); use plain
+# CMAKE_FLAGS when invoking CMake on libraries/binaries for the host platform.
+XCMAKE_FLAGS += -DCMAKE_C_COMPILER=$(CC_PATH) -DCMAKE_CXX_COMPILER=$(CXX_PATH) -DCMAKE_SYSTEM_NAME=$(CMAKE_SYSTEM_NAME)
 
 TARGET_TRIPLE := $(XHOST_TRIPLE)
 else
@@ -546,7 +571,8 @@ $(CRYPTOPP_DIR)/Makefile: $(C_DEPS_DIR)/cryptopp-rebuild | $(SUBMODULES_TARGET)
 	mkdir -p $(CRYPTOPP_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/cryptopp-rebuild. See above for rationale.
-	cd $(CRYPTOPP_DIR) && cmake $(CMAKE_FLAGS) $(CRYPTOPP_SRC_DIR)
+	cd $(CRYPTOPP_DIR) && cmake $(XCMAKE_FLAGS) $(CRYPTOPP_SRC_DIR) \
+	  -DCMAKE_BUILD_TYPE=Release
 
 $(JEMALLOC_SRC_DIR)/configure.ac: | $(SUBMODULES_TARGET)
 
@@ -568,7 +594,8 @@ $(PROTOBUF_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | $(SUBMODULES_TARGET)
 	mkdir -p $(PROTOBUF_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOBUF_DIR) && cmake $(CMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake
+	cd $(PROTOBUF_DIR) && cmake $(XCMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
+	  -DCMAKE_BUILD_TYPE=Release
 
 ifneq ($(PROTOC_DIR),$(PROTOBUF_DIR))
 $(PROTOC_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | $(SUBMODULES_TARGET)
@@ -576,35 +603,39 @@ $(PROTOC_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | $(SUBMODULES_TARGET)
 	mkdir -p $(PROTOC_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOC_DIR) && cmake $(CMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake
+	cd $(PROTOC_DIR) && cmake $(CMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
+	  -DCMAKE_BUILD_TYPE=Release
 endif
 
+$(ROCKSDB_DIR)/Makefile: sse := $(if $(findstring x86_64,$(TARGET_TRIPLE)),-msse3)
 $(ROCKSDB_DIR)/Makefile: $(C_DEPS_DIR)/rocksdb-rebuild | $(SUBMODULES_TARGET) libsnappy $(if $(USE_STDMALLOC),,libjemalloc)
 	rm -rf $(ROCKSDB_DIR)
 	mkdir -p $(ROCKSDB_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/rocksdb-rebuild. See above for rationale.
-	cd $(ROCKSDB_DIR) && cmake $(CMAKE_FLAGS) $(ROCKSDB_SRC_DIR) \
-	  $(if $(PORTABLE),-DPORTABLE=ON) \
+	cd $(ROCKSDB_DIR) && CFLAGS+=" $(sse)" && CXXFLAGS+=" $(sse)" && cmake $(XCMAKE_FLAGS) $(ROCKSDB_SRC_DIR) \
+	  $(if $(findstring release,$(BUILD_TYPE)),-DPORTABLE=ON) \
 	  -DSNAPPY_LIBRARIES=$(SNAPPY_DIR)/libsnappy.a -DSNAPPY_INCLUDE_DIR="$(SNAPPY_SRC_DIR);$(SNAPPY_DIR)" -DWITH_SNAPPY=ON \
 	  $(if $(USE_STDMALLOC),,-DJEMALLOC_LIBRARIES=$(JEMALLOC_DIR)/lib/libjemalloc.a -DJEMALLOC_INCLUDE_DIR=$(JEMALLOC_DIR)/include -DWITH_JEMALLOC=ON) \
-	  -DCMAKE_CXX_FLAGS="$(if $(findstring x86_64,$(TARGET_TRIPLE)),-msse3) $(if $(ENABLE_ROCKSDB_ASSERTIONS),,-DNDEBUG)"
-	@# TODO(benesch): Tweak how we pass -DNDEBUG above when we upgrade to a
-	@# RocksDB release that includes https://github.com/facebook/rocksdb/pull/2300.
+	  -DCMAKE_BUILD_TYPE=$(if $(ENABLE_ROCKSDB_ASSERTIONS),Debug,Release)
 
 $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | $(SUBMODULES_TARGET)
 	rm -rf $(SNAPPY_DIR)
 	mkdir -p $(SNAPPY_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/snappy-rebuild. See above for rationale.
-	cd $(SNAPPY_DIR) && cmake $(CMAKE_FLAGS) $(SNAPPY_SRC_DIR)
+	cd $(SNAPPY_DIR) && cmake $(XCMAKE_FLAGS) $(SNAPPY_SRC_DIR) \
+	  -DCMAKE_BUILD_TYPE=Release
 
-$(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild | $(SUBMODULES_TARGET)
+# TODO(benesch): make it possible to build libroach without CCL code. Because
+# libroach and libroachccl are defined in the same CMake project, CMake requires
+# that the CCL code be present even if only the OSS target will be built.
+$(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild | $(SUBMODULES_TARGET) $(CPP_PROTOS_TARGET) $(CPP_PROTOS_CCL_TARGET)
 	rm -rf $(LIBROACH_DIR)
 	mkdir -p $(LIBROACH_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/libroach-rebuild. See above for rationale.
-	cd $(LIBROACH_DIR) && cmake $(CMAKE_FLAGS) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
+	cd $(LIBROACH_DIR) && cmake $(XCMAKE_FLAGS) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
 		-DPROTOBUF_LIB=$(PROTOBUF_DIR)/libprotobuf.a -DROCKSDB_LIB=$(ROCKSDB_DIR)/librocksdb.a \
 		-DJEMALLOC_LIB=$(JEMALLOC_DIR)/lib/libjemalloc.a -DSNAPPY_LIB=$(SNAPPY_DIR)/libsnappy.a \
 		-DCRYPTOPP_LIB=$(CRYPTOPP_DIR)/libcryptopp.a
@@ -639,11 +670,11 @@ librocksdb: $(ROCKSDB_DIR)/Makefile
 	@$(MAKE) --no-print-directory -C $(ROCKSDB_DIR) rocksdb
 
 .PHONY: libroach
-libroach: $(LIBROACH_DIR)/Makefile $(CPP_PROTOS_TARGET)
+libroach: $(LIBROACH_DIR)/Makefile
 	@$(MAKE) --no-print-directory -C $(LIBROACH_DIR) roach
 
 .PHONY: libroachccl
-libroachccl: $(LIBROACH_DIR)/Makefile $(CPP_PROTOS_CCL_TARGET)
+libroachccl: $(LIBROACH_DIR)/Makefile
 	@$(MAKE) --no-print-directory -C $(LIBROACH_DIR) roachccl
 
 PHONY: check-libroach
@@ -678,12 +709,9 @@ SQLPARSER_TARGETS = \
 	$(PKG_ROOT)/sql/lex/keywords.go \
 	$(PKG_ROOT)/sql/lex/reserved_keywords.go
 
-DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
+PROTOBUF_TARGETS := $(GO_PROTOS_TARGET) $(GW_PROTOS_TARGET) $(CPP_PROTOS_TARGET) $(CPP_PROTOS_CCL_TARGET)
 
-GO_PROTOS_TARGET := bin/.go_protobuf_sources
-GW_PROTOS_TARGET := bin/.gw_protobuf_sources
-CPP_PROTOS_TARGET := bin/.cpp_protobuf_sources
-CPP_PROTOS_CCL_TARGET := bin/.cpp_ccl_protobuf_sources
+DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
 
 .DEFAULT_GOAL := all
 all: $(COCKROACH)
@@ -700,17 +728,21 @@ buildshort: $(C_LIBS_CCL)
 $(COCKROACH) build go-install gotestdashi generate lint lintshort: $(C_LIBS_CCL)
 $(COCKROACH) build go-install generate: $(UI_ROOT)/distccl/bindata.go
 
-$(COCKROACH) build buildoss buildshort: BUILDMODE = build -i -o $(COCKROACH)
+$(COCKROACH) build buildoss buildshort: BUILDMODE = build -o $(COCKROACH)
 
 BUILDINFO = .buildinfo/tag .buildinfo/rev
+BUILD_TAGGED_RELEASE =
 
 # The build.utcTime format must remain in sync with TimeFormat in pkg/build/info.go.
 $(COCKROACH) build buildoss buildshort go-install gotestdashi generate lint lintshort: \
-	$(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET) $(SQLPARSER_TARGETS) $(BUILDINFO) $(DOCGEN_TARGETS) protobuf
+	$(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET) $(SQLPARSER_TARGETS) $(BUILDINFO) $(DOCGEN_TARGETS) $(PROTOBUF_TARGETS)
 $(COCKROACH) build buildoss buildshort go-install gotestdashi generate lint lintshort: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(shell cat .buildinfo/tag)" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')" \
-	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)"
+	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
+	-X "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple=$(TARGET_TRIPLE)" \
+	$(if $(BUILDCHANNEL),-X "github.com/cockroachdb/cockroach/pkg/build.channel=$(BUILDCHANNEL)") \
+	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log.crashReportEnv=$(shell cat .buildinfo/tag)")
 
 # Note: We pass `-v` to `go build` and `go test -i` so that warnings
 # from the linker aren't suppressed. The usage of `-v` also shows when
@@ -738,12 +770,16 @@ start:
 .PHONY: testbuild
 testbuild: gotestdashi
 	$(XGO) list -tags '$(TAGS)' -f \
-	'$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -i -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
+	'$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
 	$(SHELL)
 
+# TODO(benesch): remove this target or give it a more sensible name. It's a
+# vestige from the pre-Go 1.10 era when we needed to run `go test -i` because
+# `go test` did not cache compilation of transitive packages. Removing it is
+# finicky because it's in the dependency graph of many other targets, so it's
+# best left to early in a release cycle.
 .PHONY: gotestdashi
-gotestdashi:
-	$(XGO) test -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i $(PKG)
+gotestdashi: ;
 
 testshort: override TESTFLAGS += -short
 
@@ -774,7 +810,7 @@ testlogic: ## Run SQL Logic Tests.
 testlogic: pkg/sql/logictest/logictest.test
 
 testccllogic: ## Run SQL CCL Logic Tests.
-testccllogic: pkg/ccl/sqlccl/logictestccl/logictestccl.test
+testccllogic: pkg/ccl/logictestccl/logictestccl.test
 
 testlogic testccllogic: TESTS := Test(CCL)?Logic//$(if $(FILES),^$(subst $(space),$$|^,$(FILES))$$)/$(SUBTESTS)
 testlogic testccllogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql)
@@ -805,7 +841,7 @@ stressrace: TESTTIMEOUT := $(RACETIMEOUT)
 stress: ## Run tests under stress.
 stressrace: ## Run tests under stress with the race detector enabled.
 stress stressrace: gotestdashi
-	$(GO) list -tags '$(TAGS)' -f '$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -i -c {{.ImportPath}} -o '\''{{.Dir}}'\''/stress.test && (cd '\''{{.Dir}}'\'' && if [ -f stress.test ]; then stress $(STRESSFLAGS) ./stress.test -test.run '\''$(TESTS)'\'' $(if $(BENCHES),-test.bench '\''$(BENCHES)'\'') -test.timeout $(TESTTIMEOUT) $(TESTFLAGS); fi)' $(PKG) | $(SHELL)
+	$(GO) list -tags '$(TAGS)' -f '$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o '\''{{.Dir}}'\''/stress.test && (cd '\''{{.Dir}}'\'' && if [ -f stress.test ]; then stress $(STRESSFLAGS) ./stress.test -test.run '\''$(TESTS)'\'' $(if $(BENCHES),-test.bench '\''$(BENCHES)'\'') -test.timeout $(TESTTIMEOUT) $(TESTFLAGS); fi)' $(PKG) | $(SHELL)
 
 .PHONY: upload-coverage
 upload-coverage: $(BOOTSTRAP_TARGET)
@@ -834,13 +870,18 @@ dupl: $(BOOTSTRAP_TARGET)
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS)
+generate: protobuf $(DOCGEN_TARGETS) | bin/langgen bin/optgen
 	$(GO) generate $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
+lint: | bin/returncheck
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
+	@# Run 'go install' to ensure we have compiled object files available for all
+	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
+	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
+	$(XGO) install -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 	$(XGO) test $(PKG_ROOT)/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'TestLint/$(TESTS)'
 
 .PHONY: lintshort
@@ -849,7 +890,7 @@ lintshort: ## Run a fast subset of the style checkers and linters.
 	$(XGO) test $(PKG_ROOT)/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
-protobuf: $(GO_PROTOS_TARGET) $(GW_PROTOS_TARGET) $(CPP_PROTOS_TARGET) $(CPP_PROTOS_CCL_TARGET)
+protobuf: $(PROTOBUF_TARGETS)
 protobuf: ## Regenerate generated code for protobuf definitions.
 
 # pre-push locally runs most of the checks CI will run. Notably, it doesn't run
@@ -917,11 +958,9 @@ CPP_PROTO_CCL_ROOT := $(LIBROACH_SRC_DIR)/protosccl
 GOGO_PROTOBUF_PATH := ./vendor/github.com/gogo/protobuf
 PROTOBUF_PATH  := $(GOGO_PROTOBUF_PATH)/protobuf
 
-PROTOC_PLUGIN   := bin/protoc-gen-gogoroach
 GOGOPROTO_PROTO := $(GOGO_PROTOBUF_PATH)/gogoproto/gogo.proto
 
 COREOS_PATH := ./vendor/github.com/coreos
-COREOS_RAFT_PROTOS := $(sort $(shell find $(COREOS_PATH)/etcd/raft -type f -name '*.proto'))
 
 GRPC_GATEWAY_GOOGLEAPIS_PACKAGE := github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
 GRPC_GATEWAY_GOOGLEAPIS_PATH := ./vendor/$(GRPC_GATEWAY_GOOGLEAPIS_PACKAGE)
@@ -957,10 +996,10 @@ CPP_SOURCES_CCL := $(subst $(PKG_ROOT),$(CPP_PROTO_CCL_ROOT),$(CPP_PROTOS_CCL:%.
 
 UI_PROTOS := $(UI_JS) $(UI_TS)
 
-$(GO_PROTOS_TARGET): $(PROTOC) $(PROTOC_PLUGIN) $(GO_PROTOS) $(GOGOPROTO_PROTO)
+$(GO_PROTOS_TARGET): $(PROTOC) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(BOOTSTRAP_TARGET) | bin/protoc-gen-gogoroach
 	$(FIND_RELEVANT) -type f -name '*.pb.go' -exec rm {} +
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
-	  build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --plugin=$(PROTOC_PLUGIN) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:$(PKG_ROOT) $$dir/*.proto; \
+	  build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:$(PKG_ROOT) $$dir/*.proto; \
 	done
 	$(SED_INPLACE) '/import _/d' $(GO_SOURCES)
 	$(SED_INPLACE) -E 's!import (fmt|math) "github.com/cockroachdb/cockroach/pkg/(fmt|math)"! !g' $(GO_SOURCES)
@@ -971,7 +1010,7 @@ $(GO_PROTOS_TARGET): $(PROTOC) $(PROTOC_PLUGIN) $(GO_PROTOS) $(GOGOPROTO_PROTO)
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
-$(GW_PROTOS_TARGET): $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO)
+$(GW_PROTOS_TARGET): $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(BOOTSTRAP_TARGET)
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
 	build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:$(PKG_ROOT) $(GW_SERVER_PROTOS)
 	build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:$(PKG_ROOT) $(GW_TS_PROTOS)
@@ -983,21 +1022,21 @@ $(GW_PROTOS_TARGET): $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) 
 	touch $@
 
 $(CPP_PROTOS_TARGET): $(PROTOC) $(CPP_PROTOS)
-	$(FIND_RELEVANT) -type f \( -name '*.pb.h' -o -name '*.pb.cc' \) -exec rm {} +
+	rm -rf $(CPP_PROTO_ROOT)
 	mkdir -p $(CPP_PROTO_ROOT)
 	build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH) --cpp_out=lite:$(CPP_PROTO_ROOT) $(CPP_PROTOS)
 	$(SED_INPLACE) -E '/gogoproto/d' $(CPP_HEADERS) $(CPP_SOURCES)
 	touch $@
 
 $(CPP_PROTOS_CCL_TARGET): $(PROTOC) $(CPP_PROTOS_CCL)
-	$(FIND_RELEVANT) -type f \( -name '*.pb.h' -o -name '*.pb.cc' \) -exec rm {} +
+	rm -rf $(CPP_PROTO_CCL_ROOT)
 	mkdir -p $(CPP_PROTO_CCL_ROOT)
 	build/werror.sh $(PROTOC) -I$(PKG_ROOT):$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH) --cpp_out=lite:$(CPP_PROTO_CCL_ROOT) $(CPP_PROTOS_CCL)
 	$(SED_INPLACE) -E '/gogoproto/d' $(CPP_HEADERS_CCL) $(CPP_SOURCES_CCL)
 	touch $@
 
 .SECONDARY: $(UI_JS)
-$(UI_JS): $(GO_PROTOS) $(COREOS_RAFT_PROTOS) $(YARN_INSTALLED_TARGET)
+$(UI_JS): $(GO_PROTOS) $(YARN_INSTALLED_TARGET)
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
 	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path $(PKG_ROOT) --path $(GOGO_PROTOBUF_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(GW_PROTOS) >> $@
@@ -1063,8 +1102,9 @@ $(UI_ROOT)/dist%/bindata.go: $(UI_ROOT)/webpack.%.js $(UI_DLLS) $(UI_JS) $(UI_MA
 	set -e; for dll in $(notdir $(UI_DLLS)); do ln -s ../dist/$$dll $(UI_ROOT)/dist$*/$$dll; done
 	$(NODE_RUN) -C $(UI_ROOT) $(WEBPACK) --config webpack.$*.js
 	go-bindata -pkg dist$* -o $@ -prefix $(UI_ROOT)/dist$* $(UI_ROOT)/dist$*/...
-	$(SED_INPLACE) -f $(UI_ROOT)/process-bindata.sed $@
+	echo 'func init() { ui.Asset = Asset; ui.AssetDir = AssetDir; ui.AssetInfo = AssetInfo }' >> $@
 	gofmt -s -w $@
+	goimports -w $@
 
 $(UI_ROOT)/yarn.opt.installed:
 	$(NODE_RUN) -C $(UI_ROOT)/opt yarn install
@@ -1076,10 +1116,15 @@ ui-watch: PORT := 3000
 ui-watch: $(UI_DLLS) $(UI_ROOT)/yarn.opt.installed
 	cd $(UI_ROOT) && $(WEBPACK_DASHBOARD) -- $(WEBPACK_DEV_SERVER) --config webpack.ccl.js --port $(PORT)
 
-.PHONY: ui-maintainer-clean
-ui-maintainer-clean: ## Like clean, but also remove some auto-generated source code.
+.PHONY: ui-clean
+ui-clean: ## Remove build artifacts.
 	find $(UI_ROOT)/dist* -mindepth 1 -not -name dist*.go -delete
-	rm -rf $(UI_ROOT)/node_modules $(UI_DLLS) $(YARN_INSTALLED_TARGET)
+	rm -f $(UI_DLLS)
+
+.PHONY: ui-maintainer-clean
+ui-maintainer-clean: ## Like clean, but also remove installed dependencies
+ui-maintainer-clean: ui-clean
+	rm -rf $(UI_ROOT)/node_modules $(YARN_INSTALLED_TARGET)
 
 .SECONDARY: $(SQLPARSER_ROOT)/gen/sql.go.tmp
 $(SQLPARSER_ROOT)/gen/sql.go.tmp: $(SQLPARSER_ROOT)/gen/sql.y $(BOOTSTRAP_TARGET)
@@ -1166,11 +1211,11 @@ $(SQLPARSER_ROOT)/help_messages.go: $(SQLPARSER_ROOT)/sql.y $(SQLPARSER_ROOT)/he
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
-bin/.docgen_bnfs: $(SQLPARSER_ROOT)/sql.y
+bin/.docgen_bnfs: $(SQLPARSER_ROOT)/sql.y pkg/cmd/docgen/diagrams.go pkg/cmd/docgen/main.go | $(SUBMODULES_TARGET)
 	go run pkg/cmd/docgen/{main,diagrams}.go grammar bnf docs/generated/sql/bnf --quiet
 	touch $@
 
-bin/.docgen_functions: $(PKG_ROOT)/sql/sem/builtins/*.go $(SQLPARSER_TARGETS) $(GO_PROTOS_TARGET)
+bin/.docgen_functions: $(PKG_ROOT)/sql/sem/builtins/*.go $(SQLPARSER_TARGETS) $(GO_PROTOS_TARGET) | $(SUBMODULES_TARGET)
 	go run pkg/cmd/docgen/{main,funcs}.go functions docs/generated/sql --quiet
 	touch $@
 
@@ -1215,6 +1260,12 @@ unsafe-clean: ## Like maintainer-clean, but also remove ALL untracked/ignored fi
 unsafe-clean: maintainer-clean unsafe-clean-c-deps
 	git clean -dxf
 
-.SECONDEXPANSION:
-bin/%: $$(shell find $(PKG_ROOT)/cmd/$$*) | $(SUBMODULES_TARGET)
-	@$(GO_INSTALL) -v $(PKG_ROOT)/cmd/$*
+# Mappings for binaries that don't live in pkg/cmd.
+langgen-package := ./pkg/sql/opt/optgen/cmd/langgen
+optgen-package := ./pkg/sql/opt/optgen/cmd/optgen
+
+bin/%: .ALWAYS_REBUILD | $(SUBMODULES_TARGET)
+	@$(GO_INSTALL) -v $(if $($*-package),$($*-package),$(PKG_ROOT)/cmd/$*)
+
+# Additional dependencies for binaries that depend on generated code.
+bin/workload: $(SQLPARSER_TARGETS) $(PROTOBUF_TARGETS)

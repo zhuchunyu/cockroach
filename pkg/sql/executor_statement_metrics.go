@@ -41,17 +41,14 @@ const (
 	// the session age.
 	sessionInit sessionPhase = iota
 
-	// When a batch of SQL code is received in pgwire.
-	// Used to compute the batch age.
-	sessionStartBatch
-
 	// Executor phases.
-	sessionStartParse
-	sessionEndParse
-	plannerStartLogicalPlan
-	plannerEndLogicalPlan
-	plannerStartExecStmt
-	plannerEndExecStmt
+	sessionQueryReceived    // Query is received.
+	sessionStartParse       // Parse starts.
+	sessionEndParse         // Parse ends.
+	plannerStartLogicalPlan // Planning starts.
+	plannerEndLogicalPlan   // Planning ends.
+	plannerStartExecStmt    // Execution starts.
+	plannerEndExecStmt      // Execution ends.
 
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
@@ -64,7 +61,8 @@ const (
 // copy behavior.
 type phaseTimes [sessionNumPhases]time.Time
 
-type sqlEngineMetrics struct {
+// EngineMetrics groups a set of SQL metrics.
+type EngineMetrics struct {
 	// The subset of SELECTs that are processed through DistSQL.
 	DistSQLSelectCount    *metric.Counter
 	DistSQLExecLatency    *metric.Histogram
@@ -73,15 +71,15 @@ type sqlEngineMetrics struct {
 	SQLServiceLatency     *metric.Histogram
 }
 
-// sqlEngineMetrics implements the metric.Struct interface
-var _ metric.Struct = sqlEngineMetrics{}
+// EngineMetrics implements the metric.Struct interface
+var _ metric.Struct = EngineMetrics{}
 
 // MetricStruct is part of the metric.Struct interface.
-func (sqlEngineMetrics) MetricStruct() {}
+func (EngineMetrics) MetricStruct() {}
 
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
-// accounting in the passed-in sqlEngineMetrics.
+// accounting in the passed-in EngineMetrics.
 // - distSQLUsed reports whether the query was distributed.
 // - automaticRetryCount is the count of implicit txn retries
 //   so far.
@@ -92,9 +90,9 @@ func recordStatementSummary(
 	stmt Statement,
 	distSQLUsed bool,
 	automaticRetryCount int,
-	resultWriter StatementResult,
+	rowsAffected int,
 	err error,
-	m *sqlEngineMetrics,
+	m *EngineMetrics,
 ) {
 	phaseTimes := planner.statsCollector.PhaseTimes()
 
@@ -103,15 +101,14 @@ func recordStatementSummary(
 	runLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[plannerStartExecStmt])
 
 	// Collect the statistics.
-	numRows := resultWriter.RowsAffected()
 	runLat := runLatRaw.Seconds()
 
 	parseLat := phaseTimes[sessionEndParse].
 		Sub(phaseTimes[sessionStartParse]).Seconds()
 	planLat := phaseTimes[plannerEndLogicalPlan].
 		Sub(phaseTimes[plannerStartLogicalPlan]).Seconds()
-	// service latency: start to parse to end of run
-	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionStartParse])
+	// service latency: time query received to end of run
+	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionQueryReceived])
 	svcLat := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
@@ -134,14 +131,12 @@ func recordStatementSummary(
 	}
 
 	planner.statsCollector.RecordStatement(
-		stmt, distSQLUsed, automaticRetryCount, numRows, err,
+		stmt, distSQLUsed, automaticRetryCount, rowsAffected, err,
 		parseLat, planLat, runLat, svcLat, execOverhead,
 	)
 
 	if log.V(2) {
 		// ages since significant epochs
-		batchAge := phaseTimes[plannerEndExecStmt].
-			Sub(phaseTimes[sessionStartBatch]).Seconds()
 		sessionAge := phaseTimes[plannerEndExecStmt].
 			Sub(phaseTimes[sessionInit]).Seconds()
 
@@ -151,13 +146,13 @@ func recordStatementSummary(
 				"plan %.2fµs (%.1f%%), "+
 				"run %.2fµs (%.1f%%), "+
 				"overhead %.2fµs (%.1f%%), "+
-				"batch age %.3fms, session age %.4fs",
-			numRows, automaticRetryCount,
+				"session age %.4fs",
+			rowsAffected, automaticRetryCount,
 			parseLat*1e6, 100*parseLat/svcLat,
 			planLat*1e6, 100*planLat/svcLat,
 			runLat*1e6, 100*runLat/svcLat,
 			execOverhead*1e6, 100*execOverhead/svcLat,
-			batchAge*1000, sessionAge,
+			sessionAge,
 		)
 	}
 }

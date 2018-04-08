@@ -17,24 +17,24 @@ package cli
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
 	"net/url"
 	"reflect"
 	"strings"
-	"text/tabwriter"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach-go/crdb"
 	version "github.com/hashicorp/go-version"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -95,6 +95,60 @@ func (c *sqlConn) ensureConn() error {
 	return nil
 }
 
+func (c *sqlConn) getServerMetadata() (version, clusterID string, err error) {
+	// Retrieve the node ID and server build info.
+	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
+	if err == driver.ErrBadConn {
+		return "", "", err
+	}
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = rows.Close() }()
+
+	// Read the node_build_info table as an array of strings.
+	rowVals, err := getAllRowStrings(rows, true /* showMoreChars */)
+	if err != nil || len(rowVals) == 0 || len(rowVals[0]) != 3 {
+		return "", "", errors.New("incorrect data while retrieving the server version")
+	}
+
+	// Extract the version fields from the query results.
+	var v10fields [5]string
+	for _, row := range rowVals {
+		switch row[1] {
+		case "ClusterID":
+			clusterID = row[2]
+		case "Version":
+			version = row[2]
+		case "Build":
+			c.serverBuild = row[2]
+		case "Organization":
+			c.clusterOrganization = row[2]
+
+			// Fields for v1.0 compatibility.
+		case "Distribution":
+			v10fields[0] = row[2]
+		case "Tag":
+			v10fields[1] = row[2]
+		case "Platform":
+			v10fields[2] = row[2]
+		case "Time":
+			v10fields[3] = row[2]
+		case "GoVersion":
+			v10fields[4] = row[2]
+		}
+	}
+
+	if version == "" {
+		// The "Version" field was not present, this indicates a v1.0
+		// CockroachDB. Use that below.
+		version = "v1.0-" + v10fields[1]
+		c.serverBuild = fmt.Sprintf("CockroachDB %s %s (%s, built %s, %s)",
+			v10fields[0], version, v10fields[2], v10fields[3], v10fields[4])
+	}
+	return version, clusterID, nil
+}
+
 // checkServerMetadata reports the server version and cluster ID
 // upon the initial connection or if either has changed since
 // the last connection, based on the last known values in the sqlConn
@@ -106,61 +160,10 @@ func (c *sqlConn) checkServerMetadata() error {
 		return nil
 	}
 
-	newServerVersion := ""
-	newClusterID := ""
-
-	// Retrieve the node ID and server build info.
-	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
-	if err == driver.ErrBadConn {
-		return err
-	}
+	newServerVersion, newClusterID, err := c.getServerMetadata()
 	if err != nil {
-		fmt.Fprintf(stderr, "warning: unable to retrieve the server's version: %v\n", err)
-	} else {
-		defer func() { _ = rows.Close() }()
-
-		// Read the node_build_info table as an array of strings.
-		rowVals, err := getAllRowStrings(rows, true /* showMoreChars */)
-		if err != nil || len(rowVals) == 0 || len(rowVals[0]) != 3 {
-			fmt.Fprintln(stderr, "warning: incorrect data while retrieving the server version")
-			// It is not an error that the server version cannot be retrieved.
-			return nil
-		}
-
-		// Extract the version fields from the query results.
-		var v10fields [5]string
-		for _, row := range rowVals {
-			switch row[1] {
-			case "ClusterID":
-				newClusterID = row[2]
-			case "Version":
-				newServerVersion = row[2]
-			case "Build":
-				c.serverBuild = row[2]
-			case "Organization":
-				c.clusterOrganization = row[2]
-
-				// Fields for v1.0 compatibility.
-			case "Distribution":
-				v10fields[0] = row[2]
-			case "Tag":
-				v10fields[1] = row[2]
-			case "Platform":
-				v10fields[2] = row[2]
-			case "Time":
-				v10fields[3] = row[2]
-			case "GoVersion":
-				v10fields[4] = row[2]
-			}
-		}
-
-		if newServerVersion == "" {
-			// The "Version" field was not present, this indicates a v1.0
-			// CockroachDB. Use that below.
-			newServerVersion = "v1.0-" + v10fields[1]
-			c.serverBuild = fmt.Sprintf("CockroachDB %s %s (%s, built %s, %s)",
-				v10fields[0], newServerVersion, v10fields[2], v10fields[3], v10fields[4])
-		}
+		// It is not an error that the server version cannot be retrieved.
+		fmt.Fprintf(stderr, "warning: unable to retrieve the server's version: %s\n", err)
 	}
 
 	// Report the server version only if it the revision has been
@@ -213,6 +216,28 @@ func (c *sqlConn) checkServerMetadata() error {
 	return nil
 }
 
+// requireServerVersion returns an error if the version of the connected server
+// does not match the constraints in constraintString.
+func (c *sqlConn) requireServerVersion(constraintString string) error {
+	versionString, _, err := c.getServerMetadata()
+	if err != nil {
+		return err
+	}
+	constraints, err := version.NewConstraint(constraintString)
+	if err != nil {
+		return err
+	}
+	vers, err := version.NewVersion(versionString)
+	if err != nil {
+		return fmt.Errorf("unable to parse server version %q", c.serverVersion)
+	}
+	if !constraints.Check(vers) {
+		return fmt.Errorf("incompatible client and server versions (detected server version: %s, required: %s)",
+			vers, constraints)
+	}
+	return nil
+}
+
 // getServerValue retrieves the first driverValue returned by the
 // given sql query. If the query fails or does not return a single
 // column, `false` is returned in the second result.
@@ -240,58 +265,45 @@ func (c *sqlConn) getServerValue(what, sql string) (driver.Value, bool) {
 	return dbVals[0], true
 }
 
+// sqlTxnShim implements the crdb.Tx interface.
+//
+// It exists to support crdb.ExecuteInTxn. Normally, we'd hand crdb.ExecuteInTxn
+// a sql.Txn, but sqlConn predates go1.8's support for multiple result sets and
+// so deals directly with the lib/pq driver. See #14964.
+type sqlTxnShim struct {
+	conn *sqlConn
+}
+
+func (t sqlTxnShim) Commit() error {
+	return t.conn.Exec(`COMMIT`, nil)
+}
+
+func (t sqlTxnShim) Rollback() error {
+	return t.conn.Exec(`ROLLBACK`, nil)
+}
+
+func (t sqlTxnShim) ExecContext(
+	_ context.Context, query string, values ...interface{},
+) (gosql.Result, error) {
+	if len(values) != 0 {
+		panic(fmt.Sprintf("sqlTxnShim.ExecContext must not be called with values"))
+	}
+	return nil, t.conn.Exec(query, nil)
+}
+
 // ExecTxn runs fn inside a transaction and retries it as needed.
 // On non-retryable failures, the transaction is aborted and rolled
 // back; on success, the transaction is committed.
 //
 // NOTE: the supplied closure should not have external side
 // effects beyond changes to the database.
-//
-// NB: this code is cribbed from cockroach-go/crdb and has been copied
-// because this code, pre-dating go1.8, deals with multiple result sets
-// direct with the driver. See #14964.
 func (c *sqlConn) ExecTxn(fn func(*sqlConn) error) (err error) {
-	// Start a transaction.
-	if err = c.Exec(`BEGIN`, nil); err != nil {
+	if err := c.Exec(`BEGIN`, nil); err != nil {
 		return err
 	}
-	defer func() {
-		if err == nil {
-			// Ignore commit errors. The tx has already been committed by RELEASE.
-			_ = c.Exec(`COMMIT`, nil)
-		} else {
-			// We always need to execute a Rollback() so sql.DB releases the
-			// connection.
-			_ = c.Exec(`ROLLBACK`, nil)
-		}
-	}()
-	// Specify that we intend to retry this txn in case of CockroachDB retryable
-	// errors.
-	if err = c.Exec(`SAVEPOINT cockroach_restart`, nil); err != nil {
-		return err
-	}
-
-	for {
-		err = fn(c)
-		if err == nil {
-			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
-			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
-			if err = c.Exec(`RELEASE SAVEPOINT cockroach_restart`, nil); err == nil {
-				return nil
-			}
-		}
-		// We got an error; let's see if it's a retryable one and, if so, restart. We look
-		// for either the standard PG errcode SerializationFailureError:40001 or the Cockroach extension
-		// errcode RetriableError:CR000. The Cockroach extension has been removed server-side, but support
-		// for it has been left here for now to maintain backwards compatibility.
-		pqErr, ok := pgerror.GetPGCause(err)
-		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
-			return err
-		}
-		if err = c.Exec(`ROLLBACK TO SAVEPOINT cockroach_restart`, nil); err != nil {
-			return err
-		}
-	}
+	return crdb.ExecuteInTx(context.TODO(), sqlTxnShim{c}, func() error {
+		return fn(c)
+	})
 }
 
 func (c *sqlConn) Exec(query string, args []driver.Value) error {
@@ -335,6 +347,19 @@ func (c *sqlConn) QueryRow(query string, args []driver.Value) ([]driver.Value, e
 	defer func() { _ = rows.Close() }()
 	vals := make([]driver.Value, len(rows.Columns()))
 	err = rows.Next(vals)
+
+	// Assert that there is just one row.
+	if err == nil {
+		nextVals := make([]driver.Value, len(rows.Columns()))
+		nextErr := rows.Next(nextVals)
+		if nextErr != io.EOF {
+			if nextErr != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("programming error: %q: expected just 1 row of result, got more", query)
+		}
+	}
+
 	return vals, err
 }
 
@@ -424,38 +449,148 @@ func makeSQLConn(url string) *sqlConn {
 // getPasswordAndMakeSQLClient prompts for a password if running in secure mode
 // and no certificates have been supplied.
 // Attempting to use security.RootUser without valid certificates will return an error.
-func getPasswordAndMakeSQLClient() (*sqlConn, error) {
-	if len(cliCtx.sqlConnURL) != 0 {
-		return makeSQLConn(cliCtx.sqlConnURL), nil
-	}
-	var user *url.Userinfo
-	if !baseCfg.Insecure && !baseCfg.ClientHasValidCerts(cliCtx.sqlConnUser) {
-		if cliCtx.sqlConnUser == security.RootUser {
-			return nil, errors.Errorf("connections with user %s must use a client certificate", security.RootUser)
-		}
-
-		pwd, err := security.PromptForPassword()
-		if err != nil {
-			return nil, err
-		}
-
-		user = url.UserPassword(cliCtx.sqlConnUser, pwd)
-	} else {
-		user = url.User(cliCtx.sqlConnUser)
-	}
-	return makeSQLClient(user)
+func getPasswordAndMakeSQLClient(appName string) (*sqlConn, error) {
+	return makeSQLClient(appName)
 }
 
-func makeSQLClient(user *url.Userinfo) (*sqlConn, error) {
-	sqlURL := cliCtx.sqlConnURL
-	if len(sqlURL) == 0 {
-		u, err := sqlCtx.PGURL(user)
+// makeURLFromFlags constructs a pg connection URL using the values
+// initialized by command-line flags.
+func makeURLFromFlags(userinfo *url.Userinfo) *url.URL {
+	host := serverCfg.Addr
+	if !strings.HasPrefix(cliCtx.Addr, ":") {
+		host = cliCtx.Addr
+	}
+
+	// Build the URL object.
+	return &url.URL{
+		Scheme: "postgresql",
+		Path:   cliCtx.sqlConnDBName,
+		Host:   host,
+		User:   userinfo,
+	}
+}
+
+// makeSQLClient connects to the database using the connection
+// settings set by the command-line flags. The value of --url, if any
+// is provided is used as the source of configuration; otherwise a URL
+// is constructed from the other command-line parameters.
+//
+// If --url is specified but any of the following items is _missing_
+// from the URL, the remaining command-line flags are used to "fill it
+// in":
+//
+// - the current database (--database)
+// - the user (--user)
+// - the SSL configuration (--insecure, --certs-dir, etc)
+//
+// Otherwise, if an item is present both in the URL and specified
+// otherwise, a warning is printed to indicate that the URL prevails.
+//
+// The appName given as argument is added to the URL even if --url is
+// specified, but only if the URL didn't already specify
+// application_name.
+func makeSQLClient(appName string) (*sqlConn, error) {
+	var baseURL *url.URL
+	var options url.Values
+
+	defaultUserinfo := url.User(security.RootUser)
+	if cliCtx.sqlConnUser != "" {
+		defaultUserinfo = url.User(cliCtx.sqlConnUser)
+	}
+
+	// Determine the starting point.
+	if cliCtx.sqlConnURL == "" {
+		baseURL = makeURLFromFlags(defaultUserinfo)
+		options = url.Values{}
+	} else {
+		// User-specified --url is the starting point.
+		var err error
+		baseURL, err = url.Parse(cliCtx.sqlConnURL)
 		if err != nil {
 			return nil, err
 		}
-		u.Path = cliCtx.sqlConnDBName
-		sqlURL = u.String()
+		options, err = url.ParseQuery(baseURL.RawQuery)
+		if err != nil {
+			return nil, err
+		}
+
+		// Check that any argument otherwise used to
+		// populate a URL, if --url was not specified, have
+		// not been specified if --url was.
+		if baseURL.Path != "" && cliCtx.sqlConnDBName != "" {
+			log.Warning(context.Background(), "parameter --database ignored, using --url instead")
+		}
+		if baseURL.User.Username() != "" && cliCtx.sqlConnUser != "" {
+			log.Warning(context.Background(), "parameter --user ignored, using --url instead")
+		}
+		if !strings.HasPrefix(cliCtx.Addr, ":") {
+			log.Warning(context.Background(), "parameter --host ignored, using --url instead")
+		}
+		if options.Get("sslmode") != "" && cliCtx.Insecure {
+			log.Warning(context.Background(), "parameter --insecure ignored, using --url instead")
+		}
 	}
+
+	// If there is no user in the URL already, use the one passed as
+	// command-line flag.
+	if baseURL.User.Username() == "" {
+		baseURL.User = defaultUserinfo
+	}
+
+	// If there are no SSL options yet, use the command-line flags to set them.
+	if options.Get("sslmode") == "" {
+		if err := cliCtx.LoadSecurityOptions(options, baseURL.User.Username()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Insecure connections are insecure and should never see a password. Reject
+	// one that may be present in the URL already.
+	if options.Get("sslmode") == "disable" {
+		if _, pwdSet := baseURL.User.Password(); pwdSet {
+			return nil, errors.Errorf("cannot specify a password in URL with an insecure connection")
+		}
+	} else {
+		if baseURL.User.Username() == security.RootUser {
+			// Disallow password login for root.
+			if options.Get("sslcert") == "" || options.Get("sslkey") == "" {
+				return nil, errors.Errorf("connections with user %s must use a client certificate",
+					baseURL.User.Username())
+			}
+			// If we can go on (we have a certificate spec), clear the password.
+			baseURL.User = url.User(security.RootUser)
+		} else {
+			// If there's no password in the URL yet, ask for it and populate
+			// it in the URL.
+			if _, pwdSet := baseURL.User.Password(); !pwdSet {
+				pwd, err := security.PromptForPassword()
+				if err != nil {
+					return nil, err
+				}
+				baseURL.User = url.UserPassword(baseURL.User.Username(), pwd)
+			}
+		}
+	}
+
+	// If there is no database in the URL already, use the one passed as
+	// command-line flag.
+	if baseURL.Path == "" || baseURL.Path == "/" {
+		baseURL.Path = cliCtx.sqlConnDBName
+	}
+
+	// Load the application name. It's not a command-line flag, so
+	// anything already in the URL should take priority.
+	if options.Get("application_name") == "" && appName != "" {
+		options.Set("application_name", appName)
+	}
+
+	baseURL.RawQuery = options.Encode()
+	sqlURL := baseURL.String()
+
+	if log.V(2) {
+		log.Infof(context.Background(), "connecting with URL: %s", sqlURL)
+	}
+
 	return makeSQLConn(sqlURL), nil
 }
 
@@ -595,7 +730,7 @@ func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc) error {
 			return false, nil
 		}
 
-		cols := getColumnStrings(rows)
+		cols := getColumnStrings(rows, true)
 		reporter, err := makeReporter()
 		if err != nil {
 			return err
@@ -624,14 +759,14 @@ func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc) error {
 }
 
 // sqlRowsToStrings turns 'rows' into a list of rows, each of which
-// is a  list of column values.
+// is a list of column values.
 // 'rows' should be closed by the caller.
 // It returns the header row followed by all data rows.
 // If both the header row and list of rows are empty, it means no row
 // information was returned (eg: statement was not a query).
 // If showMoreChars is true, then more characters are not escaped.
 func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, error) {
-	cols := getColumnStrings(rows)
+	cols := getColumnStrings(rows, showMoreChars)
 	allRows, err := getAllRowStrings(rows, showMoreChars)
 	if err != nil {
 		return nil, nil, err
@@ -639,11 +774,11 @@ func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, 
 	return cols, allRows, nil
 }
 
-func getColumnStrings(rows *sqlRows) []string {
+func getColumnStrings(rows *sqlRows, showMoreChars bool) []string {
 	srcCols := rows.Columns()
 	cols := make([]string, len(srcCols))
 	for i, c := range srcCols {
-		cols[i] = formatVal(c, true, false)
+		cols[i] = formatVal(c, showMoreChars, showMoreChars)
 	}
 	return cols
 }
@@ -687,21 +822,6 @@ func getNextRowStrings(rows *sqlRows, showMoreChars bool) ([]string, error) {
 	return rowStrings, nil
 }
 
-// expandTabsAndNewLines ensures that multi-line row strings that may
-// contain tabs are properly formatted: tabs are expanded to spaces,
-// and newline characters are marked visually. Marking newline
-// characters is especially important in single-column results where
-// the underlying TableWriter would not otherwise show the difference
-// between one multi-line row and two one-line rows.
-func expandTabsAndNewLines(s string) string {
-	var buf bytes.Buffer
-	// 4-wide columns, 1 character minimum width.
-	w := tabwriter.NewWriter(&buf, 4, 0, 1, ' ', 0)
-	fmt.Fprint(w, strings.Replace(s, "\n", "␤\n", -1))
-	_ = w.Flush()
-	return buf.String()
-}
-
 func isNotPrintableASCII(r rune) bool { return r < 0x20 || r > 0x7e || r == '"' || r == '\\' }
 func isNotGraphicUnicode(r rune) bool { return !unicode.IsGraphic(r) }
 func isNotGraphicUnicodeOrTabOrNewline(r rune) bool {
@@ -726,7 +846,10 @@ func formatVal(val driver.Value, showPrintableUnicode bool, showNewLinesAndTabs 
 				return t
 			}
 		}
-		return fmt.Sprintf("%+q", t)
+		s := fmt.Sprintf("%+q", t)
+		// Strip the start and final quotes. The surrounding display
+		// format (e.g. CSV/TSV) will add its own quotes.
+		return s[1 : len(s)-1]
 
 	case []byte:
 		if showPrintableUnicode {
@@ -742,7 +865,10 @@ func formatVal(val driver.Value, showPrintableUnicode bool, showNewLinesAndTabs 
 				return string(t)
 			}
 		}
-		return fmt.Sprintf("%+q", t)
+		// Strip the start and final quotes. The surrounding display
+		// format (e.g. CSV/TSV) will add its own quotes.
+		s := fmt.Sprintf("%+q", t)
+		return s[1 : len(s)-1]
 
 	case time.Time:
 		return t.Format(tree.TimestampOutputFormat)

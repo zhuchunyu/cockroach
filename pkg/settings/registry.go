@@ -29,8 +29,20 @@ import (
 // read concurrently by different callers.
 var Registry = make(map[string]Setting)
 
+// When a setting is removed, it should be added to this list so that we cannot
+// accidentally reuse its name, potentially mis-handling older values.
+var retiredSettings = map[string]struct{}{
+	//removed as of 2.0.
+	"kv.gc.batch_size":                     {},
+	"kv.transaction.max_intents":           {},
+	"diagnostics.reporting.report_metrics": {},
+}
+
 // Register adds a setting to the registry.
 func register(key, desc string, s Setting) {
+	if _, ok := retiredSettings[key]; ok {
+		panic(fmt.Sprintf("cannot reuse previously defined setting name: %s", key))
+	}
 	if _, ok := Registry[key]; ok {
 		panic(fmt.Sprintf("setting already defined: %s", key))
 	}
@@ -56,4 +68,54 @@ func Keys() (res []string) {
 func Lookup(name string) (Setting, bool) {
 	v, ok := Registry[name]
 	return v, ok
+}
+
+// ReadableTypes maps our short type identifiers to friendlier names.
+var ReadableTypes = map[string]string{
+	"s": "string",
+	"i": "integer",
+	"f": "float",
+	"b": "boolean",
+	"z": "byte size",
+	"d": "duration",
+	"e": "enumeration",
+	"m": "custom validation",
+}
+
+// safeToReportSettings are the names of settings which we want reported with
+// their values, regardless of their type -- usually only numeric/duration/bool
+// settings are reported to avoid including potentially sensitive info that may
+// appear in strings or byte/proto/statemachine settings.
+var safeToReportSettings = map[string]struct{}{
+	"version": {},
+}
+
+// SanitizedValue returns a string representation of the value for settings
+// types the are not considered sensitive (numbers, bools, etc) or
+// <redacted> for those with values could store sensitive things (i.e. strings).
+func SanitizedValue(name string, values *Values) string {
+	if setting, ok := Lookup(name); ok {
+		if _, ok := safeToReportSettings[name]; ok {
+			return setting.String(values)
+		}
+		// for settings with types that can't be sensitive, report values.
+		switch setting.(type) {
+		case *IntSetting,
+			*FloatSetting,
+			*ByteSizeSetting,
+			*DurationSetting,
+			*BoolSetting,
+			*EnumSetting:
+			return setting.String(values)
+		case *StringSetting:
+			if setting.String(values) == "" {
+				return ""
+			}
+			return "<redacted>"
+		default:
+			return "<redacted>"
+		}
+	} else {
+		return "<unknown>"
+	}
 }

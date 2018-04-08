@@ -1,4 +1,4 @@
-// Copyright 2017 The Cockroach Authors.
+// Copyright 2018 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,175 +17,85 @@ package opt
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-type operator uint8
+//go:generate optgen -out operator.og.go ops ops/*.opt
 
-const (
-	unknownOp operator = iota
+// Operator describes the type of operation that a memo expression performs.
+// Some operators are relational (join, select, project) and others are scalar
+// (and, or, plus, variable).
+type Operator uint16
 
-	// -- Relational operators --
-	// This list will grow significantly as we implement new operators.
-	// The only relational operators implemented so far are scanOp and selectOp.
+// MaxOperands is the maximum number of operands that an operator can have.
+// Increasing this limit can have a large memory impact, as every memo
+// expression uses memory for the max number of operands, even if it does not
+// have that many.
+const MaxOperands = 3
 
-	// scan is the lowest level relational operator, responsible for scanning
-	// tables.
-	scanOp
-
-	// selectOp is a pass-through operator which applies filters to its input.
-	selectOp
-
-	// -- Scalar operators --
-
-	// variableOp is a leaf expression that represents a non-constant value, like a column
-	// in a table.
-	variableOp
-
-	// constOp is a leaf expression that has a constant value.
-	constOp
-
-	// tupleOp is a list of scalar expressions.
-	tupleOp
-
-	andOp
-	orOp
-	notOp
-
-	eqOp
-	ltOp
-	gtOp
-	leOp
-	geOp
-	neOp
-	inOp
-	notInOp
-	likeOp
-	notLikeOp
-	iLikeOp
-	notILikeOp
-	similarToOp
-	notSimilarToOp
-	regMatchOp
-	notRegMatchOp
-	regIMatchOp
-	notRegIMatchOp
-
-	// isOp implements the SQL operator IS, as well as its extended
-	// version IS NOT DISTINCT FROM.
-	isOp
-
-	// isNotOp implements the SQL operator IS NOT, as well as its extended
-	// version IS DISTINCT FROM.
-	isNotOp
-
-	// containsOp is the @> JSON operator.
-	containsOp
-	// containedByOp is the <@ JSON operator.
-	containedByOp
-
-	anyOp
-	someOp
-	allOp
-
-	bitandOp
-	bitorOp
-	bitxorOp
-	plusOp
-	minusOp
-	multOp
-	divOp
-	floorDivOp
-	modOp
-	powOp
-	concatOp
-	lShiftOp
-	rShiftOp
-	fetchValOp
-	fetchTextOp
-	fetchValPathOp
-	fetchTextPathOp
-
-	unaryPlusOp
-	unaryMinusOp
-	unaryComplementOp
-
-	functionCallOp
-
-	// unsupportedScalarOp is a temporary facility to pass through an unsupported
-	// TypedExpr (like a subquery) through MakeIndexConstraints.
-	unsupportedScalarOp
-
-	// This should be last.
-	numOperators
-)
-
-// operatorInfo stores static information about an operator.
-type operatorInfo struct {
-	// name of the operator, used when printing expressions.
-	name string
-	// class of the operator (see operatorClass).
-	class operatorClass
-	// operator-specific layout of auxiliary expressions.
-	layout exprLayout
-
-	normalizeFn func(*Expr)
-}
-
-// operatorTab stores static information about all operators.
-var operatorTab = [numOperators]operatorInfo{
-	unknownOp: {name: "unknown"},
-}
-
-func (op operator) String() string {
-	if op >= numOperators {
-		return fmt.Sprintf("operator(%d)", op)
+// String returns the name of the operator as a string.
+func (i Operator) String() string {
+	if i >= Operator(len(opNames)-1) {
+		return fmt.Sprintf("Operator(%d)", i)
 	}
-	return operatorTab[op].name
+
+	return opNames[opIndexes[i]:opIndexes[i+1]]
 }
 
-// registerOperator initializes the operator's entry in operatorTab.
-// There must be a call to registerOperator in an init() function for every
-// operator.
-func registerOperator(op operator, info operatorInfo) {
-	operatorTab[op] = info
-
-	if info.class != nil {
-		// Normalize the layout so that auxiliary expressions that are not present
-		// are given an invalid index which will cause a panic if they are accessed.
-		l := info.class.layout()
-		if l.numAux == 0 {
-			if l.aggregations == 0 {
-				l.aggregations = -1
-			} else {
-				l.numAux++
-			}
-			if l.groupings == 0 {
-				l.groupings = -1
-			} else {
-				l.numAux++
-			}
-			if l.projections == 0 {
-				l.projections = -1
-			} else {
-				l.numAux++
-			}
-			if l.filters == 0 {
-				l.filters = -1
-			} else {
-				l.numAux++
-			}
-		}
-		operatorTab[op].layout = l
-	}
+// ComparisonOpReverseMap maps from an optimizer operator type to a semantic
+// tree comparison operator type.
+var ComparisonOpReverseMap = [...]tree.ComparisonOperator{
+	EqOp:             tree.EQ,
+	LtOp:             tree.LT,
+	GtOp:             tree.GT,
+	LeOp:             tree.LE,
+	GeOp:             tree.GE,
+	NeOp:             tree.NE,
+	InOp:             tree.In,
+	NotInOp:          tree.NotIn,
+	LikeOp:           tree.Like,
+	NotLikeOp:        tree.NotLike,
+	ILikeOp:          tree.ILike,
+	NotILikeOp:       tree.NotILike,
+	SimilarToOp:      tree.SimilarTo,
+	NotSimilarToOp:   tree.NotSimilarTo,
+	RegMatchOp:       tree.RegMatch,
+	NotRegMatchOp:    tree.NotRegMatch,
+	RegIMatchOp:      tree.RegIMatch,
+	NotRegIMatchOp:   tree.NotRegIMatch,
+	IsOp:             tree.IsNotDistinctFrom,
+	IsNotOp:          tree.IsDistinctFrom,
+	ContainsOp:       tree.Contains,
+	JsonExistsOp:     tree.JSONExists,
+	JsonSomeExistsOp: tree.JSONSomeExists,
+	JsonAllExistsOp:  tree.JSONAllExists,
 }
 
-// operatorClass implements functionality that is common for a subset of
-// operators.
-type operatorClass interface {
-	// format outputs information about the expr tree to a treePrinter.
-	format(e *Expr, tp treeprinter.Node)
+// BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
+// binary operator type.
+var BinaryOpReverseMap = [...]tree.BinaryOperator{
+	BitandOp:        tree.Bitand,
+	BitorOp:         tree.Bitor,
+	BitxorOp:        tree.Bitxor,
+	PlusOp:          tree.Plus,
+	MinusOp:         tree.Minus,
+	MultOp:          tree.Mult,
+	DivOp:           tree.Div,
+	FloorDivOp:      tree.FloorDiv,
+	ModOp:           tree.Mod,
+	PowOp:           tree.Pow,
+	ConcatOp:        tree.Concat,
+	LShiftOp:        tree.LShift,
+	RShiftOp:        tree.RShift,
+	FetchValOp:      tree.JSONFetchVal,
+	FetchTextOp:     tree.JSONFetchText,
+	FetchValPathOp:  tree.JSONFetchValPath,
+	FetchTextPathOp: tree.JSONFetchTextPath,
+}
 
-	// layout returns the operator-specific expression layout.
-	layout() exprLayout
+// UnaryOpReverseMap maps from an optimizer operator type to a semantic tree
+// unary operator type.
+var UnaryOpReverseMap = [...]tree.UnaryOperator{
+	UnaryMinusOp:      tree.UnaryMinus,
+	UnaryComplementOp: tree.UnaryComplement,
 }

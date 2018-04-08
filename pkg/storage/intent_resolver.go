@@ -384,7 +384,7 @@ func (ir *intentResolver) cleanupTxnIntentsAsync(
 			}
 			defer release()
 			intents := roachpb.AsIntents(et.Txn.Intents, &et.Txn)
-			if err := ir.cleanupFinishedTxnIntents(ctx, &et.Txn, intents, now); err != nil {
+			if err := ir.cleanupFinishedTxnIntents(ctx, &et.Txn, intents, now, et.Poison); err != nil {
 				log.Warningf(ctx, "failed to cleanup transaction intents: %s", err)
 			}
 		}); err != nil {
@@ -449,7 +449,7 @@ func (ir *intentResolver) cleanupTxnIntentsOnGCAsync(
 			// before resolving the intents.
 			if txn.Status == roachpb.PENDING {
 				if !txnwait.IsExpired(now, txn) {
-					log.ErrEventf(ctx, "cannot push a PENDING transaction which is not expired: %s", txn)
+					log.VErrEventf(ctx, 3, "cannot push a PENDING transaction which is not expired: %s", txn)
 					return
 				}
 				b := &client.Batch{}
@@ -464,7 +464,7 @@ func (ir *intentResolver) cleanupTxnIntentsOnGCAsync(
 				})
 				ir.store.metrics.GCPushTxn.Inc(1)
 				if err := ir.store.DB().Run(ctx, b); err != nil {
-					log.ErrEventf(ctx, "failed to push PENDING, expired txn (%s): %s", txn, err)
+					log.VErrEventf(ctx, 2, "failed to push PENDING, expired txn (%s): %s", txn, err)
 					return
 				}
 				// Get the pushed txn and update the intents slice.
@@ -475,7 +475,7 @@ func (ir *intentResolver) cleanupTxnIntentsOnGCAsync(
 				}
 			}
 
-			if err := ir.cleanupFinishedTxnIntents(ctx, txn, intents, now); err != nil {
+			if err := ir.cleanupFinishedTxnIntents(ctx, txn, intents, now, false /* poison */); err != nil {
 				log.Warningf(ctx, "failed to cleanup transaction intents: %s", err)
 			} else {
 				ir.store.metrics.GCResolveSuccess.Inc(int64(len(intents)))
@@ -488,11 +488,15 @@ func (ir *intentResolver) cleanupTxnIntentsOnGCAsync(
 // single transaction and when all intents have been successfully
 // resolved, the transaction record is GC'ed.
 func (ir *intentResolver) cleanupFinishedTxnIntents(
-	ctx context.Context, txn *roachpb.Transaction, intents []roachpb.Intent, now hlc.Timestamp,
+	ctx context.Context,
+	txn *roachpb.Transaction,
+	intents []roachpb.Intent,
+	now hlc.Timestamp,
+	poison bool,
 ) error {
 	// Resolve intents.
 	min, _ := txn.InclusiveTimeBounds()
-	opts := ResolveOptions{Wait: true, Poison: false, MinTimestamp: min}
+	opts := ResolveOptions{Wait: true, Poison: poison, MinTimestamp: min}
 	if err := ir.resolveIntents(ctx, intents, opts); err != nil {
 		return errors.Wrapf(err, "failed to resolve intents")
 	}

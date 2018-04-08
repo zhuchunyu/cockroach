@@ -21,7 +21,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -44,26 +43,18 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 	// while constructing the list of tables that should be truncated.
 	toTraverse := make([]sqlbase.TableDescriptor, 0, len(n.Tables))
 	for _, name := range n.Tables {
-		tn, err := name.NormalizeTableName()
+		tn, err := name.Normalize()
 		if err != nil {
 			return nil, err
 		}
-		if err := tn.QualifyWithDatabase(p.SessionData().Database); err != nil {
-			return nil, err
-		}
-
-		tableDesc, err := MustGetTableOrViewDesc(
-			ctx, p.txn, p.getVirtualTabler(), tn, true, /* allowAdding */
-		)
+		var tableDesc *TableDescriptor
+		// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+		// TODO(vivek): check if the cache can be used.
+		p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+			tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
+		})
 		if err != nil {
 			return nil, err
-		}
-		// We don't support truncation on views, only real tables.
-		if !tableDesc.IsTable() {
-			return nil, pgerror.NewErrorf(
-				pgerror.CodeWrongObjectTypeError,
-				"cannot run TRUNCATE on %s %q - %ss are not updateable",
-				tableDesc.Kind(), tn, tableDesc.Kind())
 		}
 
 		if err := p.CheckPrivilege(ctx, tableDesc, privilege.DROP); err != nil {
@@ -110,6 +101,12 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 	}
 
 	// TODO(knz): move truncate logic to Start/Next so it can be used with SHOW TRACE FOR.
+	// andrei: Also, the current code runs the risk of executing the truncation at
+	// prepare time. That doesn't happen currently because we don't prepare
+	// TRUNCATE statements.
+	if p.extendedEvalCtx.PrepareOnly {
+		return nil, errors.Errorf("programming error: cannot prepare a TRUNCATE statement")
+	}
 	traceKV := p.extendedEvalCtx.Tracing.KVTracingEnabled()
 	for id := range toTruncate {
 		if err := p.truncateTable(p.EvalContext().Ctx(), id, traceKV); err != nil {
@@ -117,7 +114,7 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 		}
 	}
 
-	return &zeroNode{}, nil
+	return newZeroNode(nil /* columns */), nil
 }
 
 // truncateTable truncates the data of a table in a single transaction. It
@@ -131,12 +128,25 @@ func (p *planner) truncateTable(ctx context.Context, id sqlbase.ID, traceKV bool
 		return err
 	}
 	newTableDesc := *tableDesc
+	newTableDesc.ReplacementOf = sqlbase.TableDescriptor_Replacement{
+		ID: id, Time: p.txn.CommitTimestamp(),
+	}
 	newTableDesc.SetID(0)
 	newTableDesc.Version = 1
 
 	// Remove old name -> id map.
+	// This is a violation of consistency because once the TRUNCATE commits
+	// some nodes in the cluster can have cached the old name to id map
+	// for the table and applying operations using the old table id.
+	// This violation is needed because it is not uncommon for TRUNCATE
+	// to be used along with other CRUD commands that follow it in the
+	// same transaction. Commands that follow the TRUNCATE in the same
+	// transaction will use the correct descriptor (through uncommittedTables)
+	// See the comment about problem 3 related to draining names in
+	// structured.proto
+	//
+	// TODO(vivek): Fix properly along with #12123.
 	zoneKey, nameKey, _ := GetKeysForTableDescriptor(tableDesc)
-
 	b := &client.Batch{}
 	// Use CPut because we want to remove a specific name -> id map.
 	if traceKV {
@@ -148,7 +158,7 @@ func (p *planner) truncateTable(ctx context.Context, id sqlbase.ID, traceKV bool
 	}
 
 	// Drop table.
-	if err := p.initiateDropTable(ctx, tableDesc); err != nil {
+	if err := p.initiateDropTable(ctx, tableDesc, false /* drainName */); err != nil {
 		return err
 	}
 

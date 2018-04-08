@@ -61,6 +61,14 @@ const (
 	// defaultThresholdBytes threshold.
 	defaultThresholdBytesFraction = 0.10 // more than 10% of space will trigger
 
+	// defaultThresholdBytesAvailableFraction is the fraction of remaining
+	// available space on a disk, which, if exceeded by the size of a suggested
+	// compaction, should trigger the processing of said compaction. This
+	// threshold is meant to make compaction more aggressive when a store is
+	// nearly full, since reclaiming space is much more important in such
+	// scenarios.
+	defaultThresholdBytesAvailableFraction = 0.10
+
 	// defaultMaxSuggestedCompactionRecordAge is the maximum age of a
 	// suggested compaction record. If not processed within this time
 	// interval since the compaction was suggested, it will be deleted.
@@ -73,6 +81,7 @@ type compactorOptions struct {
 	CompactionMinInterval           time.Duration
 	ThresholdBytes                  int64
 	ThresholdBytesFraction          float64
+	ThresholdBytesAvailableFraction float64
 	MaxSuggestedCompactionRecordAge time.Duration
 }
 
@@ -81,27 +90,34 @@ func defaultCompactorOptions() compactorOptions {
 		CompactionMinInterval:           defaultCompactionMinInterval,
 		ThresholdBytes:                  defaultThresholdBytes,
 		ThresholdBytesFraction:          defaultThresholdBytesFraction,
+		ThresholdBytesAvailableFraction: defaultThresholdBytesAvailableFraction,
 		MaxSuggestedCompactionRecordAge: defaultMaxSuggestedCompactionRecordAge,
 	}
 }
 
 type storeCapacityFunc func() (roachpb.StoreCapacity, error)
 
+type doneCompactingFunc func(ctx context.Context)
+
 // A Compactor records suggested compactions and periodically
 // makes requests to the engine to reclaim storage space.
 type Compactor struct {
 	eng     engine.WithSSTables
 	capFn   storeCapacityFunc
+	doneFn  doneCompactingFunc
 	ch      chan struct{}
 	opts    compactorOptions
 	Metrics Metrics
 }
 
 // NewCompactor returns a compactor for the specified storage engine.
-func NewCompactor(eng engine.WithSSTables, capFn storeCapacityFunc) *Compactor {
+func NewCompactor(
+	eng engine.WithSSTables, capFn storeCapacityFunc, doneFn doneCompactingFunc,
+) *Compactor {
 	return &Compactor{
 		eng:     eng,
 		capFn:   capFn,
+		doneFn:  doneFn,
 		ch:      make(chan struct{}, 1),
 		opts:    defaultCompactorOptions(),
 		Metrics: makeMetrics(),
@@ -131,7 +147,7 @@ func (c *Compactor) Start(ctx context.Context, tracer opentracing.Tracer, stoppe
 				if bytesQueued, err := c.examineQueue(ctx); err != nil {
 					log.Warningf(ctx, "failed check whether compaction suggestions exist: %s", err)
 				} else if bytesQueued > 0 {
-					log.Eventf(ctx, "compactor starting in %s as there are suggested compactions pending", c.opts.CompactionMinInterval)
+					log.VEventf(ctx, 3, "compactor starting in %s as there are suggested compactions pending", c.opts.CompactionMinInterval)
 				} else {
 					// Queue is empty, don't set the timer. This can happen only at startup.
 					break
@@ -301,19 +317,24 @@ func (c *Compactor) processCompaction(
 	delBatch engine.Batch,
 ) (int64, error) {
 	shouldProcess := aggr.Bytes >= c.opts.ThresholdBytes ||
-		aggr.Bytes >= int64(float64(capacity.LogicalBytes)*c.opts.ThresholdBytesFraction)
+		aggr.Bytes >= int64(float64(capacity.LogicalBytes)*c.opts.ThresholdBytesFraction) ||
+		aggr.Bytes >= int64(float64(capacity.Available)*c.opts.ThresholdBytesAvailableFraction)
 
 	if shouldProcess {
 		startTime := timeutil.Now()
-		log.Eventf(ctx, "processing compaction %s", aggr)
+		log.Infof(ctx, "processing compaction %s", aggr)
 		if err := c.eng.CompactRange(aggr.StartKey, aggr.EndKey, false /* forceBottommost */); err != nil {
+			c.Metrics.CompactionFailures.Inc(1)
 			return 0, errors.Wrapf(err, "unable to compact range %+v", aggr)
 		}
 		c.Metrics.BytesCompacted.Inc(aggr.Bytes)
-		c.Metrics.Compactions.Inc(1)
+		c.Metrics.CompactionSuccesses.Inc(1)
 		duration := timeutil.Since(startTime)
 		c.Metrics.CompactingNanos.Inc(int64(duration))
-		log.Eventf(ctx, "processed compaction %s in %s", aggr, duration)
+		if c.doneFn != nil {
+			c.doneFn(ctx)
+		}
+		log.Infof(ctx, "processed compaction %s in %s", aggr, duration)
 	} else {
 		log.VEventf(ctx, 2, "skipping compaction(s) %s", aggr)
 	}
@@ -407,7 +428,7 @@ func (c *Compactor) Suggest(ctx context.Context, sc storagebase.SuggestedCompact
 	var existing storagebase.Compaction
 	ok, _, _, err := c.eng.GetProto(engine.MVCCKey{Key: key}, &existing)
 	if err != nil {
-		log.ErrEventf(ctx, "unable to record suggested compaction: %s", err)
+		log.VErrEventf(ctx, 2, "unable to record suggested compaction: %s", err)
 		return
 	}
 

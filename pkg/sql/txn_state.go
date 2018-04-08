@@ -20,15 +20,20 @@ import (
 	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -51,6 +56,9 @@ type txnState2 struct {
 		txn *client.Txn
 	}
 
+	// connCtx is the connection's context. This is the parent of Ctx.
+	connCtx context.Context
+
 	// Ctx is the context for everything running in this SQL txn.
 	// This is only set while the session's state is not stateNoTxn.
 	Ctx context.Context
@@ -58,10 +66,15 @@ type txnState2 struct {
 	// sp is the span corresponding to the SQL txn. These are often root spans, as
 	// SQL txns are frequently the level at which we do tracing.
 	sp opentracing.Span
+	// recordingThreshold, is not zero, indicates that sp is recording and that
+	// the recording should be dumped to the log if execution of the transaction
+	// took more than this.
+	recordingThreshold time.Duration
+	recordingStart     time.Time
 
-	// cancel is the cancellation function for the above context. Called upon
-	// COMMIT/ROLLBACK of the transaction to release resources associated with the
-	// context. nil when no txn is in progress.
+	// cancel is Ctx's cancellation function. Called upon COMMIT/ROLLBACK of the
+	// transaction to release resources associated with the context. nil when no
+	// txn is in progress.
 	cancel context.CancelFunc
 
 	// The timestamp to report for current_timestamp(), now() etc.
@@ -73,6 +86,9 @@ type txnState2 struct {
 
 	// The transaction's priority.
 	priority roachpb.UserPriority
+
+	// The transaction's read only state.
+	readOnly bool
 
 	// mon tracks txn-bound objects like the running state of
 	// planNode in the midst of performing a computation.
@@ -87,6 +103,10 @@ type txnState2 struct {
 	// Do not use directly; set through setAdvanceInfo() and read through
 	// consumeAdvanceInfo().
 	adv advanceInfo
+
+	// txnAbortCount is incremented whenever the state transitions to
+	// stateAborted.
+	txnAbortCount *metric.Counter
 }
 
 // txnType represents the type of a SQL transaction.
@@ -112,6 +132,7 @@ const (
 // sqlTimestamp: The timestamp to report for current_timestamp(), now() etc.
 // isolation: The transaction's isolation level.
 // priority: The transaction's priority.
+// readOnly: The read-only character of the new txn.
 // tranCtx: A bag of extra execution context.
 func (ts *txnState2) resetForNewSQLTxn(
 	connCtx context.Context,
@@ -119,6 +140,7 @@ func (ts *txnState2) resetForNewSQLTxn(
 	sqlTimestamp time.Time,
 	isolation enginepb.IsolationType,
 	priority roachpb.UserPriority,
+	readOnly tree.ReadWriteMode,
 	tranCtx transitionCtx,
 ) {
 	// Reset state vars to defaults.
@@ -130,12 +152,7 @@ func (ts *txnState2) resetForNewSQLTxn(
 	// TODO(andrei): figure out how to close these spans on server shutdown? Ties
 	// into a larger discussion about how to drain SQL and rollback open txns.
 	var sp opentracing.Span
-	var opName string
-	if txnType == implicitTxn {
-		opName = sqlImplicitTxnName
-	} else {
-		opName = sqlTxnName
-	}
+	opName := sqlTxnName
 
 	// Create a span for the new txn. The span is always Recordable to support the
 	// use of session tracing, which may start recording on it.
@@ -146,6 +163,18 @@ func (ts *txnState2) resetForNewSQLTxn(
 	} else {
 		// Create a root span for this SQL txn.
 		sp = tranCtx.tracer.StartSpan(opName, tracing.Recordable)
+	}
+
+	if txnType == implicitTxn {
+		sp.SetTag("implicit", "true")
+	}
+
+	alreadyRecording := tranCtx.sessionTracing.Enabled()
+	duration := traceTxnThreshold.Get(&tranCtx.settings.SV)
+	if !alreadyRecording && (duration > 0) {
+		tracing.StartRecording(sp, tracing.SnowballRecording)
+		ts.recordingThreshold = duration
+		ts.recordingStart = timeutil.Now()
 	}
 
 	// Put the new span in the context.
@@ -165,10 +194,16 @@ func (ts *txnState2) resetForNewSQLTxn(
 	ts.mu.txn.SetDebugName(opName)
 	ts.mu.Unlock()
 
+	if err := ts.mu.txn.SetIsolation(isolation); err != nil {
+		panic(err)
+	}
 	if err := ts.setIsolationLevel(isolation); err != nil {
 		panic(err)
 	}
 	if err := ts.setPriority(priority); err != nil {
+		panic(err)
+	}
+	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
 	}
 
@@ -197,10 +232,25 @@ func (ts *txnState2) finishSQLTxn(connCtx context.Context) {
 			"attempting to finishSQLTxn(), but KV txn is not finalized: %+v", ts.mu.txn))
 	}
 
+	if ts.recordingThreshold > 0 {
+		if r := tracing.GetRecording(ts.sp); r != nil {
+			if elapsed := timeutil.Since(ts.recordingStart); elapsed >= ts.recordingThreshold {
+				dump := tracing.FormatRecordedSpans(r)
+				if len(dump) > 0 {
+					log.Infof(ts.Ctx, "SQL txn took %s, exceeding tracing threshold of %s:\n%s",
+						elapsed, ts.recordingThreshold, dump)
+				}
+			}
+		} else {
+			log.Warning(ts.Ctx, "Missing trace when sampled was enabled.")
+		}
+	}
+
 	ts.sp.Finish()
 	ts.sp = nil
 	ts.Ctx = nil
 	ts.mu.txn = nil
+	ts.recordingThreshold = 0
 }
 
 func (ts *txnState2) setIsolationLevel(isolation enginepb.IsolationType) error {
@@ -219,6 +269,20 @@ func (ts *txnState2) setPriority(userPriority roachpb.UserPriority) error {
 	return nil
 }
 
+func (ts *txnState2) setReadOnlyMode(mode tree.ReadWriteMode) error {
+	switch mode {
+	case tree.UnspecifiedReadWriteMode:
+		return nil
+	case tree.ReadOnly:
+		ts.readOnly = true
+	case tree.ReadWrite:
+		ts.readOnly = false
+	default:
+		return errors.Errorf("unknown read mode: %s", mode)
+	}
+	return nil
+}
+
 // advanceCode is part of advanceInfo; it instructs the module managing the
 // statements buffer on what action to take.
 type advanceCode int
@@ -232,17 +296,48 @@ const (
 	// advanceOne means that the cursor should be advanced by one position. This
 	// is the code commonly used after a successful statement execution.
 	advanceOne
-	// skipQueryStr means that the cursor should skip over any remaining
-	// statements that are part of the current query string and be positioned on
-	// the first statement in the next query string.
-	skipQueryStr
+	// skipBatch means that the cursor should skip over any remaining commands
+	// that are part of the current batch and be positioned on the first
+	// comamnd in the next batch.
+	skipBatch
+
 	// rewind means that the cursor should be moved back to the position indicated
 	// by rewCap.
 	rewind
 )
 
-// WIP(andrei)
-var _ = advanceUnknown
+// txnEvent is part of advanceInfo, informing the connExecutor about some
+// transaction events. It is used by the connExecutor to clear state associated
+// with a SQL transaction (other than the state encapsulated in TxnState; e.g.
+// as schema changes).
+//
+//go:generate stringer -type=txnEvent
+type txnEvent int
+
+const (
+	noEvent txnEvent = iota
+
+	// txnStart means that the statement that just ran started a new transaction.
+	txnStart
+	// txnCommit means that the transaction has committed (successfully). This
+	// doesn't mean that the SQL txn is necessarily "finished" - this event can be
+	// generated by a RELEASE statement and the connection is still waiting for a
+	// COMMIT.
+	// This event is produced both when entering the CommitWait state and also
+	// when leaving it.
+	txnCommit
+	// txnAborted means that the transaction will not commit. This doesn't mean
+	// that the SQL txn is necessarily "finished" - the connection might be in the
+	// Aborted state.
+	// This event is produced both when entering the Aborted state sometimes when
+	// leaving it.
+	txnAborted
+	// txnRestart means that the transaction is expecting a retry. The iteration
+	// of the txn just finished will not commit.
+	// This event is produced both when entering the RetryWait state and sometimes
+	// when exiting it.
+	txnRestart
+)
 
 // advanceInfo represents instructions for the connExecutor about what statement
 // to execute next (how to move its cursor over the input statements) and how
@@ -251,21 +346,9 @@ var _ = advanceUnknown
 type advanceInfo struct {
 	code advanceCode
 
-	// flush, if set, means that all results produced so far can be delivered to
-	// the client; we will never need to rewind beyond the current point in the
-	// results stream.
-	// When the connExecutor sees flush set, it instructs the results delivery
-	// module to deliver the accumulated results before creating any more
-	// StatementResults. Separately, it records the position of the cursor running
-	// through input statements *after* applying the advanceCode above as the
-	// transaction start position (the point to which a future rewind will move
-	// the cursor). Through the advanceCode, the state machine transition has
-	// control over whether future rewinds should point to the statement that
-	// generated the transition (code == stayInPlace) or the statement after it
-	// (code == advanceOne). The former is the case when we start a new
-	// transaction (implicit or explicit), the latter is used, for example, when
-	// executing a COMMIT.
-	flush bool
+	// txnEvent is filled in when the transaction commits, aborts or starts
+	// waiting for a retry.
+	txnEvent txnEvent
 
 	// Fields for the rewind code:
 
@@ -288,18 +371,29 @@ type transitionCtx struct {
 	// The Tracer used to create root spans for new txns if the parent ctx doesn't
 	// have a span.
 	tracer opentracing.Tracer
-
-	defaultIsolationLevel enginepb.IsolationType
+	// sessionTracing provides access to the session's tracing interface. The
+	// state machine needs to see if session tracing is enabled.
+	sessionTracing *SessionTracing
+	settings       *cluster.Settings
 }
+
+var noRewind = rewindCapability{}
 
 // setAdvanceInfo sets the adv field. This has to be called as part of any state
 // transition. The connExecutor is supposed to inspect adv after any transition
 // and act on it.
-func (ts *txnState2) setAdvanceInfo(adv advanceInfo) {
+func (ts *txnState2) setAdvanceInfo(code advanceCode, rewCap rewindCapability, ev txnEvent) {
 	if ts.adv.code != advanceUnknown {
 		panic("previous advanceInfo has not been consume()d")
 	}
-	ts.adv = adv
+	if code != rewind && rewCap != noRewind {
+		panic("if rewCap is specified, code needs to be rewind")
+	}
+	ts.adv = advanceInfo{
+		code:     code,
+		rewCap:   rewCap,
+		txnEvent: ev,
+	}
 }
 
 // consumerAdvanceInfo returns the advanceInfo set by the last transition and

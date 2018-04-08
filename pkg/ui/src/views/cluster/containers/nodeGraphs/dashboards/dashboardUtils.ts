@@ -1,5 +1,3 @@
-import _ from "lodash";
-
 import { NodesSummary } from "src/redux/nodes";
 
 /**
@@ -34,20 +32,16 @@ export interface GraphDashboardProps {
   tooltipSelection: string;
 }
 
-export function nodeAddress(nodesSummary: NodesSummary, nid: string) {
+export function nodeDisplayName(nodesSummary: NodesSummary, nid: string) {
   const ns = nodesSummary.nodeStatusByID[nid];
   if (!ns) {
     // This should only happen immediately after loading a page, and
     // associated graphs should display no data.
-    return "unknown address";
+    return "unknown node";
   }
-  return ns.desc.address.address_field;
+  return nodesSummary.nodeDisplayNameByID[ns.desc.node_id];
 }
 
 export function storeIDsForNode(nodesSummary: NodesSummary, nid: string): string[] {
-  const ns = nodesSummary.nodeStatusByID[nid];
-  if (!ns) {
-    return [];
-  }
-  return _.map(ns.store_statuses, (ss) => ss.desc.store_id.toString());
+  return nodesSummary.storeIDsByNodeID[nid] || [];
 }

@@ -23,7 +23,6 @@ import (
 	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -31,8 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/codahale/hdrhistogram"
+	"github.com/pkg/errors"
 )
 
 var numOps uint64
@@ -127,6 +128,16 @@ type Options struct {
 
 // Run a test of writing synchronously to the RocksDB WAL.
 func Run(opts Options) error {
+	// Check if the directory exists.
+	_, err := os.Stat(opts.Dir)
+	if err == nil {
+		return errors.Errorf("error: supplied path '%s' must not exist", opts.Dir)
+	}
+
+	defer func() {
+		_ = os.RemoveAll(opts.Dir)
+	}()
+
 	fmt.Printf("writing to %s\n", opts.Dir)
 
 	db, err := engine.NewRocksDB(
@@ -138,9 +149,6 @@ func Run(opts Options) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = os.RemoveAll(opts.Dir)
-	}()
 
 	workers := make([]*worker, opts.Concurrency)
 
@@ -156,17 +164,17 @@ func Run(opts Options) error {
 	defer ticker.Stop()
 
 	done := make(chan os.Signal, 3)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(done, os.Interrupt)
 
 	go func() {
 		wg.Wait()
-		done <- syscall.Signal(0)
+		done <- sysutil.Signal(0)
 	}()
 
 	if opts.Duration > 0 {
 		go func() {
 			time.Sleep(opts.Duration)
-			done <- syscall.Signal(0)
+			done <- sysutil.Signal(0)
 		}()
 	}
 

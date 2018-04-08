@@ -69,7 +69,7 @@ const (
 var (
 	metaExecLatency = metric.Metadata{
 		Name: "exec.latency",
-		Help: "Latency of batch KV requests executed on this node"}
+		Help: "Latency in nanoseconds of batch KV requests executed on this node"}
 	metaExecSuccess = metric.Metadata{
 		Name: "exec.success",
 		Help: "Number of batch KV requests executed successfully on this node"}
@@ -465,6 +465,14 @@ func (n *Node) SetDraining(drain bool) error {
 	return n.stores.VisitStores(func(s *storage.Store) error {
 		s.SetDraining(drain)
 		return nil
+	})
+}
+
+// SetHLCUpperBound sets the upper bound of the HLC wall time on all of the
+// node's underlying stores.
+func (n *Node) SetHLCUpperBound(ctx context.Context, hlcUpperBound int64) error {
+	return n.stores.VisitStores(func(s *storage.Store) error {
+		return s.WriteHLCUpperBound(ctx, hlcUpperBound)
 	})
 }
 
@@ -897,7 +905,7 @@ func (n *Node) batchInternal(
 		br, pErr = n.stores.Send(ctx, *args)
 		if pErr != nil {
 			br = &roachpb.BatchResponse{}
-			log.ErrEventf(ctx, "%T", pErr.GetDetail())
+			log.VErrEventf(ctx, 3, "%T", pErr.GetDetail())
 		}
 		if br.Error != nil {
 			panic(roachpb.ErrorUnexpectedlySet(n.stores, br))

@@ -140,18 +140,12 @@ func (rh *rowHelper) skipColumnInPK(
 	return true, nil
 }
 
-type columnIDs []ColumnID
-
-func (c columnIDs) Len() int           { return len(c) }
-func (c columnIDs) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
-func (c columnIDs) Less(i, j int) bool { return c[i] < c[j] }
-
 func (rh *rowHelper) sortedColumnFamily(famID FamilyID) ([]ColumnID, bool) {
 	if rh.sortedColumnFamilies == nil {
 		rh.sortedColumnFamilies = make(map[FamilyID][]ColumnID, len(rh.TableDesc.Families))
 		for _, family := range rh.TableDesc.Families {
 			colIDs := append([]ColumnID(nil), family.ColumnIDs...)
-			sort.Sort(columnIDs(colIDs))
+			sort.Sort(ColumnIDs(colIDs))
 			rh.sortedColumnFamilies[family.ID] = colIDs
 		}
 	}
@@ -396,11 +390,11 @@ func (ri *RowInserter) EncodeIndexesForRow(
 // RowUpdater abstracts the key/value operations for updating table rows.
 type RowUpdater struct {
 	Helper                rowHelper
+	DeleteHelper          *rowHelper
 	FetchCols             []ColumnDescriptor
 	FetchColIDtoRowIndex  map[ColumnID]int
 	UpdateCols            []ColumnDescriptor
 	updateColIDtoRowIndex map[ColumnID]int
-	deleteOnlyIndex       map[int]struct{}
 	primaryKeyColChange   bool
 
 	// rd and ri are used when the update this RowUpdater is created for modifies
@@ -524,21 +518,19 @@ func makeRowUpdaterWithoutCascader(
 		tableCols = append(tableCols, tableDesc.Columns...)
 	}
 
-	var deleteOnlyIndex map[int]struct{}
+	var deleteOnlyIndexes []IndexDescriptor
 	for _, m := range tableDesc.Mutations {
 		if index := m.GetIndex(); index != nil {
 			if needsUpdate(*index) {
-				indexes = append(indexes, *index)
-
 				switch m.State {
 				case DescriptorMutation_DELETE_ONLY:
-					if deleteOnlyIndex == nil {
+					if deleteOnlyIndexes == nil {
 						// Allocate at most once.
-						deleteOnlyIndex = make(map[int]struct{}, len(tableDesc.Mutations))
+						deleteOnlyIndexes = make([]IndexDescriptor, 0, len(tableDesc.Mutations))
 					}
-					deleteOnlyIndex[len(indexes)-1] = struct{}{}
-
-				case DescriptorMutation_DELETE_AND_WRITE_ONLY:
+					deleteOnlyIndexes = append(deleteOnlyIndexes, *index)
+				default:
+					indexes = append(indexes, *index)
 				}
 			}
 		} else if col := m.GetColumn(); col != nil {
@@ -546,11 +538,17 @@ func makeRowUpdaterWithoutCascader(
 		}
 	}
 
+	var deleteOnlyHelper *rowHelper
+	if len(deleteOnlyIndexes) > 0 {
+		rh := newRowHelper(tableDesc, deleteOnlyIndexes)
+		deleteOnlyHelper = &rh
+	}
+
 	ru := RowUpdater{
 		Helper:                newRowHelper(tableDesc, indexes),
+		DeleteHelper:          deleteOnlyHelper,
 		UpdateCols:            updateCols,
 		updateColIDtoRowIndex: updateColIDtoRowIndex,
-		deleteOnlyIndex:       deleteOnlyIndex,
 		primaryKeyColChange:   primaryKeyColChange,
 		marshaled:             make([]roachpb.Value, len(updateCols)),
 		newValues:             make([]tree.Datum, len(tableCols)),
@@ -613,6 +611,11 @@ func makeRowUpdaterWithoutCascader(
 				return RowUpdater{}, err
 			}
 		}
+		for _, index := range deleteOnlyIndexes {
+			if err := index.RunOverAllColumns(maybeAddCol); err != nil {
+				return RowUpdater{}, err
+			}
+		}
 	}
 
 	var err error
@@ -650,16 +653,22 @@ func (ru *RowUpdater) UpdateRow(
 		return nil, errors.Errorf("got %d values but expected %d", len(updateValues), len(ru.UpdateCols))
 	}
 
-	primaryIndexKey, secondaryIndexEntries, err := ru.Helper.encodeIndexes(ru.FetchColIDtoRowIndex, oldValues)
+	primaryIndexKey, oldSecondaryIndexEntries, err := ru.Helper.encodeIndexes(ru.FetchColIDtoRowIndex, oldValues)
 	if err != nil {
 		return nil, err
 	}
-
+	var deleteOldSecondaryIndexEntries []IndexEntry
+	if ru.DeleteHelper != nil {
+		_, deleteOldSecondaryIndexEntries, err = ru.DeleteHelper.encodeIndexes(ru.FetchColIDtoRowIndex, oldValues)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// The secondary index entries returned by rowHelper.encodeIndexes are only
 	// valid until the next call to encodeIndexes. We need to copy them so that
 	// we can compare against the new secondary index entries.
-	secondaryIndexEntries = append(ru.indexEntriesBuf[:0], secondaryIndexEntries...)
-	ru.indexEntriesBuf = secondaryIndexEntries
+	oldSecondaryIndexEntries = append(ru.indexEntriesBuf[:0], oldSecondaryIndexEntries...)
+	ru.indexEntriesBuf = oldSecondaryIndexEntries
 
 	// Check that the new value types match the column types. This needs to
 	// happen before index encoding because certain datum types (i.e. tuple)
@@ -693,7 +702,6 @@ func (ru *RowUpdater) UpdateRow(
 			return nil, err
 		}
 	}
-
 	if rowPrimaryKeyChanged {
 		if err := ru.rd.DeleteRow(ctx, batch, oldValues, SkipFKs, traceKV); err != nil {
 			return nil, err
@@ -704,16 +712,16 @@ func (ru *RowUpdater) UpdateRow(
 			return nil, err
 		}
 
-		ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID)
-		for i := range newSecondaryIndexEntries {
-			if !bytes.Equal(newSecondaryIndexEntries[i].Key, secondaryIndexEntries[i].Key) {
-				ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID)
+		ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID, ru.Helper.TableDesc.PrimaryIndex.Type)
+		for i := range ru.Helper.Indexes {
+			if !bytes.Equal(newSecondaryIndexEntries[i].Key, oldSecondaryIndexEntries[i].Key) {
+				ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
 			}
 		}
 
 		if ru.cascader != nil {
 			if err := ru.cascader.txn.Run(ctx, batch); err != nil {
-				return nil, err
+				return nil, ConvertBatchError(ctx, ru.Helper.TableDesc, batch)
 			}
 			if err := ru.cascader.cascadeAll(
 				ctx,
@@ -834,32 +842,70 @@ func (ru *RowUpdater) UpdateRow(
 	}
 
 	// Update secondary indexes.
-	for i, newSecondaryIndexEntry := range newSecondaryIndexEntries {
-		secondaryIndexEntry := secondaryIndexEntries[i]
+	// We're iterating through all of the indexes, which should have corresponding entries in both oldSecondaryIndexEntries
+	// and newSecondaryIndexEntries. Inverted indexes could potentially have more entries at the end of both and we will
+	// update those separately.
+	for i, index := range ru.Helper.Indexes {
+		oldSecondaryIndexEntry := oldSecondaryIndexEntries[i]
+		newSecondaryIndexEntry := newSecondaryIndexEntries[i]
+
+		// We're skipping inverted indexes in this loop, but appending the inverted index entry to the back of
+		// newSecondaryIndexEntries to process later. For inverted indexes we need to remove all old entries before adding
+		// new ones.
+		if index.Type == IndexDescriptor_INVERTED {
+			newSecondaryIndexEntries = append(newSecondaryIndexEntries, newSecondaryIndexEntry)
+			oldSecondaryIndexEntries = append(oldSecondaryIndexEntries, oldSecondaryIndexEntry)
+
+			continue
+		}
+
 		var expValue interface{}
-		if !bytes.Equal(newSecondaryIndexEntry.Key, secondaryIndexEntry.Key) {
-			ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID)
+		if !bytes.Equal(newSecondaryIndexEntry.Key, oldSecondaryIndexEntry.Key) {
+			ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
 			if traceKV {
-				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], secondaryIndexEntry.Key))
+				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], oldSecondaryIndexEntry.Key))
 			}
-			batch.Del(secondaryIndexEntry.Key)
-		} else if !bytes.Equal(newSecondaryIndexEntry.Value.RawBytes, secondaryIndexEntry.Value.RawBytes) {
-			expValue = &secondaryIndexEntry.Value
+			batch.Del(oldSecondaryIndexEntry.Key)
+		} else if !newSecondaryIndexEntry.Value.EqualData(oldSecondaryIndexEntry.Value) {
+			expValue = &oldSecondaryIndexEntry.Value
 		} else {
 			continue
 		}
-		// Do not update Indexes in the DELETE_ONLY state.
-		if _, ok := ru.deleteOnlyIndex[i]; !ok {
-			if traceKV {
-				log.VEventf(ctx, 2, "CPut %s -> %v", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], newSecondaryIndexEntry.Key), newSecondaryIndexEntry.Value.PrettyPrint())
-			}
-			batch.CPut(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
+
+		if traceKV {
+			log.VEventf(ctx, 2, "CPut %s -> %v", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], newSecondaryIndexEntry.Key), newSecondaryIndexEntry.Value.PrettyPrint())
 		}
+		batch.CPut(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
+	}
+
+	// We're deleting indexes in a delete only state. We're bounding this by the number of indexes because inverted
+	// indexed will be handled separately.
+	if ru.DeleteHelper != nil {
+		for _, deletedSecondaryIndexEntry := range deleteOldSecondaryIndexEntries {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", deletedSecondaryIndexEntry.Key)
+			}
+			batch.Del(deletedSecondaryIndexEntry.Key)
+		}
+	}
+
+	// We're removing all of the inverted index entries from the row being updated.
+	for i := len(ru.Helper.Indexes); i < len(oldSecondaryIndexEntries); i++ {
+		if traceKV {
+			log.VEventf(ctx, 2, "Del %s", oldSecondaryIndexEntries[i].Key)
+		}
+		batch.Del(oldSecondaryIndexEntries[i].Key)
+	}
+
+	putFn := insertInvertedPutFn
+	// We're adding all of the inverted index entries from the row being updated.
+	for i := len(ru.Helper.Indexes); i < len(newSecondaryIndexEntries); i++ {
+		putFn(ctx, b, &newSecondaryIndexEntries[i].Key, &newSecondaryIndexEntries[i].Value, traceKV)
 	}
 
 	if ru.cascader != nil {
 		if err := ru.cascader.txn.Run(ctx, batch); err != nil {
-			return nil, err
+			return nil, ConvertBatchError(ctx, ru.Helper.TableDesc, batch)
 		}
 		if err := ru.cascader.cascadeAll(
 			ctx,
@@ -891,7 +937,7 @@ func (ru *RowUpdater) IsColumnOnlyUpdate() bool {
 	// be improved. Specifically, RowUpdater currently has two responsibilities
 	// (computing which indexes need to be updated and mapping sql rows to k/v
 	// operations) and these should be split.
-	return !ru.primaryKeyColChange && len(ru.deleteOnlyIndex) == 0 && len(ru.Helper.Indexes) == 0
+	return !ru.primaryKeyColChange && ru.DeleteHelper == nil && len(ru.Helper.Indexes) == 0
 }
 
 // RowDeleter abstracts the key/value operations for deleting table rows.
@@ -902,8 +948,7 @@ type RowDeleter struct {
 	Fks                  fkDeleteHelper
 	cascader             *cascader
 	// For allocation avoidance.
-	startKey roachpb.Key
-	endKey   roachpb.Key
+	key roachpb.Key
 }
 
 // MakeRowDeleter creates a RowDeleter for the given table.
@@ -1023,23 +1068,24 @@ func (rd *RowDeleter) DeleteRow(
 		if traceKV {
 			log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.secIndexValDirs[i], secondaryIndexEntry.Key))
 		}
-		b.Del(secondaryIndexEntry.Key)
+		b.Del(&secondaryIndexEntry.Key)
 	}
 
 	// Delete the row.
-	rd.startKey = roachpb.Key(primaryIndexKey)
-	rd.endKey = roachpb.Key(encoding.EncodeInterleavedSentinel(primaryIndexKey))
-	if traceKV {
-		log.VEventf(ctx, 2, "DelRange %s - %s",
-			keys.PrettyPrint(rd.Helper.primIndexValDirs, rd.startKey),
-			// Although not strictly necessary, we explicitly
-			// specify that we want to print out the interleaved
-			// sentinel.
-			keys.PrettyPrint(append(rd.Helper.primIndexValDirs, 0), rd.endKey),
-		)
+	for i, family := range rd.Helper.TableDesc.Families {
+		if i > 0 {
+			// HACK: MakeFamilyKey appends to its argument, so on every loop iteration
+			// after the first, trim primaryIndexKey so nothing gets overwritten.
+			// TODO(dan): Instead of this, use something like engine.ChunkAllocator.
+			primaryIndexKey = primaryIndexKey[:len(primaryIndexKey):len(primaryIndexKey)]
+		}
+		rd.key = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
+		if traceKV {
+			log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.primIndexValDirs, rd.key))
+		}
+		b.Del(&rd.key)
+		rd.key = nil
 	}
-	b.DelRange(&rd.startKey, &rd.endKey, false /* returnKeys */)
-	rd.startKey, rd.endKey = nil, nil
 
 	if rd.cascader != nil {
 		if err := rd.cascader.cascadeAll(

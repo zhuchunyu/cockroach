@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -254,7 +255,7 @@ func TestPostProcess(t *testing.T) {
 			outBuf := &RowBuffer{}
 
 			var out ProcOutputHelper
-			evalCtx := tree.NewTestingEvalContext()
+			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
 			if err := out.Init(&tc.post, inBuf.OutputTypes(), evalCtx, outBuf); err != nil {
 				t.Fatal(err)
@@ -389,4 +390,79 @@ func TestAggregatorSpecAggregationEquals(t *testing.T) {
 			t.Fatalf("case %d: incorrect result from %#v.Equals(%#v), expected %t, actual %t", i, tc.b, tc.a, tc.expected, actual)
 		}
 	}
+}
+
+func TestProcessorBaseContext(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+
+	runTest := func(t *testing.T, f func(noop *noopProcessor)) {
+		flowCtx := &FlowCtx{
+			Ctx:      ctx,
+			Settings: st,
+			EvalCtx:  tree.MakeTestingEvalContext(st),
+		}
+		defer flowCtx.EvalCtx.Stop(ctx)
+
+		input := NewRepeatableRowSource(oneIntCol, makeIntRows(10, 1))
+		noop, err := newNoopProcessor(flowCtx, input, &PostProcessSpec{}, &RowDisposer{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The context should be valid before Next is called in case ConsumerDone
+		// or ConsumerClosed are called without calling Next.j
+		if noop.ctx != ctx {
+			t.Fatalf("processorBase.ctx not initialized")
+		}
+		f(noop)
+		// The context should be reset after ConsumerClosed is called so that any
+		// subsequent logging calls will not operate on closed spans.
+		if noop.ctx != ctx {
+			t.Fatalf("processorBase.ctx not reset on close")
+		}
+	}
+
+	t.Run("next-close", func(t *testing.T) {
+		runTest(t, func(noop *noopProcessor) {
+			// The normal case: a call to Next followed by the processor being closed.
+			noop.Next()
+			noop.ConsumerClosed()
+		})
+	})
+
+	t.Run("close-without-next", func(t *testing.T) {
+		runTest(t, func(noop *noopProcessor) {
+			// A processor can be closed without Next ever being called.
+			noop.ConsumerClosed()
+		})
+	})
+
+	t.Run("close-next", func(t *testing.T) {
+		runTest(t, func(noop *noopProcessor) {
+			// After the processor is closed, it can't be opened via a call to Next.
+			noop.ConsumerClosed()
+			noop.Next()
+		})
+	})
+
+	t.Run("next-close-next", func(t *testing.T) {
+		runTest(t, func(noop *noopProcessor) {
+			// A spurious call to Next after the processor is closed.
+			noop.Next()
+			noop.ConsumerClosed()
+			noop.Next()
+		})
+	})
+
+	t.Run("next-close-close", func(t *testing.T) {
+		runTest(t, func(noop *noopProcessor) {
+			// Close should be idempotent.
+			noop.Next()
+			noop.ConsumerClosed()
+			noop.ConsumerClosed()
+		})
+	})
 }

@@ -396,10 +396,20 @@ func (pp *physicalProps) addEquivalency(colA, colB int) {
 		pp.notNullCols.Add(gA)
 	}
 
-	for i := range pp.weakKeys {
-		if pp.weakKeys[i].Contains(gB) {
+	if pp.constantCols.Contains(gA) {
+		// One of the columns became a constant; remove it from all keys (similar to
+		// what addConstantColumn does).
+		for i := range pp.weakKeys {
+			pp.weakKeys[i].Remove(gA)
 			pp.weakKeys[i].Remove(gB)
-			pp.weakKeys[i].Add(gA)
+		}
+	} else {
+		// Replace any occurrences of gB with gA (the new representative).
+		for i := range pp.weakKeys {
+			if pp.weakKeys[i].Contains(gB) {
+				pp.weakKeys[i].Remove(gB)
+				pp.weakKeys[i].Add(gA)
+			}
 		}
 	}
 
@@ -858,4 +868,16 @@ MainLoop:
 		break
 	}
 	return result
+}
+
+// getColVarIdx detects whether an expression is a straightforward
+// reference to a column or index variable. In this case it returns
+// the index of that column's in the descriptor's []Column array.
+// Used by indexInfo.makeIndexConstraints().
+func getColVarIdx(expr tree.Expr) (ok bool, colIdx int) {
+	switch q := expr.(type) {
+	case *tree.IndexedVar:
+		return true, q.Idx
+	}
+	return false, -1
 }

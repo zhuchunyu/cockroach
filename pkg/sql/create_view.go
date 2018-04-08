@@ -43,12 +43,15 @@ type createViewNode struct {
 //						selected columns.
 //          mysql requires CREATE VIEW plus SELECT on all the selected columns.
 func (p *planner) CreateView(ctx context.Context, n *tree.CreateView) (planNode, error) {
-	name, err := n.Name.NormalizeWithDatabaseName(p.SessionData().Database)
+	name, err := n.Name.Normalize()
 	if err != nil {
 		return nil, err
 	}
 
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), name.Database())
+	var dbDesc *DatabaseDescriptor
+	p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+		dbDesc, err = ResolveTargetObject(ctx, p, name)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +78,8 @@ func (p *planner) CreateView(ctx context.Context, n *tree.CreateView) (planNode,
 					return
 				}
 				// Persist the database prefix expansion.
-				tn.OmitDBNameDuringFormatting = false
+				tn.ExplicitSchema = true
+				tn.ExplicitCatalog = true
 			},
 		)
 		f.FormatNode(n.AsSource)
@@ -142,7 +146,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err = desc.ValidateTable(); err != nil {
+	if err = desc.ValidateTable(params.EvalContext().Settings); err != nil {
 		return err
 	}
 
@@ -175,7 +179,7 @@ func (n *createViewNode) startExec(params runParams) error {
 	if desc.Adding() {
 		params.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
 	}
-	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn, params.EvalContext().Settings); err != nil {
 		return err
 	}
 
@@ -191,7 +195,7 @@ func (n *createViewNode) startExec(params runParams) error {
 			ViewName  string
 			Statement string
 			User      string
-		}{n.n.Name.String(), n.n.String(), params.SessionData().User},
+		}{n.n.Name.TableName().FQString(), n.n.String(), params.SessionData().User},
 	)
 }
 
@@ -215,7 +219,8 @@ func (n *createViewNode) makeViewTableDesc(
 	resultColumns []sqlbase.ResultColumn,
 	privileges *sqlbase.PrivilegeDescriptor,
 ) (sqlbase.TableDescriptor, error) {
-	desc := initTableDescriptor(id, parentID, viewName, params.p.txn.OrigTimestamp(), privileges)
+	desc := initTableDescriptor(id, parentID, viewName,
+		params.p.txn.CommitTimestamp(), privileges)
 	desc.ViewQuery = tree.AsStringWithFlags(n.n.AsSource, tree.FmtParsable)
 	for i, colRes := range resultColumns {
 		colType, err := coltypes.DatumTypeToColumnType(colRes.Typ)
@@ -233,6 +238,10 @@ func (n *createViewNode) makeViewTableDesc(
 		}
 		desc.AddColumn(*col)
 	}
-
-	return desc, desc.AllocateIDs()
+	// AllocateIDs mutates its receiver. `return desc, desc.AllocateIDs()`
+	// happens to work in gc, but does not work in gccgo.
+	//
+	// See https://github.com/golang/go/issues/23188.
+	err := desc.AllocateIDs()
+	return desc, err
 }

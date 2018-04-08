@@ -14,9 +14,18 @@
 
 package util
 
-// FastIntMap is a replacement for map[int]int which is more efficient when the
-// values are small. It can be passed by value (but Copy must be used for
-// independent modification of copies).
+import (
+	"bytes"
+	"fmt"
+	"math/bits"
+	"sort"
+
+	"golang.org/x/tools/container/intsets"
+)
+
+// FastIntMap is a replacement for map[int]int which is more efficient when both
+// keys and values are small. It can be passed by value (but Copy must be used
+// for independent modification of copies).
 type FastIntMap struct {
 	small [numWords]uint64
 	large map[int]int
@@ -77,26 +86,92 @@ func (m FastIntMap) Get(key int) (value int, ok bool) {
 	return value, ok
 }
 
+// Len returns the number of keys in the map.
+func (m FastIntMap) Len() int {
+	if m.large != nil {
+		return len(m.large)
+	}
+	res := 0
+	for w := 0; w < numWords; w++ {
+		v := m.small[w]
+		// We want to count the number of non-zero groups. To do this, we OR all
+		// the bits of each group into the low-bit of that group, apply a mask
+		// selecting just those low bits and count the number of 1s.
+		// To OR the bits efficiently, we first OR the high half of each group into
+		// the low half of each group, and repeat.
+		// Note: this code assumes that numBits is a power of two.
+		for i := uint32(numBits / 2); i > 0; i /= 2 {
+			v |= (v >> i)
+		}
+		res += bits.OnesCount64(v & groupLowBitMask)
+	}
+	return res
+}
+
 // MaxKey returns the maximum key that is in the map. If the map
 // is empty, returns ok=false.
 func (m FastIntMap) MaxKey() (_ int, ok bool) {
 	if m.large == nil {
-		// TODO(radu): we could skip words that are 0
-		// and use bits.LeadingZeros64.
-		for i := numVals - 1; i >= 0; i-- {
-			if m.getSmallVal(uint32(i)) != -1 {
-				return i, true
+		for w := numWords - 1; w >= 0; w-- {
+			if val := m.small[w]; val != 0 {
+				// Example (with numBits = 4)
+				//   pos:   3    2    1    0
+				//   bits:  0000 0000 0010 0000
+				// To get the left-most non-zero group, we calculate how many groups are
+				// covered by the leading zeros.
+				pos := numValsPerWord - 1 - bits.LeadingZeros64(val)/numBits
+				return w*numValsPerWord + pos, true
 			}
 		}
 		return 0, false
 	}
-	max, ok := 0, false
+	if len(m.large) == 0 {
+		return 0, false
+	}
+	max := intsets.MinInt
 	for k := range m.large {
-		if !ok || max < k {
-			max, ok = k, true
+		if max < k {
+			max = k
 		}
 	}
-	return max, ok
+	return max, true
+}
+
+// MaxValue returns the maximum value that is in the map. If the map
+// is empty, returns ok=false.
+func (m FastIntMap) MaxValue() (_ int, ok bool) {
+	if m.large == nil {
+		// In the small case, all values are positive.
+		max := -1
+		for w := 0; w < numWords; w++ {
+			if m.small[w] != 0 {
+				// To optimize for small maps, we stop when the rest of the values are
+				// unset. See the comment in MaxKey.
+				numVals := numValsPerWord - bits.LeadingZeros64(m.small[w])/numBits
+				for i := 0; i < numVals; i++ {
+					val := int(m.getSmallVal(uint32(w*numValsPerWord + i)))
+					// NB: val is -1 here if this key isn't in the map.
+					if max < val {
+						max = val
+					}
+				}
+			}
+		}
+		if max == -1 {
+			return 0, false
+		}
+		return max, true
+	}
+	if len(m.large) == 0 {
+		return 0, false
+	}
+	max := intsets.MinInt
+	for _, v := range m.large {
+		if max < v {
+			max = v
+		}
+	}
+	return max, true
 }
 
 // ForEach calls the given function for each key/value pair in the map (in
@@ -115,6 +190,42 @@ func (m FastIntMap) ForEach(fn func(key, val int)) {
 	}
 }
 
+// String prints out the contents of the map in the following format:
+//   map[key1:val1 key2:val2 ...]
+// The keys are in ascending order.
+func (m FastIntMap) String() string {
+	var buf bytes.Buffer
+	buf.WriteString("map[")
+	first := true
+
+	if m.large != nil {
+		keys := make([]int, 0, len(m.large))
+		for k := range m.large {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+		for _, k := range keys {
+			if !first {
+				buf.WriteByte(' ')
+			}
+			first = false
+			fmt.Fprintf(&buf, "%d:%d", k, m.large[k])
+		}
+	} else {
+		for i := 0; i < numVals; i++ {
+			if val := m.getSmallVal(uint32(i)); val != -1 {
+				if !first {
+					buf.WriteByte(' ')
+				}
+				first = false
+				fmt.Fprintf(&buf, "%d:%d", i, val)
+			}
+		}
+	}
+	buf.WriteByte(']')
+	return buf.String()
+}
+
 // These constants determine the "small" representation: we pack <numVals>
 // values of <numBits> bits into <numWords> 64-bit words. Each value is 0 if the
 // corresponding key is not set, otherwise it is the value+1.
@@ -130,6 +241,8 @@ const (
 	numVals        = numWords * numValsPerWord // 32
 	mask           = (1 << numBits) - 1
 	maxValue       = mask - 1
+	// Mask for the low bits of each group: 0001 0001 0001 ...
+	groupLowBitMask = 0x1111111111111111
 )
 
 // Returns -1 if the value is unmapped.

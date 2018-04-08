@@ -29,7 +29,6 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -45,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -77,6 +78,7 @@ uninitialized, specify the --join flag to point to any healthy node
 (or list of nodes) already part of the cluster.
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 [--join=host:port,[host:port]]`,
+	Args:    cobra.NoArgs,
 	RunE:    MaybeShoutError(MaybeDecorateGRPCError(runStart)),
 }
 
@@ -278,7 +280,7 @@ func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, 
 }
 
 func initTempStorageConfig(
-	ctx context.Context, stopper *stop.Stopper, firstStore base.StoreSpec,
+	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, firstStore base.StoreSpec,
 ) (base.TempStorageConfig, error) {
 	var recordPath string
 	if !firstStore.InMemory {
@@ -333,6 +335,7 @@ func initTempStorageConfig(
 	// cli flags.
 	tempStorageConfig := base.TempStorageConfigFromEnv(
 		ctx,
+		st,
 		firstStore,
 		startCtx.tempDir,
 		tempStorageMaxSizeBytes,
@@ -369,10 +372,6 @@ func initTempStorageConfig(
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
 func runStart(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-
 	tBegin := timeutil.Now()
 
 	// First things first: if the user wants background processing,
@@ -393,7 +392,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// the buffers in the signal handler below. If we started capturing
 	// signals later, some startup logging might be lost.
 	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(signalCh, drainSignals...)
 
 	// Set up a tracing span for the start process.  We want any logging
 	// happening beyond this point to be accounted to this start
@@ -437,7 +436,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if serverCfg.Settings.ExternalIODir, err = initExternalIODir(ctx, serverCfg.Stores.Specs[0]); err != nil {
 		return err
 	}
-	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, stopper, serverCfg.Stores.Specs[0]); err != nil {
+	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, serverCfg.Settings, stopper, serverCfg.Stores.Specs[0]); err != nil {
 		return err
 	}
 
@@ -536,12 +535,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 			// We don't do this in (*server.Server).Start() because we don't want it
 			// in tests.
 			if !envutil.EnvOrDefaultBool("COCKROACH_SKIP_UPDATE_CHECK", false) {
-				s.PeriodicallyCheckForUpdates()
+				s.PeriodicallyCheckForUpdates(ctx)
 			}
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			pgURL, err := serverCfg.PGURL(url.User(cliCtx.sqlConnUser))
+			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
 			if err != nil {
 				return err
 			}
@@ -556,6 +555,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 				fmt.Fprintf(tw, "socket:\t%s\n", serverCfg.SocketFile)
 			}
 			fmt.Fprintf(tw, "logs:\t%s\n", flag.Lookup("log-dir").Value)
+			if serverCfg.SQLAuditLogDirName.IsSet() {
+				fmt.Fprintf(tw, "SQL audit logs:\t%s\n", serverCfg.SQLAuditLogDirName)
+			}
 			if serverCfg.Attrs != "" {
 				fmt.Fprintf(tw, "attrs:\t%s\n", serverCfg.Attrs)
 			}
@@ -677,14 +679,28 @@ func runStart(cmd *cobra.Command, args []string) error {
 			// still be running after shutdownCtx's span has been finished.
 			ac := log.AmbientContext{}
 			ac.AddLogTag("server drain process", nil)
-			ctx := ac.AnnotateCtx(context.Background())
-			if _, err := s.Drain(ctx, server.GracefulDrainModes); err != nil {
-				log.Warning(ctx, err)
+			drainCtx := ac.AnnotateCtx(context.Background())
+			if _, err := s.Drain(drainCtx, server.GracefulDrainModes); err != nil {
+				log.Warning(drainCtx, err)
 			}
-			stopper.Stop(ctx)
+			stopper.Stop(drainCtx)
 		}()
 
-		// Don't return: we're shutting down gracefully.
+	// Don't return: we're shutting down gracefully.
+
+	case <-log.FatalChan():
+		// A fatal error has occurred. Stop everything (gracelessly) to
+		// avoid serving incorrect data while the final log messages are
+		// being written.
+		// https://github.com/cockroachdb/cockroach/issues/23414
+		// TODO(bdarnell): This could be more graceless, for example by
+		// reaching into the server objects and closing all the
+		// connections while they're in use. That would be more in line
+		// with the expected effect of a log.Fatal.
+		stopper.Stop(ctx)
+		// The logging goroutine is now responsible for killing this
+		// process, so just block this goroutine.
+		select {}
 	}
 
 	// At this point, a signal has been received to shut down the
@@ -728,22 +744,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	select {
 	case sig := <-signalCh:
 		// This new signal is not welcome, as it interferes with the graceful
-		// shutdown process. On Unix, a signal that was not handled gracefully by
-		// the application should be visible to other processes as an exit code
-		// encoded as 128+signal number.
-		//
-		// Also, on Unix, os.Signal is syscall.Signal and it's convertible to int.
-		returnErr = &cliError{
-			exitCode: 128 + int(sig.(syscall.Signal)),
-			severity: log.Severity_ERROR,
-			cause: errors.Errorf(
-				"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint),
-		}
-		// NB: we do not return here to go through log.Flush below.
+		// shutdown process.
+		log.Shout(ctx, log.Severity_ERROR, fmt.Sprintf(
+			"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint))
+		handleSignalDuringShutdown(sig)
+		panic("unreachable")
 
 	case <-time.After(time.Minute):
-		returnErr = errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
-		// NB: we do not return here to go through log.Flush below.
+		return errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
 
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
@@ -769,8 +777,7 @@ func reportConfiguration(ctx context.Context) {
 	// running as root in a multi-user environment, or using different
 	// uid/gid across runs in the same data directory. To determine
 	// this, it's easier if the information appears in the log file.
-	log.Infof(ctx, "process identity: uid %d euid %d gid %d egid %d",
-		syscall.Getuid(), syscall.Geteuid(), syscall.Getgid(), syscall.Getegid())
+	log.Infof(ctx, "process identity: %s", sysutil.ProcessIdentity())
 }
 
 func maybeWarnMemorySizes(ctx context.Context) {
@@ -780,7 +787,7 @@ func maybeWarnMemorySizes(ctx context.Context) {
 		fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", cacheSizeValue)
 		fmt.Fprintf(&buf, "  A significantly larger value is usually needed for good performance.\n")
 		if size, err := server.GetTotalMemory(context.Background()); err == nil {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=25%% (%s).",
+			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=.25 (%s).",
 				humanizeutil.IBytes(size/4))
 		} else {
 			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
@@ -793,7 +800,7 @@ func maybeWarnMemorySizes(ctx context.Context) {
 		fmt.Fprintf(&buf, "Using the default setting for --max-sql-memory (%s).\n", sqlSizeValue)
 		fmt.Fprintf(&buf, "  A significantly larger value is usually needed in production.\n")
 		if size, err := server.GetTotalMemory(context.Background()); err == nil {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --max-sql-memory=25%% (%s).",
+			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --max-sql-memory=.25 (%s).",
 				humanizeutil.IBytes(size/4))
 		} else {
 			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
@@ -864,6 +871,15 @@ func setupAndInitializeLoggingAndProfiling(ctx context.Context) (*stop.Stopper, 
 		// may not have been ready before the call to MkdirAll() above.
 		log.Shout(ctx, log.Severity_WARNING, "multiple stores configured"+
 			" and --log-dir not specified, you may want to specify --log-dir to disambiguate.")
+	}
+
+	if auditLogDir := serverCfg.SQLAuditLogDirName.String(); auditLogDir != "" && auditLogDir != outputDirectory {
+		// Make sure the path for the audit log exists, if it's a different path than
+		// the main log.
+		if err := os.MkdirAll(auditLogDir, 0755); err != nil {
+			return nil, err
+		}
+		log.Eventf(ctx, "created SQL audit log directory %s", auditLogDir)
 	}
 
 	if startCtx.serverInsecure {
@@ -971,6 +987,7 @@ Shutdown the server. The first stage is drain, where any new requests
 will be ignored by the server. When all extant requests have been
 completed, the server exits.
 `,
+	Args: cobra.NoArgs,
 	RunE: MaybeDecorateGRPCError(runQuit),
 }
 
@@ -1043,10 +1060,6 @@ type errTryHardShutdown struct{ error }
 
 // runQuit accesses the quit shutdown path.
 func runQuit(cmd *cobra.Command, args []string) (err error) {
-	if len(args) != 0 {
-		return usageAndError(cmd)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

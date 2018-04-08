@@ -43,16 +43,16 @@ SELECT * FROM kv
 5 11
 7 15
 
-statement error column "m" does not exist
+statement error pgcode 42703 column "m" does not exist
 UPDATE kv SET m = 9 WHERE k IN (1, 3)
 
-statement error compound types not supported yet: "kv.k"
+statement error unimplemented at or near "k"
 UPDATE kv SET kv.k = 9
 
-statement error compound types not supported yet: "k.\*"
+statement error unimplemented at or near "*"
 UPDATE kv SET k.* = 9
 
-statement error compound types not supported yet: "k\.v"
+statement error unimplemented at or near "v"
 UPDATE kv SET k.v = 9
 
 statement ok
@@ -66,7 +66,7 @@ SELECT * FROM kview
 5 11
 7 15
 
-statement error cannot run UPDATE on view "kview" - views are not updateable
+statement error "kview" is not a table
 UPDATE kview SET v = 99 WHERE k IN (1, 3)
 
 query II rowsort

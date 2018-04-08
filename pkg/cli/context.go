@@ -20,11 +20,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	isatty "github.com/mattn/go-isatty"
 )
 
@@ -35,8 +35,12 @@ var serverCfg = func() server.Config {
 	st := cluster.MakeClusterSettings(cluster.BinaryMinimumSupportedVersion, cluster.BinaryServerVersion)
 	settings.SetCanonicalValuesContainer(&st.SV)
 
-	return server.MakeConfig(context.Background(), st)
+	s := server.MakeConfig(context.Background(), st)
+	s.SQLAuditLogDirName = &sqlAuditLogDir
+	return s
 }()
+
+var sqlAuditLogDir log.DirName
 
 // GetServerCfgStores provides direct public access to the StoreSpecList inside
 // serverCfg. This is used by CCL code to populate some fields.
@@ -70,7 +74,7 @@ func initCLIDefaults() {
 	cliCtx.showTimes = false
 	cliCtx.cmdTimeout = 0 // no timeout
 	cliCtx.sqlConnURL = ""
-	cliCtx.sqlConnUser = security.RootUser
+	cliCtx.sqlConnUser = ""
 	cliCtx.sqlConnDBName = ""
 
 	sqlCtx.execStmts = nil

@@ -40,6 +40,7 @@ import (
 // the wire.
 type StatementType int
 
+//go:generate stringer -type=StatementType
 const (
 	// Ack indicates that the statement does not have a meaningful
 	// return. Examples include SET, BEGIN, COMMIT.
@@ -217,6 +218,16 @@ func (*CancelQuery) StatementType() StatementType { return Ack }
 // StatementTag returns a short string identifying the type of statement.
 func (*CancelQuery) StatementTag() string { return "CANCEL QUERY" }
 
+func (*CancelQuery) independentFromParallelizedPriors() {}
+
+// StatementType implements the Statement interface.
+func (*CancelSession) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CancelSession) StatementTag() string { return "CANCEL SESSION" }
+
+func (*CancelSession) independentFromParallelizedPriors() {}
+
 // StatementType implements the Statement interface.
 func (*CommitTransaction) StatementType() StatementType { return Ack }
 
@@ -230,6 +241,12 @@ func (*CopyFrom) StatementType() StatementType { return CopyIn }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CopyFrom) StatementTag() string { return "COPY" }
+
+// StatementType implements the Statement interface.
+func (*CreateChangefeed) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CreateChangefeed) StatementTag() string { return "CREATE CHANGEFEED" }
 
 // StatementType implements the Statement interface.
 func (*CreateDatabase) StatementType() StatementType { return DDL }
@@ -700,6 +717,15 @@ func (*ShowJobs) hiddenFromStats()                   {}
 func (*ShowJobs) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
+func (*ShowRoleGrants) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowRoleGrants) StatementTag() string { return "SHOW GRANTS ON ROLE" }
+
+func (*ShowRoleGrants) hiddenFromStats()                   {}
+func (*ShowRoleGrants) independentFromParallelizedPriors() {}
+
+// StatementType implements the Statement interface.
 func (*ShowSessions) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -805,6 +831,15 @@ func (*ShowTables) hiddenFromStats()                   {}
 func (*ShowTables) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
+func (*ShowSchemas) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSchemas) StatementTag() string { return "SHOW SCHEMAS" }
+
+func (*ShowSchemas) hiddenFromStats()                   {}
+func (*ShowSchemas) independentFromParallelizedPriors() {}
+
+// StatementType implements the Statement interface.
 func (*Split) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -849,8 +884,10 @@ func (n *Backup) String() string                    { return AsString(n) }
 func (n *BeginTransaction) String() string          { return AsString(n) }
 func (n *CancelJob) String() string                 { return AsString(n) }
 func (n *CancelQuery) String() string               { return AsString(n) }
+func (n *CancelSession) String() string             { return AsString(n) }
 func (n *CommitTransaction) String() string         { return AsString(n) }
 func (n *CopyFrom) String() string                  { return AsString(n) }
+func (n *CreateChangefeed) String() string          { return AsString(n) }
 func (n *CreateDatabase) String() string            { return AsString(n) }
 func (n *CreateIndex) String() string               { return AsString(n) }
 func (n *CreateRole) String() string                { return AsString(n) }
@@ -913,7 +950,9 @@ func (n *ShowIndex) String() string                 { return AsString(n) }
 func (n *ShowJobs) String() string                  { return AsString(n) }
 func (n *ShowQueries) String() string               { return AsString(n) }
 func (n *ShowRanges) String() string                { return AsString(n) }
+func (n *ShowRoleGrants) String() string            { return AsString(n) }
 func (n *ShowRoles) String() string                 { return AsString(n) }
+func (n *ShowSchemas) String() string               { return AsString(n) }
 func (n *ShowSessions) String() string              { return AsString(n) }
 func (n *ShowSyntax) String() string                { return AsString(n) }
 func (n *ShowTableStats) String() string            { return AsString(n) }

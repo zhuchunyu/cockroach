@@ -194,6 +194,10 @@ func (h *ProcOutputHelper) neededColumns() (colIdxs util.FastIntSet) {
 //
 // inputs are optional.
 //
+// pushTrailingMeta is called after draining the sources and before calling
+// dst.ProducerDone(). It gives the caller the opportunity to push some trailing
+// metadata (e.g. tracing information and txn updates, if applicable).
+//
 // Returns true if more rows are needed, false otherwise. If false is returned
 // both the inputs and the output have been properly closed.
 func emitHelper(
@@ -201,6 +205,7 @@ func emitHelper(
 	output *ProcOutputHelper,
 	row sqlbase.EncDatumRow,
 	meta *ProducerMetadata,
+	pushTrailingMeta func(context.Context),
 	inputs ...RowSource,
 ) bool {
 	if output.output == nil {
@@ -230,7 +235,7 @@ func emitHelper(
 		return true
 	case DrainRequested:
 		log.VEventf(ctx, 1, "no more rows required. drain requested.")
-		DrainAndClose(ctx, output.output, nil /* cause */, inputs...)
+		DrainAndClose(ctx, output.output, nil /* cause */, pushTrailingMeta, inputs...)
 		return false
 	case ConsumerClosed:
 		log.VEventf(ctx, 1, "no more rows required. Consumer shut down.")
@@ -383,6 +388,7 @@ func (pb *processorBase) init(
 	output RowReceiver,
 ) error {
 	pb.flowCtx = flowCtx
+	pb.ctx = pb.flowCtx.Ctx
 	if evalCtx == nil {
 		evalCtx = flowCtx.NewEvalCtx()
 	}
@@ -420,8 +426,12 @@ func (pb *processorBase) internalClose() bool {
 	closing := !pb.closed
 	if closing {
 		pb.closed = true
+		pb.started = true // a closed processor has definitely started
 		tracing.FinishSpan(pb.span)
 		pb.span = nil
+		// Reset the context so that any incidental uses after this point do not
+		// access the finished span.
+		pb.ctx = pb.flowCtx.Ctx
 	}
 	// This prevents Next() from returning more rows.
 	pb.out.consumerClosed()
@@ -453,28 +463,6 @@ func (rb *rowSourceBase) consumerClosed(name string) {
 	atomic.StoreUint32((*uint32)(&rb.consumerStatus), uint32(ConsumerClosed))
 }
 
-// noopProcessor is a processor that simply passes rows through from the
-// synchronizer to the post-processing stage. It can be useful for its
-// post-processing or in the last stage of a computation, where we may only
-// need the synchronizer to join streams.
-type noopProcessor struct {
-	processorBase
-	input RowSource
-}
-
-var _ Processor = &noopProcessor{}
-var _ RowSource = &noopProcessor{}
-
-func newNoopProcessor(
-	flowCtx *FlowCtx, input RowSource, post *PostProcessSpec, output RowReceiver,
-) (*noopProcessor, error) {
-	n := &noopProcessor{input: input}
-	if err := n.init(post, input.OutputTypes(), flowCtx, nil /* evalCtx */, output); err != nil {
-		return nil, err
-	}
-	return n, nil
-}
-
 // processorSpan creates a child span for a processor (if we are doing any
 // tracing). The returned span needs to be finished using tracing.FinishSpan.
 func processorSpan(ctx context.Context, name string) (context.Context, opentracing.Span) {
@@ -484,83 +472,6 @@ func processorSpan(ctx context.Context, name string) (context.Context, opentraci
 	}
 	newSpan := tracing.StartChildSpan(name, parentSp, true /* separateRecording */)
 	return opentracing.ContextWithSpan(ctx, newSpan), newSpan
-}
-
-// Run is part of the processor interface.
-func (n *noopProcessor) Run(wg *sync.WaitGroup) {
-	if n.out.output == nil {
-		panic("noopProcessor output not initialized for emitting rows")
-	}
-	Run(n.flowCtx.Ctx, n, n.out.output)
-	if wg != nil {
-		wg.Done()
-	}
-}
-
-func (n *noopProcessor) close() {
-	if n.internalClose() {
-		n.input.ConsumerClosed()
-	}
-}
-
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (n *noopProcessor) producerMeta(err error) *ProducerMetadata {
-	var meta *ProducerMetadata
-	if !n.closed {
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-		} else if trace := getTraceData(n.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		// We need to close as soon as we send producer metadata as we're done
-		// sending rows. The consumer is allowed to not call ConsumerDone().
-		n.close()
-	}
-	return meta
-}
-
-// Next is part of the RowSource interface.
-func (n *noopProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	n.maybeStart("noop", "" /* logTag */)
-
-	for {
-		row, meta := n.input.Next()
-		if n.closed || meta != nil {
-			return nil, meta
-		}
-		if row == nil {
-			return nil, n.producerMeta(nil /* err */)
-		}
-
-		outRow, status, err := n.out.ProcessRow(n.ctx, row)
-		if err != nil {
-			return nil, n.producerMeta(err)
-		}
-		switch status {
-		case NeedMoreRows:
-			if outRow == nil && err == nil {
-				continue
-			}
-		case DrainRequested:
-			n.input.ConsumerDone()
-			continue
-		}
-		return outRow, nil
-	}
-}
-
-// ConsumerDone is part of the RowSource interface.
-func (n *noopProcessor) ConsumerDone() {
-	n.input.ConsumerDone()
-}
-
-// ConsumerClosed is part of the RowSource interface.
-func (n *noopProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	n.close()
 }
 
 func newProcessor(
@@ -648,12 +559,6 @@ func newProcessor(
 			return newColumnBackfiller(flowCtx, *core.Backfiller, post, outputs[0])
 		}
 	}
-	if core.SetOp != nil {
-		if err := checkNumInOut(inputs, outputs, 2, 1); err != nil {
-			return nil, err
-		}
-		return newAlgebraicSetOp(flowCtx, core.SetOp, inputs[0], inputs[1], post, outputs[0])
-	}
 	if core.Sampler != nil {
 		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
 			return nil, err
@@ -683,6 +588,20 @@ func newProcessor(
 			return nil, errors.New("SSTWriter processor unimplemented")
 		}
 		return NewSSTWriterProcessor(flowCtx, *core.SSTWriter, inputs[0], outputs[0])
+	}
+	if core.MetadataTestSender != nil {
+		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+			return nil, err
+		}
+		return newMetadataTestSender(flowCtx, inputs[0], post, outputs[0], core.MetadataTestSender.ID)
+	}
+	if core.MetadataTestReceiver != nil {
+		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+			return nil, err
+		}
+		return newMetadataTestReceiver(
+			flowCtx, inputs[0], post, outputs[0], core.MetadataTestReceiver.SenderIDs,
+		)
 	}
 	return nil, errors.Errorf("unsupported processor core %s", core)
 }

@@ -506,9 +506,7 @@ func TestGCQueueProcess(t *testing.T) {
 		ctx := context.Background()
 		now := tc.Clock().Now()
 		return RunGC(ctx, desc, snap, now, zone.GC,
-			func(ctx context.Context, gcKeys [][]roachpb.GCRequest_GCKey, info *GCInfo) error {
-				return nil
-			},
+			NoopGCer{},
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
 			},
@@ -786,7 +784,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.UUID{})
 	var count int
 	if _, err := engine.MVCCIterate(context.Background(), tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
-		true, nil, false, func(roachpb.KeyValue) (bool, error) {
+		true, false, nil, false, func(roachpb.KeyValue) (bool, error) {
 			count++
 			return false, nil
 		}); err != nil {

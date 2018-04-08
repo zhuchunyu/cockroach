@@ -22,7 +22,6 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -31,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // Job manages logging the progress of long-running system processes, like
@@ -62,6 +60,7 @@ type Details interface{}
 var _ Details = BackupDetails{}
 var _ Details = RestoreDetails{}
 var _ Details = SchemaChangeDetails{}
+var _ Details = ChangefeedDetails{}
 
 // Record stores the job fields that are not automatically managed by Job.
 type Record struct {
@@ -108,11 +107,6 @@ type InvalidStatusError struct {
 
 func (e *InvalidStatusError) Error() string {
 	return fmt.Sprintf("cannot %s %s job (id %d)", e.op, e.status, e.id)
-}
-
-// Status returns the errors status.
-func (e InvalidStatusError) Status() Status {
-	return e.status
 }
 
 // ID returns the ID of the job that this Job is currently tracking. This will
@@ -319,21 +313,6 @@ func (j *Job) WithTxn(txn *client.Txn) *Job {
 	return j
 }
 
-// DB returns the *client.DB associated with this job.
-func (j *Job) DB() *client.DB {
-	return j.registry.db
-}
-
-// Gossip returns the *gossip.Gossip associated with this job.
-func (j *Job) Gossip() *gossip.Gossip {
-	return j.registry.gossip
-}
-
-// ClusterID returns the uuid.UUID cluster ID associated with this job.
-func (j *Job) ClusterID() uuid.UUID {
-	return j.registry.clusterID()
-}
-
 func (j *Job) runInTxn(ctx context.Context, fn func(context.Context, *client.Txn) error) error {
 	if j.txn != nil {
 		defer func() { j.txn = nil }()
@@ -383,7 +362,13 @@ func (j *Job) insert(ctx context.Context, id int64, payload *Payload) error {
 	}
 
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		payload.ModifiedMicros = timeutil.ToUnixMicros(txn.Proto().OrigTimestamp.GoTime())
+		// Note: although the following uses OrigTimestamp and
+		// OrigTimestamp can diverge from the value of now() throughout a
+		// transaction, this may be OK -- we merely required ModifiedMicro
+		// to be equal *or greater* than previously inserted timestamps
+		// computed by now(). For now OrigTimestamp can only move forward
+		// and the assertion OrigTimestamp >= now() holds at all times.
+		payload.ModifiedMicros = timeutil.ToUnixMicros(txn.OrigTimestamp().GoTime())
 		payloadBytes, err := protoutil.Marshal(payload)
 		if err != nil {
 			return err
@@ -492,6 +477,8 @@ func detailsType(d isPayload_Details) Type {
 		return TypeSchemaChange
 	case *Payload_Import:
 		return TypeImport
+	case *Payload_Changefeed:
+		return TypeChangefeed
 	default:
 		panic(fmt.Sprintf("Payload.Type called on a payload with an unknown details type: %T", d))
 	}
@@ -514,6 +501,8 @@ func WrapPayloadDetails(details Details) interface {
 		return &Payload_SchemaChange{SchemaChange: &d}
 	case ImportDetails:
 		return &Payload_Import{Import: &d}
+	case ChangefeedDetails:
+		return &Payload_Changefeed{Changefeed: &d}
 	default:
 		panic(fmt.Sprintf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
@@ -535,6 +524,8 @@ func (p *Payload) UnwrapDetails() (Details, error) {
 		return *d.SchemaChange, nil
 	case *Payload_Import:
 		return *d.Import, nil
+	case *Payload_Changefeed:
+		return *d.Changefeed, nil
 	default:
 		return nil, errors.Errorf("jobs.Payload: unsupported details type %T", d)
 	}
@@ -679,11 +670,16 @@ func (d ImportDetails_Table) Completed() float32 {
 	}
 	sampling := sum(d.SamplingProgress) * samplingPhaseContribution
 	if len(d.SamplingProgress) == 0 {
-		// SamplingProgress in empty iff we are in the second phase. If so, the
+		// SamplingProgress is empty iff we are in the second phase. If so, the
 		// first phase is implied as fully complete.
 		sampling = samplingPhaseContribution
 	}
 	read := sum(d.ReadProgress) * readStageContribution
 	write := sum(d.WriteProgress) * writeStageContribution
-	return sampling + read + write
+	completed := sampling + read + write
+	// Float addition can round such that the sum is > 1.
+	if completed > 1 {
+		completed = 1
+	}
+	return completed
 }

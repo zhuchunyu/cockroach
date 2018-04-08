@@ -59,43 +59,32 @@ func (r ReplicaID) String() string {
 	return strconv.FormatInt(int64(r), 10)
 }
 
-// IsSubset returns whether attributes list a is a subset of
-// attributes list b.
-func (a Attributes) IsSubset(b Attributes) bool {
-	m := map[string]struct{}{}
-	for _, s := range b.Attrs {
-		m[s] = struct{}{}
+// Equals returns whether the Attributes lists are equivalent. Attributes lists
+// are treated as sets, meaning that ordering and duplicates are ignored.
+func (a Attributes) Equals(b Attributes) bool {
+	// This is O(n^2), but Attribute lists should never be long enough for that
+	// to matter, and allocating memory every time this is called would be worse.
+	if len(a.Attrs) != len(b.Attrs) {
+		return false
 	}
-	for _, s := range a.Attrs {
-		if _, ok := m[s]; !ok {
+	for _, aAttr := range a.Attrs {
+		var found bool
+		for _, bAttr := range b.Attrs {
+			if aAttr == bAttr {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}
 	return true
 }
 
-func (a Attributes) uniqueAttrs() []string {
-	var attrs []string
-	m := map[string]struct{}{}
-	for _, s := range a.Attrs {
-		if _, ok := m[s]; !ok {
-			m[s] = struct{}{}
-			attrs = append(attrs, s)
-		}
-	}
-	return attrs
-}
-
+// String implements the fmt.Stringer interface.
 func (a Attributes) String() string {
-	return strings.Join(a.uniqueAttrs(), ",")
-}
-
-// SortedString returns a sorted, de-duplicated, comma-separated list
-// of the attributes.
-func (a Attributes) SortedString() string {
-	attrs := a.uniqueAttrs()
-	sort.Strings(attrs)
-	return strings.Join(attrs, ",")
+	return strings.Join(a.Attrs, ",")
 }
 
 // RSpan returns the RangeDescriptor's resolved span.
@@ -321,6 +310,22 @@ func (l Locality) String() string {
 // value interface.
 func (Locality) Type() string {
 	return "Locality"
+}
+
+// Equals returns whether the two Localities are equivalent.
+//
+// Because Locality Tiers are hierarchically ordered, if two Localities contain
+// the same Tiers in different orders, they are not considered equal.
+func (l Locality) Equals(r Locality) bool {
+	if len(l.Tiers) != len(r.Tiers) {
+		return false
+	}
+	for i := range l.Tiers {
+		if l.Tiers[i] != r.Tiers[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // MaxDiversityScore is the largest possible diversity score, indicating that

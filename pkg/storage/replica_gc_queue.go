@@ -45,15 +45,15 @@ const (
 
 // Priorities for the replica GC queue.
 const (
-	replicaGCPriorityDefault float64 = 0
+	replicaGCPriorityDefault = 0.0
 
 	// Replicas that have been removed from the range spend a lot of
 	// time in the candidate state, so treat them as higher priority.
-	replicaGCPriorityCandidate = 1
+	replicaGCPriorityCandidate = 1.0
 
 	// The highest priority is used when we have definite evidence
 	// (external to replicaGCQueue) that the replica has been removed.
-	replicaGCPriorityRemoved = 2
+	replicaGCPriorityRemoved = 2.0
 )
 
 var (
@@ -135,7 +135,8 @@ func (rgcq *replicaGCQueue) shouldQueue(
 
 	var isCandidate bool
 	if raftStatus := repl.RaftStatus(); raftStatus != nil {
-		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate)
+		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate ||
+			raftStatus.SoftState.RaftState == raft.StatePreCandidate)
 	} else {
 		// If a replica doesn't have an active raft group, we should check whether
 		// we're decommissioning. If so, we should process the replica because it

@@ -91,9 +91,9 @@ const (
 	PushTxn
 	// QueryTxn fetches the current state of the designated transaction.
 	QueryTxn
-	// RangeLookup looks up range descriptors, containing the
+	// DeprecatedRangeLookup looks up range descriptors, containing the
 	// locations of replicas for the range containing the specified key.
-	RangeLookup
+	DeprecatedRangeLookup
 	// ResolveIntent resolves existing write intents for a key.
 	ResolveIntent
 	// ResolveIntentRange resolves existing write intents for a key range.
@@ -140,4 +140,12 @@ const (
 	AddSSTable
 	// RecomputeStats applies a delta to a Range's MVCCStats to fix computational errors.
 	RecomputeStats
+	// Refresh verifies no writes to a key have occurred since the
+	// transaction orig timestamp and sets a new entry in the timestamp
+	// cache at the current transaction timestamp.
+	Refresh
+	// RefreshRange verifies no writes have occurred to a span of keys
+	// since the transaction orig timestamp and sets a new span in the
+	// timestamp cache at the current transaction timestamp.
+	RefreshRange
 )

@@ -73,15 +73,18 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		}
 	}
 
-	if n.zoneSpecifier.TargetsIndex() {
-		_, err := params.p.expandIndexName(params.ctx, &n.zoneSpecifier.TableOrIndex, true /* requireTable */)
-		if err != nil {
-			return err
-		}
+	var table *TableDescriptor
+	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+	// TODO(vivek): check if the cache can be used.
+	params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		table, err = params.p.resolveTableForZone(params.ctx, &n.zoneSpecifier)
+	})
+	if err != nil {
+		return err
 	}
 
 	targetID, err := resolveZone(
-		params.ctx, params.p.txn, &n.zoneSpecifier, params.SessionData().Database)
+		params.ctx, params.p.txn, &n.zoneSpecifier)
 	if err != nil {
 		return err
 	}
@@ -94,8 +97,8 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			"cannot remove default zone")
 	}
 
-	table, index, partition, err := resolveSubzone(params.ctx, params.p.txn,
-		&n.zoneSpecifier, targetID)
+	index, partition, err := resolveSubzone(params.ctx, params.p.txn,
+		&n.zoneSpecifier, targetID, table)
 	if err != nil {
 		return err
 	}
@@ -151,8 +154,9 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		}
 	}
 
+	hasNewSubzones := yamlConfig != nil && index != nil
 	n.run.numAffected, err = writeZoneConfig(params.ctx, params.p.txn,
-		targetID, table, zone, params.extendedEvalCtx.ExecCfg)
+		targetID, table, zone, params.extendedEvalCtx.ExecCfg, hasNewSubzones)
 	return err
 }
 
@@ -169,14 +173,31 @@ func writeZoneConfig(
 	table *sqlbase.TableDescriptor,
 	zone config.ZoneConfig,
 	execCfg *ExecutorConfig,
+	hasNewSubzones bool,
 ) (numAffected int, err error) {
 	if len(zone.Subzones) > 0 {
-		if !execCfg.Settings.Version.IsMinSupported(cluster.VersionPartitioning) {
+		st := execCfg.Settings
+		if !st.Version.IsMinSupported(cluster.VersionPartitioning) {
 			return 0, errors.New("cluster version does not support zone configs on indexes or partitions")
 		}
-		zone.SubzoneSpans, err = GenerateSubzoneSpans(table, zone.Subzones)
+		zone.SubzoneSpans, err = GenerateSubzoneSpans(
+			st, execCfg.ClusterID(), table, zone.Subzones, hasNewSubzones)
 		if err != nil {
 			return 0, err
+		}
+	}
+	if len(zone.Constraints) > 1 || (len(zone.Constraints) == 1 && zone.Constraints[0].NumReplicas != 0) {
+		st := execCfg.Settings
+		if !st.Version.IsMinSupported(cluster.VersionPerReplicaZoneConstraints) {
+			return 0, errors.New(
+				"cluster version does not support zone configs with per-replica constraints")
+		}
+	}
+	if len(zone.LeasePreferences) > 0 {
+		st := execCfg.Settings
+		if !st.Version.IsMinSupported(cluster.VersionLeasePreferences) {
+			return 0, errors.New(
+				"cluster version does not support zone configs with lease placement preferences")
 		}
 	}
 

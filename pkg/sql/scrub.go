@@ -101,17 +101,14 @@ type scrubRun struct {
 func (n *scrubNode) startExec(params runParams) error {
 	switch n.n.Typ {
 	case tree.ScrubTable:
-		tableName, err := n.n.Table.NormalizeWithDatabaseName(params.SessionData().Database)
+		tableName, err := n.n.Table.Normalize()
 		if err != nil {
-			return err
-		}
-		if err := tableName.QualifyWithDatabase(params.SessionData().Database); err != nil {
 			return err
 		}
 		// If the tableName provided refers to a view and error will be
 		// returned here.
-		tableDesc, err := MustGetTableDesc(params.ctx, params.p.txn, params.p.getVirtualTabler(),
-			tableName, false /* allowAdding */)
+		tableDesc, err := ResolveExistingObject(
+			params.ctx, params.p, tableName, true /*required*/, requireTableDesc)
 		if err != nil {
 			return err
 		}
@@ -174,27 +171,24 @@ func (n *scrubNode) Close(ctx context.Context) {
 func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tree.Name) error {
 	// Check that the database exists.
 	database := string(*name)
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), database)
+	dbDesc, err := ResolveDatabase(ctx, p, database, true /*required*/)
 	if err != nil {
 		return err
 	}
-	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc, false)
+	tbNames, err := GetObjectNames(ctx, p, dbDesc, tree.PublicSchema, true /*explicitPrefix*/)
 	if err != nil {
 		return err
 	}
 
 	for i := range tbNames {
 		tableName := &tbNames[i]
-		if err := tableName.QualifyWithDatabase(database); err != nil {
-			return err
-		}
-		tableDesc, err := MustGetTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), tableName,
-			false /* allowAdding */)
+		tableDesc, _, err := p.LogicalSchemaAccessor().GetObjectDesc(
+			tableName, p.ObjectLookupFlags(ctx, true /*required*/))
 		if err != nil {
 			return err
 		}
-		// Skip views and don't throw an error if we encounter one.
-		if tableDesc.IsView() {
+		// Skip non-tables and don't throw an error if we encounter one.
+		if !tableDesc.IsTable() {
 			continue
 		}
 		if err := n.startScrubTable(ctx, p, tableDesc, tableName); err != nil {
@@ -554,10 +548,11 @@ func scrubRunDistSQL(
 ) (*sqlbase.RowContainer, error) {
 	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
 	rows := sqlbase.NewRowContainer(*p.extendedEvalCtx.ActiveMemAcc, ci, 0 /* rowCapacity */)
-	rowResultWriter := NewRowResultWriter(tree.Rows, rows)
+	rowResultWriter := NewRowResultWriter(rows)
 	recv := makeDistSQLReceiver(
 		ctx,
 		rowResultWriter,
+		tree.Rows,
 		p.ExecCfg().RangeDescriptorCache,
 		p.ExecCfg().LeaseHolderCache,
 		p.txn,
@@ -566,10 +561,9 @@ func scrubRunDistSQL(
 		},
 	)
 
-	if err := p.extendedEvalCtx.DistSQLPlanner.Run(planCtx, p.txn, plan, recv, &p.extendedEvalCtx); err != nil {
-		return rows, err
-	} else if recv.err != nil {
-		return rows, recv.err
+	p.extendedEvalCtx.DistSQLPlanner.Run(planCtx, p.txn, plan, recv, &p.extendedEvalCtx)
+	if rowResultWriter.Err() != nil {
+		return rows, rowResultWriter.Err()
 	} else if rows.Len() == 0 {
 		rows.Close(ctx)
 		return nil, nil

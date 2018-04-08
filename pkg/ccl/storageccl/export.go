@@ -23,22 +23,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
 )
-
-// ExportRequestLimit is the number of Export requests that can run at once.
-// Each extracts data from RocksDB to a temp file and then uploads it to cloud
-// storage. In order to not exhaust the disk or memory, or saturate the network,
-// limit the number of these that can be run in parallel. This number was chosen
-// by a guess. If SST files are likely to not be over 200MB, then 5 parallel
-// workers hopefully won't use more than 1GB of space in the temp directory. It
-// could be improved by more measured heuristics.
-const ExportRequestLimit = 5
-
-var exportRequestLimiter = makeConcurrentRequestLimiter(ExportRequestLimit)
 
 func init() {
 	batcheval.RegisterCommand(roachpb.Export, declareKeysExport, evalExport)
@@ -106,25 +94,37 @@ func evalExport(
 	defer tracing.FinishSpan(span)
 
 	// If the startTime is zero, then we're doing a full backup and the gc
-	// threshold is irrelevant. Otherwise, make sure startTime is after the gc
-	// threshold. If it's not, the mvcc tombstones could have been deleted and
-	// the resulting RocksDB tombstones compacted, which means we'd miss
-	// deletions in the incremental backup.
+	// threshold is irrelevant for MVCC_Lastest backups. Otherwise, make sure
+	// startTime is after the gc threshold. If it's not, the mvcc tombstones could
+	// have been deleted and the resulting RocksDB tombstones compacted, which
+	// means we'd miss deletions in the incremental backup. For MVCC_All backups
+	// with no start time, they'll only be capturing the *revisions* since the
+	// gc threshold, so noting that in the reply allows the BACKUP to correctly
+	// note the supported time bounds for RESTORE AS OF SYSTEM TIME.
 	gcThreshold := cArgs.EvalCtx.GetGCThreshold()
-	if args.StartTime != (hlc.Timestamp{}) {
+	if !args.StartTime.IsEmpty() {
 		if !gcThreshold.Less(args.StartTime) {
 			return result.Result{}, errors.Errorf("start timestamp %v must be after replica GC threshold %v", args.StartTime, gcThreshold)
 		}
+	} else if args.MVCCFilter == roachpb.MVCCFilter_All {
+		reply.StartTime = gcThreshold
 	}
 
-	if err := exportRequestLimiter.beginLimitedRequest(ctx); err != nil {
+	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExports.Begin(ctx); err != nil {
 		return result.Result{}, err
 	}
-	defer exportRequestLimiter.endLimitedRequest()
-	log.Infof(ctx, "export [%s,%s)", args.Key, args.EndKey)
+	defer cArgs.EvalCtx.GetLimiters().ConcurrentExports.Finish()
+
+	makeExportStorage := !args.ReturnSST || (args.Storage != roachpb.ExportStorage{})
+	if makeExportStorage || log.V(1) {
+		log.Infof(ctx, "export [%s,%s)", args.Key, args.EndKey)
+	} else {
+		// Requests that don't write to export storage are expected to be small.
+		log.Eventf(ctx, "export [%s,%s)", args.Key, args.EndKey)
+	}
 
 	var exportStore ExportStorage
-	if !args.ReturnSST || (args.Storage != roachpb.ExportStorage{}) {
+	if makeExportStorage {
 		var err error
 		exportStore, err = MakeExportStorage(ctx, args.Storage, cArgs.EvalCtx.ClusterSettings())
 		if err != nil {
@@ -170,8 +170,13 @@ func evalExport(
 
 		// Skip tombstone (len=0) records when startTime is zero
 		// (non-incremental) and we're not exporting all versions.
-		if skipTombstones && (args.StartTime == hlc.Timestamp{}) && len(iter.UnsafeValue()) == 0 {
+		if skipTombstones && args.StartTime.IsEmpty() && len(iter.UnsafeValue()) == 0 {
 			iter.NextKey()
+			if ok, err := iter.Valid(); err != nil {
+				return result.Result{}, err
+			} else if !ok {
+				break
+			}
 			continue
 		}
 

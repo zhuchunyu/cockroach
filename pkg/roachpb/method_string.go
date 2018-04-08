@@ -2,15 +2,15 @@
 
 package roachpb
 
-import "fmt"
+import "strconv"
 
-const _Method_name = "GetPutConditionalPutIncrementDeleteDeleteRangeClearRangeScanReverseScanBeginTransactionEndTransactionAdminSplitAdminMergeAdminTransferLeaseAdminChangeReplicasHeartbeatTxnGCPushTxnQueryTxnRangeLookupResolveIntentResolveIntentRangeNoopMergeTruncateLogRequestLeaseTransferLeaseLeaseInfoComputeChecksumDeprecatedVerifyChecksumCheckConsistencyInitPutWriteBatchExportImportAdminScatterAddSSTableRecomputeStats"
+const _Method_name = "GetPutConditionalPutIncrementDeleteDeleteRangeClearRangeScanReverseScanBeginTransactionEndTransactionAdminSplitAdminMergeAdminTransferLeaseAdminChangeReplicasHeartbeatTxnGCPushTxnQueryTxnDeprecatedRangeLookupResolveIntentResolveIntentRangeNoopMergeTruncateLogRequestLeaseTransferLeaseLeaseInfoComputeChecksumDeprecatedVerifyChecksumCheckConsistencyInitPutWriteBatchExportImportAdminScatterAddSSTableRecomputeStatsRefreshRefreshRange"
 
-var _Method_index = [...]uint16{0, 3, 6, 20, 29, 35, 46, 56, 60, 71, 87, 101, 111, 121, 139, 158, 170, 172, 179, 187, 198, 211, 229, 233, 238, 249, 261, 274, 283, 298, 322, 338, 345, 355, 361, 367, 379, 389, 403}
+var _Method_index = [...]uint16{0, 3, 6, 20, 29, 35, 46, 56, 60, 71, 87, 101, 111, 121, 139, 158, 170, 172, 179, 187, 208, 221, 239, 243, 248, 259, 271, 284, 293, 308, 332, 348, 355, 365, 371, 377, 389, 399, 413, 420, 432}
 
 func (i Method) String() string {
 	if i < 0 || i >= Method(len(_Method_index)-1) {
-		return fmt.Sprintf("Method(%d)", i)
+		return "Method(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
 	return _Method_name[_Method_index[i]:_Method_index[i+1]]
 }

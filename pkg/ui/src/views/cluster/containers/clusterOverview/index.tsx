@@ -1,21 +1,21 @@
 import classNames from "classnames";
 import d3 from "d3";
 import React from "react";
+import { RouterState } from "react-router";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
 import { AdminUIState } from "src/redux/state";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { Bytes as formatBytes } from "src/util/format";
-import { NodesOverview } from "src/views/cluster/containers/nodesOverview";
 import createChartComponent from "src/views/shared/util/d3-react";
 import capacityChart from "./capacity";
-
-import "./cluster.styl";
 import spinner from "assets/spinner.gif";
+import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
+import "./cluster.styl";
 
 // tslint:disable-next-line:variable-name
-const CapacityChart = createChartComponent(capacityChart);
+const CapacityChart = createChartComponent("svg", capacityChart());
 
 interface CapacityUsageProps {
   usedCapacity: number;
@@ -29,25 +29,24 @@ function renderCapacityUsage(props: CapacityUsageProps) {
   const usedPercentage = usableCapacity !== 0 ? usedCapacity / usableCapacity : 0;
   return [
     <h3 className="capacity-usage cluster-summary__title">Capacity Usage</h3>,
-    <div className="capacity-usage cluster-summary__metric">{ formatPercentage(usedPercentage) }</div>,
+    <div className="capacity-usage cluster-summary__metric storage-percent">{ formatPercentage(usedPercentage) }</div>,
     <div className="capacity-usage cluster-summary__chart">
       <CapacityChart used={usedCapacity} usable={usableCapacity} />
     </div>,
-    <div className="capacity-usage cluster-summary__aside">
-      <span className="label">Current Usage</span>
-      <span className="value">{ formatBytes(usedCapacity) }</span>
-    </div>,
+    <div className="capacity-usage cluster-summary__label storage-used">Used<br />Capacity</div>,
+    <div className="capacity-usage cluster-summary__metric storage-used">{ formatBytes(usedCapacity) }</div>,
+    <div className="capacity-usage cluster-summary__label storage-usable">Usable<br />Capacity</div>,
+    <div className="capacity-usage cluster-summary__metric storage-usable">{ formatBytes(usableCapacity) }</div>,
   ];
 }
 
 const mapStateToCapacityUsageProps = createSelector(
   nodesSummarySelector,
   function (nodesSummary: NodesSummary) {
-    const { capacityAvailable, capacityUsed } = nodesSummary.nodeSums;
-    const usableCapacity = capacityAvailable + capacityUsed;
+    const { capacityUsed, capacityUsable } = nodesSummary.nodeSums;
     return {
       usedCapacity: capacityUsed,
-      usableCapacity: usableCapacity,
+      usableCapacity: capacityUsable,
     };
   },
 );
@@ -143,9 +142,24 @@ interface ClusterSummaryProps {
   nodeLiveness: NodeLivenessProps;
   replicationStatus: ReplicationStatusProps;
   loading: boolean;
+  refreshLiveness: typeof refreshLiveness;
+  refreshNodes: typeof refreshNodes;
 }
 
 class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
+  componentWillMount() {
+    this.refresh();
+  }
+
+  componentWillReceiveProps() {
+    this.refresh();
+  }
+
+  refresh() {
+    this.props.refreshLiveness();
+    this.props.refreshNodes();
+  }
+
   render() {
     const children = [];
 
@@ -163,7 +177,7 @@ class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
   }
 }
 
-function mapStateToClusterSummaryProps (state: AdminUIState) {
+function mapStateToClusterSummaryProps(state: AdminUIState) {
   return {
     capacityUsage: mapStateToCapacityUsageProps(state),
     nodeLiveness: mapStateToNodeLivenessProps(state),
@@ -172,24 +186,40 @@ function mapStateToClusterSummaryProps (state: AdminUIState) {
   };
 }
 
+const actions = {
+  refreshLiveness: refreshLiveness,
+  refreshNodes: refreshNodes,
+};
+
 // tslint:disable-next-line:variable-name
-const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps)(ClusterSummary);
+const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps, actions)(ClusterSummary);
 
 /**
  * Renders the main content of the cluster visualization page.
  */
-class ClusterOverview extends React.Component<{}, {}> {
+class ClusterOverview extends React.Component<RouterState, {}> {
   static title() {
     return "Cluster Overview";
   }
 
   render() {
     return (
-      <div>
+      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
         <section className="cluster-overview">
           <ClusterSummaryConnected />
         </section>
-        <NodesOverview />
+        <div style={{
+          flexGrow: 1,
+          position: "relative",
+          margin: "18px 24px",
+          border: "1px solid #EDEDED",
+          borderRadius: 3,
+          backgroundColor: "white",
+        }}>
+          <div style={{ position: "absolute", width: "100%", height: "100%" }}>
+            { this.props.children }
+          </div>
+        </div>
       </div>
     );
   }

@@ -20,7 +20,6 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
-	"unsafe"
 
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
@@ -828,6 +827,15 @@ func TestMVCCStatsDelDelGC(t *testing.T) {
 // an intent is rewritten to a lower timestamp. This formerly caused bugs
 // because when computing the stats updates, there was an implicit assumption
 // that the meta entries would always move forward in time.
+// UPDATE: since there should be no way for a txn to write older intents,
+//   mvccPutInternal now makes sure that writes are always done at the most
+//   recent intent timestamp within the same txn. Note that this case occurs
+//   when the txn timestamp is moved forward due to a write too old condition,
+//   which writes the first intent at a higher timestamp. We don't allow the
+//   second intent to then be written at a lower timestamp, because that breaks
+//   the contract that the intent is always the newest version.
+//   This test now merely verifies that even when we try to write an older
+//   version, we're upgraded to write the MVCCMetadata.Timestamp.
 func TestMVCCStatsPutIntentTimestampNotPutTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	engine := createTestEngine()
@@ -888,10 +896,9 @@ func TestMVCCStatsPutIntentTimestampNotPutTimestamp(t *testing.T) {
 	}
 
 	expAggMS := enginepb.MVCCStats{
-		// Surprise: the new intent actually lives at 1E9-1, and it's now
-		// 2E9+1, so it has accumulated an age of two. This formerly failed
-		// to register.
-		IntentAge: 2,
+		// Even though we tried to put a new intent at an older timestamp, it
+		// will have been written at 2E9+1, so the age will be 0.
+		IntentAge: 0,
 
 		LastUpdateNanos: 2E9 + 1,
 		LiveBytes:       mKeySize + m2ValSize + vKeySize + vValSize, // 2+46+12+10 = 70
@@ -1469,36 +1476,4 @@ func TestMVCCComputeStatsError(t *testing.T) {
 			}
 		})
 	}
-}
-
-// BenchmarkMVCCStats set MVCCStats values.
-func BenchmarkMVCCStats(b *testing.B) {
-	rocksdb := NewInMem(roachpb.Attributes{Attrs: []string{"ssd"}}, testCacheSize)
-	defer rocksdb.Close()
-
-	ms := enginepb.MVCCStats{
-		LiveBytes:       1,
-		KeyBytes:        1,
-		ValBytes:        1,
-		IntentBytes:     1,
-		LiveCount:       1,
-		KeyCount:        1,
-		ValCount:        1,
-		IntentCount:     1,
-		IntentAge:       1,
-		GCBytesAge:      1,
-		SysBytes:        1,
-		SysCount:        1,
-		LastUpdateNanos: 1,
-	}
-	b.SetBytes(int64(unsafe.Sizeof(ms)))
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		if err := MVCCSetRangeStats(context.Background(), rocksdb, 1, &ms); err != nil {
-			b.Fatal(err)
-		}
-	}
-
-	b.StopTimer()
 }

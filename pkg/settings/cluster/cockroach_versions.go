@@ -43,6 +43,13 @@ const (
 	VersionUnreplicatedTombstoneKey
 	VersionRecomputeStats
 	VersionNoRaftProposalKeys
+	VersionTxnSpanRefresh
+	VersionReadUncommittedRangeLookups
+	VersionPerReplicaZoneConstraints
+	VersionLeasePreferences
+	Version2_0
+	VersionImportSkipRecords
+	VersionProposedTSLeaseRequest
 
 	// Add new versions here (step one of two).
 
@@ -158,6 +165,41 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionNoRaftProposalKeys,
 		Version: roachpb.Version{Major: 1, Minor: 1, Unstable: 11},
 	},
+	{
+		// VersionTxnSpanRefresh is https://github.com/cockroachdb/cockroach/pull/21140.
+		Key:     VersionTxnSpanRefresh,
+		Version: roachpb.Version{Major: 1, Minor: 1, Unstable: 12},
+	},
+	{
+		// VersionReadUncommittedRangeLookups is https://github.com/cockroachdb/cockroach/pull/21276.
+		Key:     VersionReadUncommittedRangeLookups,
+		Version: roachpb.Version{Major: 1, Minor: 1, Unstable: 13},
+	},
+	{
+		// VersionPerReplicaZoneConstraints is https://github.com/cockroachdb/cockroach/pull/22819.
+		Key:     VersionPerReplicaZoneConstraints,
+		Version: roachpb.Version{Major: 1, Minor: 1, Unstable: 14},
+	},
+	{
+		// VersionLeasePreferences is https://github.com/cockroachdb/cockroach/pull/23202.
+		Key:     VersionLeasePreferences,
+		Version: roachpb.Version{Major: 1, Minor: 1, Unstable: 15},
+	},
+	{
+		// Version2_0 is CockroachDB v2.0. It's used for all v2.0.x patch releases.
+		Key:     Version2_0,
+		Version: roachpb.Version{Major: 2, Minor: 0},
+	},
+	{
+		// VersionImportSkipRecords is https://github.com/cockroachdb/cockroach/pull/23466
+		Key:     VersionImportSkipRecords,
+		Version: roachpb.Version{Major: 2, Minor: 0, Unstable: 1},
+	},
+	{
+		// VersionProposedTSLeaseRequest is https://github.com/cockroachdb/cockroach/pull/23466
+		Key:     VersionProposedTSLeaseRequest,
+		Version: roachpb.Version{Major: 2, Minor: 0, Unstable: 2},
+	},
 
 	// Add new versions here (step two of two).
 
@@ -168,7 +210,7 @@ var (
 	// this binary. If this binary is started using a store marked with an older
 	// version than BinaryMinimumSupportedVersion, then the binary will exit with
 	// an error.
-	BinaryMinimumSupportedVersion = VersionByKey(VersionBase)
+	BinaryMinimumSupportedVersion = VersionByKey(Version1_1)
 
 	// BinaryServerVersion is the version of this binary.
 	//

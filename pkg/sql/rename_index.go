@@ -18,25 +18,26 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
 )
 
-var errEmptyIndexName = errors.New("empty index name")
+var errEmptyIndexName = pgerror.NewError(pgerror.CodeSyntaxError, "empty index name")
 
 // RenameIndex renames the index.
 // Privileges: CREATE on table.
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNode, error) {
-	tn, err := p.expandIndexName(ctx, n.Index, true /* requireTable */)
-	if err != nil {
-		return nil, err
-	}
-
-	tableDesc, err := MustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
+	var tableDesc *TableDescriptor
+	var err error
+	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+	// TODO(vivek): check if the cache can be used.
+	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		_, tableDesc, err = expandIndexName(ctx, p, n.Index, true /* requireTable */)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +46,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 	if err != nil {
 		if n.IfExists {
 			// Noop.
-			return &zeroNode{}, nil
+			return newZeroNode(nil /* columns */), nil
 		}
 		// Index does not exist, but we want it to: error out.
 		return nil, err
@@ -69,7 +70,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 
 	if n.Index.Index == n.NewName {
 		// Noop.
-		return &zeroNode{}, nil
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	if _, _, err := tableDesc.FindIndexByName(string(n.NewName)); err == nil {
@@ -82,12 +83,20 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 		return nil, err
 	}
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	if err := tableDesc.Validate(ctx, p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
 		return nil, err
 	}
 	if err := p.txn.Put(ctx, descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
 		return nil, err
 	}
+
+	// TODO(vivek): the code above really should really be replaced by a call
+	// to writeTableDesc(). However if we do that then a couple of logic tests
+	// start failing. How can that be?
+	//
+	// if err := p.writeTableDesc(ctx, tableDesc); err != nil {
+	//	return nil, err
+	// }
 	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
-	return &zeroNode{}, nil
+	return newZeroNode(nil /* columns */), nil
 }

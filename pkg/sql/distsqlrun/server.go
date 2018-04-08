@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -73,7 +74,7 @@ type DistSQLVersion uint32
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version DistSQLVersion = 8
+const Version DistSQLVersion = 11
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
@@ -174,6 +175,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) *ServerImpl {
 			cfg.Metrics.MaxBytesHist,
 			-1, /* increment: use default block size */
 			noteworthyMemoryUsageBytes,
+			cfg.Settings,
 		),
 	}
 	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
@@ -297,13 +299,17 @@ func (ds *ServerImpl) setupFlow(
 		ds.Metrics.MaxBytesHist,
 		-1, /* use default block size */
 		noteworthyMemoryUsageBytes,
+		ds.Settings,
 	)
 	monitor.Start(ctx, &ds.memMonitor, mon.BoundAccount{})
 	acc := monitor.MakeBoundAccount()
 
-	// The flow will run in a Txn that specifies child=true because we
-	// do not want each distributed Txn to heartbeat the transaction.
-	txn := client.NewTxnWithProto(ds.FlowDB, req.Flow.Gateway, client.LeafTxn, req.Txn)
+	var txn *client.Txn
+	if req.Txn != nil {
+		// The flow will run in a Txn that specifies child=true because we
+		// do not want each distributed Txn to heartbeat the transaction.
+		txn = client.NewTxnWithProto(ds.FlowDB, req.Flow.Gateway, client.LeafTxn, *req.Txn)
+	}
 
 	location, err := timeutil.TimeZoneStringToLocation(req.EvalContext.Location)
 	if err != nil {
@@ -327,10 +333,20 @@ func (ds *ServerImpl) setupFlow(
 		// own context.
 		CtxProvider: simpleCtxProvider{ctx: ctx},
 		Txn:         txn,
+		Planner:     &dummyEvalPlanner{},
+		Sequence:    &dummySequenceOperators{},
 	}
 	evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 	evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
-	evalCtx.SetClusterTimestamp(req.EvalContext.ClusterTimestamp)
+	evalCtx.SessionData.SequenceState = sessiondata.NewSequenceState()
+	var haveSequences bool
+	for _, seq := range req.EvalContext.SeqState.Seqs {
+		evalCtx.SessionData.SequenceState.RecordValue(seq.SeqID, seq.LatestVal)
+	}
+	if haveSequences {
+		evalCtx.SessionData.SequenceState.SetLastSequenceIncremented(
+			*req.EvalContext.SeqState.LastSeqIncremented)
+	}
 
 	// TODO(radu): we should sanity check some of these fields (especially
 	// txnProto).
@@ -497,7 +513,100 @@ type TestingKnobs struct {
 	// running flows to complete or give a grace period of minFlowDrainWait
 	// to incoming flows to register.
 	DrainFast bool
+
+	// MetadataTestLevel controls whether or not additional metadata test
+	// processors are planned, which send additional "RowNum" metadata that is
+	// checked by a test receiver on the gateway.
+	MetadataTestLevel MetadataTestLevel
 }
+
+// MetadataTestLevel represents the types of queries where metadata test
+// processors are planned.
+type MetadataTestLevel int
+
+const (
+	// Off represents that no metadata test processors are planned.
+	Off MetadataTestLevel = iota
+	// NoExplain represents that metadata test processors are planned for all
+	// queries except EXPLAIN (DISTSQL) statements.
+	NoExplain
+	// On represents that metadata test processors are planned for all queries.
+	On
+)
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*TestingKnobs) ModuleTestingKnobs() {}
+
+var errEvalPlanner = errors.New("cannot backfill such evaluated expression")
+
+// Implements the tree.EvalPlanner interface by returning errors.
+type dummyEvalPlanner struct {
+}
+
+// Implements the tree.EvalPlanner interface.
+func (ep *dummyEvalPlanner) QueryRow(
+	ctx context.Context, sql string, args ...interface{},
+) (tree.Datums, error) {
+	return nil, errEvalPlanner
+}
+
+// Implements the tree.EvalDatabase interface.
+func (ep *dummyEvalPlanner) ParseQualifiedTableName(
+	ctx context.Context, sql string,
+) (*tree.TableName, error) {
+	return nil, errEvalPlanner
+}
+
+// Implements the tree.EvalDatabase interface.
+func (ep *dummyEvalPlanner) ResolveTableName(ctx context.Context, tn *tree.TableName) error {
+	return errEvalPlanner
+}
+
+// Implements the tree.EvalPlanner interface.
+func (ep *dummyEvalPlanner) ParseType(sql string) (coltypes.CastTargetType, error) {
+	return nil, errEvalPlanner
+}
+
+// Implements the tree.EvalPlanner interface.
+func (ep *dummyEvalPlanner) EvalSubquery(expr *tree.Subquery) (tree.Datum, error) {
+	return nil, errEvalPlanner
+}
+
+var errSequenceOperators = errors.New("cannot backfill such sequence operation")
+
+// Implements the tree.SequenceOperators interface by returning errors.
+type dummySequenceOperators struct {
+}
+
+// Implements the tree.EvalDatabase interface.
+func (so *dummySequenceOperators) ParseQualifiedTableName(
+	ctx context.Context, sql string,
+) (*tree.TableName, error) {
+	return nil, errSequenceOperators
+}
+
+// Implements the tree.EvalDatabase interface.
+func (so *dummySequenceOperators) ResolveTableName(ctx context.Context, tn *tree.TableName) error {
+	return errEvalPlanner
+}
+
+// Implements the tree.SequenceOperators interface.
+func (so *dummySequenceOperators) IncrementSequence(
+	ctx context.Context, seqName *tree.TableName,
+) (int64, error) {
+	return 0, errSequenceOperators
+}
+
+// Implements the tree.SequenceOperators interface.
+func (so *dummySequenceOperators) GetLatestValueInSessionForSequence(
+	ctx context.Context, seqName *tree.TableName,
+) (int64, error) {
+	return 0, errSequenceOperators
+}
+
+// Implements the tree.SequenceOperators interface.
+func (so *dummySequenceOperators) SetSequenceValue(
+	ctx context.Context, seqName *tree.TableName, newVal int64, isCalled bool,
+) error {
+	return errSequenceOperators
+}

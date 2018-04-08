@@ -109,7 +109,7 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 		}
 	}
 
-	joinType := distsqlJoinType(n.joinType)
+	joinType := n.joinType
 
 	post, joinToStreamColMap := joinOutColumns(n, plans[0], plans[1])
 	onExpr := remapOnExpr(planCtx.EvalContext(), n, plans[0], plans[1])
@@ -295,6 +295,31 @@ func remapOnExpr(
 	return distsqlplan.MakeExpression(n.pred.onCond, evalCtx, joinColMap)
 }
 
+// shiftExprCols remaps expression columns when merging rows in a join. It takes
+// expression columns for the right side of a join, and remaps the indices so
+// that they refer to indices in the merged row.
+func shiftExprCols(
+	evalCtx *tree.EvalContext, expr tree.TypedExpr, rightStreamToPlan, leftStreamToPlan []int,
+) distsqlrun.Expression {
+	offset := 0
+	for _, val := range leftStreamToPlan {
+		if val >= 0 {
+			offset++
+		}
+	}
+	shiftMap := make([]int, len(rightStreamToPlan))
+	idx := 0
+	for i := 0; i < len(rightStreamToPlan); i++ {
+		if rightStreamToPlan[i] >= 0 {
+			shiftMap[i] = idx + offset
+			idx++
+		} else {
+			shiftMap[i] = -1
+		}
+	}
+	return distsqlplan.MakeExpression(expr, evalCtx, shiftMap)
+}
+
 // eqCols produces a slice of ordinal references for the plan columns specified
 // in eqIndices using planToColMap.
 // That is: eqIndices contains a slice of plan column indexes and planToColMap
@@ -429,7 +454,7 @@ func useInterleavedJoin(n *joinNode) bool {
 //        Join on PK1 (this is a prefix of the parent PKs).
 //        For child key /5/6/#/42, the maximal join prefix is /5
 //
-//  3. Subest joins:
+//  3. Subset joins:
 //        Parent table (PK1, PK2, PK3)
 //        Child table (PK1, PK2, PK3, PK4)
 //        Join on PK1, PK3
@@ -502,9 +527,23 @@ func maximalJoinPrefix(
 		if len(key) == 0 {
 			break
 		}
+		// Note: this key might have been edited with PrefixEnd. This can cause
+		// problems for certain datatypes, like strings, which have a sentinel byte
+		// sequence indicating the end of the type. In that case, PeekLength will
+		// fail. If that happens, we try to UndoPrefixEnd the key and check the
+		// length again.
+		// TODO(jordan): this function should be aware of whether a key has been
+		// PrefixEnd'd or not, and act accordingly.
 		valLen, err := encoding.PeekLength(key)
 		if err != nil {
-			return nil, false, err
+			key, ok := encoding.UndoPrefixEnd(key)
+			if !ok {
+				return nil, false, err
+			}
+			valLen, err = encoding.PeekLength(key)
+			if err != nil {
+				return nil, false, err
+			}
 		}
 		prefixLen += valLen
 		key = key[valLen:]
@@ -773,17 +812,40 @@ func joinSpans(n *joinNode, parentSpans []spanPartition) ([]spanPartition, error
 	return joinSpans, nil
 }
 
-func distsqlJoinType(joinType joinType) distsqlrun.JoinType {
-	switch joinType {
-	case joinTypeInner:
-		return distsqlrun.JoinType_INNER
-	case joinTypeLeftOuter:
-		return distsqlrun.JoinType_LEFT_OUTER
-	case joinTypeRightOuter:
-		return distsqlrun.JoinType_RIGHT_OUTER
-	case joinTypeFullOuter:
-		return distsqlrun.JoinType_FULL_OUTER
+func distsqlSetOpJoinType(setOpType tree.UnionType) sqlbase.JoinType {
+	switch setOpType {
+	case tree.ExceptOp:
+		return sqlbase.ExceptAllJoin
+	case tree.IntersectOp:
+		return sqlbase.IntersectAllJoin
+	default:
+		panic(fmt.Sprintf("set op type %v unsupported by joins", setOpType))
 	}
+}
 
-	panic(fmt.Sprintf("invalid join type %d", joinType))
+func findJoinProcessorNodes(
+	leftRouters, rightRouters []distsqlplan.ProcessorIdx,
+	processors []distsqlplan.Processor,
+	includeRight bool,
+) (nodes []roachpb.NodeID) {
+	// TODO(radu): for now we run a join processor on every node that produces
+	// data for either source. In the future we should be smarter here.
+	seen := make(map[roachpb.NodeID]struct{})
+	for _, pIdx := range leftRouters {
+		n := processors[pIdx].Node
+		if _, ok := seen[n]; !ok {
+			seen[n] = struct{}{}
+			nodes = append(nodes, n)
+		}
+	}
+	if includeRight {
+		for _, pIdx := range rightRouters {
+			n := processors[pIdx].Node
+			if _, ok := seen[n]; !ok {
+				seen[n] = struct{}{}
+				nodes = append(nodes, n)
+			}
+		}
+	}
+	return nodes
 }

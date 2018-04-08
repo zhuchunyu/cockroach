@@ -17,11 +17,15 @@ package pgwire
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -31,8 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -89,6 +93,8 @@ type Server struct {
 	AmbientCtx log.AmbientContext
 	cfg        *base.Config
 	executor   *sql.Executor
+	SQLServer  *sql.Server
+	execCfg    *sql.ExecutorConfig
 
 	metrics ServerMetrics
 
@@ -104,13 +110,15 @@ type Server struct {
 
 	sqlMemoryPool mon.BytesMonitor
 	connMonitor   mon.BytesMonitor
+
+	stopper *stop.Stopper
 }
 
 // ServerMetrics is the set of metrics for the pgwire server.
 type ServerMetrics struct {
 	BytesInCount   *metric.Counter
 	BytesOutCount  *metric.Counter
-	Conns          *metric.Counter
+	Conns          *metric.Gauge
 	ConnMemMetrics sql.MemoryMetrics
 	SQLMemMetrics  sql.MemoryMetrics
 
@@ -121,9 +129,9 @@ func makeServerMetrics(
 	internalMemMetrics *sql.MemoryMetrics, histogramWindow time.Duration,
 ) ServerMetrics {
 	return ServerMetrics{
-		Conns:              metric.NewCounter(MetaConns),
 		BytesInCount:       metric.NewCounter(MetaBytesIn),
 		BytesOutCount:      metric.NewCounter(MetaBytesOut),
+		Conns:              metric.NewGauge(MetaConns),
 		ConnMemMetrics:     sql.MakeMemMetrics("conns", histogramWindow),
 		SQLMemMetrics:      sql.MakeMemMetrics("client", histogramWindow),
 		internalMemMetrics: internalMemMetrics,
@@ -141,17 +149,22 @@ var noteworthySQLMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWOR
 var noteworthyConnMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_CONN_MEMORY_USAGE", 2*1024*1024)
 
 // MakeServer creates a Server.
+//
+// Start() needs to be called on the Server so it begins processing.
 func MakeServer(
 	ambientCtx log.AmbientContext,
 	cfg *base.Config,
+	st *cluster.Settings,
 	executor *sql.Executor,
 	internalMemMetrics *sql.MemoryMetrics,
 	parentMemoryMonitor *mon.BytesMonitor,
 	histogramWindow time.Duration,
+	executorConfig *sql.ExecutorConfig,
 ) *Server {
 	server := &Server{
 		AmbientCtx: ambientCtx,
 		cfg:        cfg,
+		execCfg:    executorConfig,
 		executor:   executor,
 		metrics:    makeServerMetrics(internalMemMetrics, histogramWindow),
 	}
@@ -159,14 +172,15 @@ func MakeServer(
 		mon.MemoryResource,
 		server.metrics.SQLMemMetrics.CurBytesCount,
 		server.metrics.SQLMemMetrics.MaxBytesHist,
-		0, noteworthySQLMemoryUsageBytes)
+		0, noteworthySQLMemoryUsageBytes, st)
 	server.sqlMemoryPool.Start(context.Background(), parentMemoryMonitor, mon.BoundAccount{})
+	server.SQLServer = sql.NewServer(executorConfig, &server.sqlMemoryPool)
 
 	server.connMonitor = mon.MakeMonitor("conn",
 		mon.MemoryResource,
 		server.metrics.ConnMemMetrics.CurBytesCount,
 		server.metrics.ConnMemMetrics.MaxBytesHist,
-		int64(connReservationBatchSize)*baseSQLMemoryBudget, noteworthyConnMemoryUsageBytes)
+		int64(connReservationBatchSize)*baseSQLMemoryBudget, noteworthyConnMemoryUsageBytes, st)
 	server.connMonitor.Start(context.Background(), &server.sqlMemoryPool, mon.BoundAccount{})
 
 	server.mu.Lock()
@@ -190,6 +204,12 @@ func Match(rd io.Reader) bool {
 	return version == version30 || version == versionSSL
 }
 
+// Start makes the Server ready for serving connections.
+func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
+	s.stopper = stopper
+	s.SQLServer.Start(ctx, stopper)
+}
+
 // IsDraining returns true if the server is not currently accepting
 // connections.
 func (s *Server) IsDraining() bool {
@@ -201,6 +221,16 @@ func (s *Server) IsDraining() bool {
 // Metrics returns the metrics struct.
 func (s *Server) Metrics() *ServerMetrics {
 	return &s.metrics
+}
+
+// StatementCounters returns the Server's StatementCounters.
+func (s *Server) StatementCounters() *sql.StatementCounters {
+	return &s.SQLServer.StatementCounters
+}
+
+// EngineMetrics returns the Server's EngineMetrics.
+func (s *Server) EngineMetrics() *sql.EngineMetrics {
+	return &s.SQLServer.EngineMetrics
 }
 
 // Drain prevents new connections from being served and waits for drainWait for
@@ -433,4 +463,113 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	}
 
 	return errors.Errorf("unknown protocol version %d", version)
+}
+
+// ServeConn2 serves a single connection, driving the handshake process
+// and delegating to the appropriate connection type.
+func (s *Server) ServeConn2(ctx context.Context, conn net.Conn) error {
+	s.mu.Lock()
+	draining := s.mu.draining
+	if !draining {
+		var cancel context.CancelFunc
+		ctx, cancel = contextutil.WithCancel(ctx)
+		done := make(chan struct{})
+		s.mu.connCancelMap[done] = cancel
+		defer func() {
+			cancel()
+			close(done)
+			s.mu.Lock()
+			delete(s.mu.connCancelMap, done)
+			s.mu.Unlock()
+		}()
+	}
+	s.mu.Unlock()
+
+	// If the Server is draining, we will use the connection only to send an
+	// error, so we don't count it in the stats. This makes sense since
+	// DrainClient() waits for that number to drop to zero,
+	// so we don't want it to oscillate unnecessarily.
+	if !draining {
+		s.metrics.Conns.Inc(1)
+		defer s.metrics.Conns.Dec(1)
+	}
+
+	var buf pgwirebase.ReadBuffer
+	n, err := buf.ReadUntypedMsg(conn)
+	if err != nil {
+		return err
+	}
+	s.metrics.BytesInCount.Inc(int64(n))
+	version, err := buf.GetUint32()
+	if err != nil {
+		return err
+	}
+	errSSLRequired := false
+	if version == versionSSL {
+		if len(buf.Msg) > 0 {
+			return errors.Errorf("unexpected data after SSLRequest: %q", buf.Msg)
+		}
+
+		if s.cfg.Insecure {
+			if _, err := conn.Write(sslUnsupported); err != nil {
+				return err
+			}
+		} else {
+			if _, err := conn.Write(sslSupported); err != nil {
+				return err
+			}
+			tlsConfig, err := s.cfg.GetServerTLSConfig()
+			if err != nil {
+				return err
+			}
+			conn = tls.Server(conn, tlsConfig)
+		}
+
+		n, err := buf.ReadUntypedMsg(conn)
+		if err != nil {
+			return err
+		}
+		s.metrics.BytesInCount.Inc(int64(n))
+		version, err = buf.GetUint32()
+		if err != nil {
+			return err
+		}
+	} else if !s.cfg.Insecure {
+		errSSLRequired = true
+	}
+
+	sendErr := func(err error) error {
+		msgBuilder := newWriteBuffer(s.metrics.BytesOutCount)
+		_ /* err */ = writeErr(err, msgBuilder, conn)
+		_ = conn.Close()
+		return err
+	}
+
+	if version != version30 {
+		return sendErr(fmt.Errorf("unknown protocol version %d", version))
+	}
+	if errSSLRequired {
+		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, ErrSSLRequired))
+	}
+	if draining {
+		return sendErr(newAdminShutdownErr(errors.New(ErrDraining)))
+	}
+
+	var sArgs sql.SessionArgs
+	if sArgs, err = parseOptions(ctx, buf.Msg); err != nil {
+		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, err.Error()))
+	}
+	sArgs.User = tree.Name(sArgs.User).Normalize()
+
+	// Reserve some memory for this connection using the server's monitor. This
+	// reduces pressure on the shared pool because the server monitor allocates in
+	// chunks from the shared pool and these chunks should be larger than
+	// baseSQLMemoryBudget.
+	reserved := s.connMonitor.MakeBoundAccount()
+	if err := reserved.Grow(ctx, baseSQLMemoryBudget); err != nil {
+		return errors.Errorf("unable to pre-allocate %d bytes for this connection: %v",
+			baseSQLMemoryBudget, err)
+	}
+	return serveConn(ctx, conn, sArgs, &s.metrics, reserved, s.SQLServer,
+		s.IsDraining, s.execCfg, s.stopper, s.cfg.Insecure)
 }

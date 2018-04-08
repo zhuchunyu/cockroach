@@ -216,10 +216,13 @@ func tryTruncateTupleComparison(
 	} else {
 		// Preserve a prefix of the tuples.
 		newOp.Left = left.Truncate(prefix)
-		newOp.Right = &tree.DTuple{
-			D:      right.D[:prefix],
-			Sorted: right.Sorted,
+		t := &tree.DTuple{
+			D: right.D[:prefix],
 		}
+		if right.Sorted() {
+			t.SetSorted()
+		}
+		newOp.Right = t
 	}
 	// Adjust the operator as necessary.
 	if weaker {
@@ -289,8 +292,10 @@ func tryTruncateTupleEqOrNe(
 	} else {
 		newOp.Left = left.Project(convertible)
 		dTuple := &tree.DTuple{
-			D:      make(tree.Datums, 0, convertible.Len()),
-			Sorted: right.Sorted,
+			D: make(tree.Datums, 0, convertible.Len()),
+		}
+		if right.Sorted() {
+			dTuple.SetSorted()
 		}
 		for i, ok := convertible.Next(0); ok; i, ok = convertible.Next(i + 1) {
 			dTuple.D = append(dTuple.D, right.D[i])
@@ -475,7 +480,7 @@ func extractNotNullConstraintsFromNotNullExpr(expr tree.TypedExpr) util.FastIntS
 // NULL; a filter "x > y" implies that both x and y are not NULL. It is
 // best-effort so there may be false negatives (but no false positives).
 func extractNotNullConstraints(filter tree.TypedExpr) util.FastIntSet {
-	if typ := filter.ResolvedType(); typ == types.Null {
+	if typ := filter.ResolvedType(); typ == types.Unknown {
 		return util.FastIntSet{}
 	} else if typ != types.Bool {
 		panic(fmt.Sprintf("non-bool filter expression: %s (type: %s)", filter, filter.ResolvedType()))

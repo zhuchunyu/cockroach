@@ -824,6 +824,13 @@ func TestMVCCGetAndDelete(t *testing.T) {
 			if value != nil {
 				t.Fatal("the value should be empty")
 			}
+			// Read the latest version with tombstone.
+			value, _, err = MVCCGetWithTombstone(context.Background(), engine, testKey1, hlc.Timestamp{WallTime: 4}, true, nil)
+			if err != nil {
+				t.Fatal(err)
+			} else if value == nil || len(value.RawBytes) != 0 {
+				t.Fatalf("the value should be non-nil with empty RawBytes; got %+v", value)
+			}
 
 			// Read the old version which should still exist.
 			for _, logical := range []int32{0, math.MaxInt32} {
@@ -965,6 +972,12 @@ func TestMVCCGetAndDeleteInTxn(t *testing.T) {
 				t.Fatal(err)
 			} else if value != nil {
 				t.Fatal("the value should be empty")
+			}
+			// Read the latest version with tombstone.
+			if value, _, err := MVCCGetWithTombstone(context.Background(), engine, testKey1, hlc.Timestamp{WallTime: 4}, true, &txn); err != nil {
+				t.Fatal(err)
+			} else if value == nil || len(value.RawBytes) != 0 {
+				t.Fatalf("the value should be non-nil with empty RawBytes; got %+v", value)
 			}
 
 			// Read the old version which shouldn't exist, as within a
@@ -1607,6 +1620,33 @@ func TestMVCCDeleteRange(t *testing.T) {
 		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) ||
 		!bytes.Equal(kvs[2].Value.RawBytes, value5.RawBytes) ||
 		!bytes.Equal(kvs[3].Value.RawBytes, value6.RawBytes) {
+		t.Fatal("the value should not be empty")
+	}
+
+	// Try again, but with tombstones set to true to fetch the deleted keys as well.
+	kvs = []roachpb.KeyValue{}
+	if _, err = MVCCIterate(
+		context.Background(), engine, keyMin, keyMax, hlc.Timestamp{WallTime: 2},
+		true, true /* tombstones */, nil, false, func(kv roachpb.KeyValue) (bool, error) {
+			kvs = append(kvs, kv)
+			return false, nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 6 ||
+		!bytes.Equal(kvs[0].Key, testKey1) ||
+		!bytes.Equal(kvs[1].Key, testKey2) ||
+		!bytes.Equal(kvs[2].Key, testKey3) ||
+		!bytes.Equal(kvs[3].Key, testKey4) ||
+		!bytes.Equal(kvs[4].Key, testKey5) ||
+		!bytes.Equal(kvs[5].Key, testKey6) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
+		!bytes.Equal(kvs[1].Value.RawBytes, nil) ||
+		!bytes.Equal(kvs[2].Value.RawBytes, nil) ||
+		!bytes.Equal(kvs[3].Value.RawBytes, value4.RawBytes) ||
+		!bytes.Equal(kvs[4].Value.RawBytes, value5.RawBytes) ||
+		!bytes.Equal(kvs[5].Value.RawBytes, value6.RawBytes) {
 		t.Fatal("the value should not be empty")
 	}
 
@@ -2697,6 +2737,58 @@ func TestMVCCConditionalPutOldTimestamp(t *testing.T) {
 	}
 }
 
+// TestMVCCMultiplePutOldTimestamp tests a case where multiple
+// transactional Puts occur to the same key, but with older timestamps
+// than a pre-existing key. The first should generate a
+// WriteTooOldError and write at a higher timestamp. The second should
+// avoid the WriteTooOldError but also write at the higher timestamp.
+func TestMVCCMultiplePutOldTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	err := MVCCPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{WallTime: 3}, value1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the first txn Put returns a write too old error, but the
+	// intent is written at the advanced timestamp.
+	txn := *txn1
+	txn.Sequence++
+	err = MVCCPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value2, &txn)
+	if _, ok := err.(*roachpb.WriteTooOldError); !ok {
+		t.Errorf("expected WriteTooOldError on Put; got %v", err)
+	}
+	// Verify new value was actually written at (3, 1).
+	value, _, err := MVCCGet(context.Background(), engine, testKey1, hlc.MaxTimestamp, true, &txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expTS := hlc.Timestamp{WallTime: 3, Logical: 1}
+	if value.Timestamp != expTS || !bytes.Equal(value2.RawBytes, value.RawBytes) {
+		t.Fatalf("expected timestamp=%s (got %s), value=%q (got %q)",
+			value.Timestamp, expTS, value2.RawBytes, value.RawBytes)
+	}
+
+	// Put again and verify no WriteTooOldError, but timestamp should continue
+	// to be set to (3,1).
+	txn.Sequence++
+	err = MVCCPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value3, &txn)
+	if err != nil {
+		t.Error(err)
+	}
+	// Verify new value was actually written at (3, 1).
+	value, _, err = MVCCGet(context.Background(), engine, testKey1, hlc.MaxTimestamp, true, &txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Timestamp != expTS || !bytes.Equal(value3.RawBytes, value.RawBytes) {
+		t.Fatalf("expected timestamp=%s (got %s), value=%q (got %q)",
+			value.Timestamp, expTS, value3.RawBytes, value.RawBytes)
+	}
+}
+
 func TestMVCCAbortTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	engine := createTestEngine()
@@ -3251,6 +3343,7 @@ func TestValidSplitKeys(t *testing.T) {
 			{roachpb.Key("\x03\x00"), false},
 			{roachpb.Key("\x03\xff"), false},
 			{roachpb.Key("\x03\xff\xff"), false},
+			{roachpb.Key("\x03\xff\xff\x88"), false},
 			{roachpb.Key("\x04"), true},
 			{roachpb.Key("\x05"), true},
 			{roachpb.Key("a"), true},
@@ -3267,6 +3360,7 @@ func TestValidSplitKeys(t *testing.T) {
 			{roachpb.Key("\x03\x00"), true}, // different
 			{roachpb.Key("\x03\xff"), true}, // different
 			{roachpb.Key("\x03\xff\xff"), false},
+			{roachpb.Key("\x03\xff\xff\x88"), false},
 			{roachpb.Key("\x04"), true},
 			{roachpb.Key("\x05"), true},
 			{roachpb.Key("a"), true},
@@ -3291,7 +3385,6 @@ func TestValidSplitKeys(t *testing.T) {
 
 func TestFindSplitKey(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	rangeID := roachpb.RangeID(1)
 	engine := createTestEngine()
 	defer engine.Close()
 
@@ -3311,10 +3404,6 @@ func TestFindSplitKey(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// write stats
-	if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
-		t.Fatal(err)
-	}
 
 	testData := []struct {
 		targetSize int64
@@ -3331,7 +3420,10 @@ func TestFindSplitKey(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ind, _ := strconv.Atoi(string(humanSplitKey))
+		ind, err := strconv.Atoi(string(humanSplitKey))
+		if err != nil {
+			t.Fatalf("%d: could not parse key %s as int: %v", i, humanSplitKey, err)
+		}
 		if ind == 0 {
 			t.Fatalf("%d: should never select first key as split key", i)
 		}
@@ -3363,7 +3455,6 @@ func TestFindValidSplitKeys(t *testing.T) {
 		return splitKey
 	}
 
-	rangeID := roachpb.RangeID(1)
 	testCases := []struct {
 		keys       []roachpb.Key
 		rangeStart roachpb.Key // optional
@@ -3411,6 +3502,29 @@ func TestFindValidSplitKeys(t *testing.T) {
 				roachpb.Key("\x03"),
 			},
 			expSplit: roachpb.Key("\x03"),
+			expError: false,
+		},
+		// Between meta2Max and metaMax, splits at metaMax.
+		{
+			keys: []roachpb.Key{
+				roachpb.Key("\x03\xff\xff"),
+				roachpb.Key("\x03\xff\xff\x88"),
+				roachpb.Key("\x04"),
+				roachpb.Key("\x04\xff\xff\x88"),
+			},
+			expSplit: roachpb.Key("\x04"),
+			expError: false,
+		},
+		// Even lopsided, always split at metaMax.
+		{
+			keys: []roachpb.Key{
+				roachpb.Key("\x03\xff\xff"),
+				roachpb.Key("\x03\xff\xff\x11"),
+				roachpb.Key("\x03\xff\xff\x88"),
+				roachpb.Key("\x03\xff\xff\xee"),
+				roachpb.Key("\x04"),
+			},
+			expSplit: roachpb.Key("\x04"),
 			expError: false,
 		},
 		// Lopsided, truncate non-zone prefix.
@@ -3508,10 +3622,6 @@ func TestFindValidSplitKeys(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// write stats
-			if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
-				t.Fatal(err)
-			}
 			rangeStart := test.keys[0]
 			if len(test.rangeStart) > 0 {
 				rangeStart = test.rangeStart
@@ -3548,7 +3658,6 @@ func TestFindValidSplitKeys(t *testing.T) {
 // the left and right halves are equally balanced.
 func TestFindBalancedSplitKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	rangeID := roachpb.RangeID(1)
 	testCases := []struct {
 		keySizes []int
 		valSizes []int
@@ -3608,10 +3717,6 @@ func TestFindBalancedSplitKeys(t *testing.T) {
 				if err := MVCCPut(context.Background(), engine, ms, key, hlc.Timestamp{Logical: 1}, val, nil); err != nil {
 					t.Fatal(err)
 				}
-			}
-			// write stats
-			if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
-				t.Fatal(err)
 			}
 			targetSize := (ms.KeyBytes + ms.ValBytes) / 2
 			splitKey, err := MVCCFindSplitKey(context.Background(), engine,

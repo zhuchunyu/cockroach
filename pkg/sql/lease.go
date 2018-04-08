@@ -155,7 +155,7 @@ func (s LeaseStore) acquire(
 		if err := filterTableState(tableDesc); err != nil {
 			return err
 		}
-		tableDesc.MaybeUpgradeFormatVersion()
+		tableDesc.MaybeFillInDescriptor()
 		// Once the descriptor is set it is immutable and care must be taken
 		// to not modify it.
 		table = &tableVersionState{
@@ -166,7 +166,7 @@ func (s LeaseStore) acquire(
 
 		// ValidateTable instead of Validate, even though we have a txn available,
 		// so we don't block reads waiting for this table version.
-		if err := table.ValidateTable(); err != nil {
+		if err := table.ValidateTable(s.execCfg.Settings); err != nil {
 			return err
 		}
 
@@ -342,13 +342,16 @@ func (s LeaseStore) Publish(
 
 			tableDesc.Version++
 			// We need to set ModificationTime to the transaction's commit
-			// timestamp. Since this is a SERIALZIABLE transaction, that will
-			// be OrigTimestamp.
-			modTime := txn.OrigTimestamp()
+			// timestamp. Since this is a SERIALIZABLE transaction, that
+			// will be OrigTimestamp. However, once we've used the
+			// timestamp, it's rather essential that we have a guarantee
+			// that the txn will commit at that exact timestamp. Using
+			// CommitTimestamp() provides this guarantee.
+			modTime := txn.CommitTimestamp()
 			tableDesc.ModificationTime = modTime
 			log.Infof(ctx, "publish: descID=%d (%s) version=%d mtime=%s",
 				tableDesc.ID, tableDesc.Name, tableDesc.Version, modTime.GoTime())
-			if err := tableDesc.ValidateTable(); err != nil {
+			if err := tableDesc.ValidateTable(s.execCfg.Settings); err != nil {
 				return err
 			}
 
@@ -402,7 +405,7 @@ func (s LeaseStore) countLeases(
 		defer cleanup()
 		const countLeases = `SELECT COUNT(version) FROM system.lease ` +
 			`WHERE "descID" = $1 AND version = $2 AND expiration > $3`
-		values, err := p.QueryRow(ctx, countLeases, descID, int(version), expiration)
+		values, err := p.queryRow(ctx, countLeases, descID, int(version), expiration)
 		if err != nil {
 			return err
 		}
@@ -435,7 +438,7 @@ func (s LeaseStore) getForExpiration(
 		}
 		tableDesc := desc.GetTable()
 		if tableDesc == nil {
-			return errors.Errorf("id %d is not a table", id)
+			return sqlbase.ErrDescriptorNotFound
 		}
 		if !tableDesc.ModificationTime.Less(prevTimestamp) {
 			return errors.Errorf("internal error: unable to read table= (%d, %s)", id, expiration)
@@ -607,7 +610,8 @@ func (t *tableState) acquire(
 	// expire. Looping is necessary because lease acquisition is done without
 	// holding the tableState lock, so anything can happen in between lease
 	// acquisition and us getting control again.
-	for s := t.mu.active.findNewest(); s == nil || s.hasExpired(timestamp); s = t.mu.active.findNewest() {
+	s := t.mu.active.findNewest()
+	for ; s == nil || s.hasExpired(timestamp); s = t.mu.active.findNewest() {
 		var resultChan <-chan singleflight.Result
 		resultChan, _ = t.mu.group.DoChan(acquireGroupKey, func() (interface{}, error) {
 			return t.acquireNodeLease(ctx, m, hlc.Timestamp{})
@@ -620,6 +624,14 @@ func (t *tableState) acquire(
 		t.mu.Lock()
 		if result.Err != nil {
 			return nil, result.Err
+		}
+	}
+
+	// If the latest lease is nearly expired, ensure a renewal is queued.
+	durationUntilExpiry := time.Duration(s.expiration.WallTime - timestamp.WallTime)
+	if durationUntilExpiry < m.LeaseStore.leaseRenewalTimeout {
+		if err := t.maybeQueueLeaseRenewal(ctx, m, s); err != nil {
+			return nil, err
 		}
 	}
 
@@ -796,8 +808,10 @@ func (t *tableState) acquireFreshestFromStoreLocked(ctx context.Context, m *Leas
 func (t *tableState) upsertLocked(ctx context.Context, table *tableVersionState, m *LeaseManager) {
 	s := t.mu.active.find(table.Version)
 	if s == nil {
+		if t.mu.active.findNewest() != nil {
+			log.Infof(ctx, "new lease: %s", table)
+		}
 		t.mu.active.insert(table)
-		log.Eventf(ctx, "new lease: %s with %s", s, table)
 		return
 	}
 
@@ -978,6 +992,25 @@ func (t *tableState) purgeOldVersions(
 		return nil
 	}
 	return err
+}
+
+// maybeQueueLeaseRenewal queues a lease renewal if there is not already a lease
+// renewal in progress.
+func (t *tableState) maybeQueueLeaseRenewal(
+	ctx context.Context, m *LeaseManager, tableVersion *tableVersionState,
+) error {
+	if !atomic.CompareAndSwapInt32(&t.renewalInProgress, 0, 1) {
+		return nil
+	}
+
+	// Start the renewal. When it finishes, it will reset t.renewalInProgress.
+	return t.stopper.RunAsyncTask(context.Background(),
+		"lease renewal", func(ctx context.Context) {
+			var cleanup func()
+			ctx, cleanup = tracing.EnsureContext(ctx, m.ambientCtx.Tracer, "lease renewal")
+			defer cleanup()
+			t.startLeaseRenewal(ctx, m, tableVersion)
+		})
 }
 
 // startLeaseRenewal starts a singleflight.Group to acquire a lease.
@@ -1245,27 +1278,15 @@ func (m *LeaseManager) AcquireByName(
 	tableVersion := m.tableNames.get(dbID, tableName, timestamp)
 	if tableVersion != nil {
 		if !timestamp.Less(tableVersion.ModificationTime) {
-
-			// Atomically check and begin a renewal if one has not already
-			// been set.
-
+			// If this lease is nearly expired, ensure a renewal is queued.
 			durationUntilExpiry := time.Duration(tableVersion.expiration.WallTime - timestamp.WallTime)
 			if durationUntilExpiry < m.LeaseStore.leaseRenewalTimeout {
-				if t := m.findTableState(tableVersion.ID, false /* create */); t != nil &&
-					atomic.CompareAndSwapInt32(&t.renewalInProgress, 0, 1) {
-					// Start the renewal. When it finishes, it will reset t.renewalInProgress.
-					if err := t.stopper.RunAsyncTask(context.Background(),
-						"lease renewal", func(ctx context.Context) {
-							var cleanup func()
-							ctx, cleanup = tracing.EnsureContext(ctx, m.ambientCtx.Tracer, "lease renewal")
-							defer cleanup()
-							t.startLeaseRenewal(ctx, m, tableVersion)
-						}); err != nil {
-						return &tableVersion.TableDescriptor, tableVersion.expiration, err
+				if t := m.findTableState(tableVersion.ID, false /* create */); t != nil {
+					if err := t.maybeQueueLeaseRenewal(ctx, m, tableVersion); err != nil {
+						return nil, hlc.Timestamp{}, err
 					}
 				}
 			}
-
 			return &tableVersion.TableDescriptor, tableVersion.expiration, nil
 		}
 		if err := m.Release(&tableVersion.TableDescriptor); err != nil {
@@ -1482,9 +1503,11 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *client.DB, g *gossip.G
 					switch union := descriptor.Union.(type) {
 					case *sqlbase.Descriptor_Table:
 						table := union.Table
-						table.MaybeUpgradeFormatVersion()
-						if err := table.ValidateTable(); err != nil {
-							log.Errorf(ctx, "%s: received invalid table descriptor: %v", kv.Key, table)
+						table.MaybeFillInDescriptor()
+						if err := table.ValidateTable(m.execCfg.Settings); err != nil {
+							log.Errorf(ctx, "%s: received invalid table descriptor: %s. Desc: %v",
+								kv.Key, err, table,
+							)
 							return
 						}
 						if log.V(2) {

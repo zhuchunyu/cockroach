@@ -222,7 +222,7 @@ statement ok
 UPDATE kv SET v = 'b' WHERE k in ('a')
 
 statement error cannot change the isolation level of a running transaction
-SET TRANSACTION ISOLATION LEVEL SNAPSHOT
+SET transaction_isolation = 'snapshot'
 
 statement ok
 ROLLBACK
@@ -237,6 +237,11 @@ SHOW TRANSACTION ISOLATION LEVEL
 ----
 serializable
 
+query T
+SHOW transaction_isolation
+----
+serializable
+
 statement ok
 SET TRANSACTION ISOLATION LEVEL SNAPSHOT
 
@@ -245,8 +250,18 @@ SHOW TRANSACTION ISOLATION LEVEL
 ----
 snapshot
 
+query T
+SHOW transaction_isolation
+----
+snapshot
+
 statement ok
 COMMIT
+
+# We can't set isolation level to an unsupported one.
+
+statement error unsupported isolation level "read committed"
+SET transaction_isolation = 'read committed'
 
 # We can explicitly start a transaction in snapshot isolation.
 
@@ -479,6 +494,10 @@ snapshot
 statement ok
 COMMIT
 
+# restore default
+statement ok
+SET DEFAULT_TRANSACTION_ISOLATION TO 'SERIALIZABLE'
+
 # SHOW TRANSACTION STATUS
 
 query T
@@ -505,7 +524,7 @@ NoTxn
 statement ok
 BEGIN
 
-query error pq: database "t" does not exist
+query error pq: relation "t\.b" does not exist
 SELECT a FROM t.b
 
 query T
@@ -962,3 +981,7 @@ SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL)
 
 statement ok
 ROLLBACK
+
+# restore the default
+statement ok
+SET default_transaction_read_only = false

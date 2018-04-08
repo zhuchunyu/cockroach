@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -183,7 +184,7 @@ func TestSplitFilter(t *testing.T) {
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(fmt.Sprintf("%s~(%s, %s)", d.expr, d.expectedRes, d.expectedRem), func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			// A function that "converts" only vars in the list.
@@ -194,8 +195,7 @@ func TestSplitFilter(t *testing.T) {
 					if colName == col {
 						// Convert to a VarName (to check that conversion happens correctly). It
 						// will print the same.
-						cn := tree.Name(colName)
-						return true, &tree.UnresolvedName{&cn}
+						return true, &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{colName}}
 					}
 				}
 				return false, nil
@@ -267,7 +267,7 @@ func TestExtractNotNullConstraints(t *testing.T) {
 	p := makeTestPlanner()
 	for _, tc := range testCases {
 		t.Run(tc.expr, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 
 			sel := makeSelectNode(t, p)

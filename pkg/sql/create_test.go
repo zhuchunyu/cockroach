@@ -18,15 +18,14 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"net"
+	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
@@ -34,8 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/jackc/pgx"
 )
 
 func TestDatabaseDescriptor(t *testing.T) {
@@ -425,7 +423,7 @@ SELECT * FROM t.kv%d
 		// This select should not see any data.
 		if _, err := tx.Query(fmt.Sprintf(
 			`SELECT * FROM t.kv%d`, i,
-		)); !testutils.IsError(err, fmt.Sprintf("id %d is not a table", 52+i)) {
+		)); !testutils.IsError(err, fmt.Sprintf("relation \"t.kv%d\" does not exist", i)) {
 			t.Fatalf("err = %v", err)
 		}
 
@@ -437,56 +435,114 @@ SELECT * FROM t.kv%d
 
 func TestCreateStatementType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// Make the connections' results buffers really small so that it overflows
+		// when we produce a few results.
+		ConnResultsBufferBytes: 10,
+		// Andrei is too lazy to figure out the incantation for telling pgx about
+		// our test certs.
+		Insecure: true,
+	})
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	host, ports, err := net.SplitHostPort(s.ServingAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(pgx.ConnConfig{
+		Host:     host,
+		Port:     uint16(port),
+		User:     "root",
+		Database: "system",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmdTag, err := conn.Exec("CREATE DATABASE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "CREATE DATABASE" {
+		t.Fatal("expected CREATE DATABASE, got", cmdTag)
+	}
+
+	cmdTag, err = conn.Exec("CREATE TABLE t.foo(x INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "CREATE TABLE" {
+		t.Fatal("expected CREATE TABLE, got", cmdTag)
+	}
+
+	cmdTag, err = conn.Exec("CREATE TABLE t.bar AS SELECT * FROM generate_series(1,10)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "SELECT 10" {
+		t.Fatal("expected SELECT 10, got", cmdTag)
+	}
+}
+
+// Test that the user's password cannot be set in insecure mode.
+func TestSetUserPasswordInsecure(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
 	defer s.Stopper().Stop(context.TODO())
 
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
+	errFail := "cluster in insecure mode; user cannot use password authentication"
 
-	e := s.Executor().(*sql.Executor)
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, e,
-		nil /* remote */, &sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(e)
-
-	query := "CREATE DATABASE t; CREATE TABLE t.foo(x INT); CREATE TABLE t.bar AS SELECT * FROM generate_series(1,10)"
-	res, err := e.ExecuteStatementsBuffered(session, query, nil, 3)
-	if err != nil {
-		t.Fatal("expected no error, got", err)
-	}
-	defer res.Close(session.Ctx())
-	if res.Empty {
-		t.Fatal("expected non-empty results")
+	testCases := []struct {
+		sql       string
+		errString string
+	}{
+		{"CREATE USER user1", ""},
+		{"CREATE USER user2 WITH PASSWORD ''", "empty passwords are not permitted"},
+		{"CREATE USER user2 WITH PASSWORD 'cockroach'", errFail},
+		{"ALTER USER user1 WITH PASSWORD 'somepass'", errFail},
 	}
 
-	result := res.ResultList[1]
-	if result.Err != nil {
-		t.Fatal("expected no error, got", err)
-	}
-	if result.PGTag != "CREATE TABLE" {
-		t.Fatal("expected CREATE TABLE, got", result.PGTag)
-	}
-	if result.Type != tree.DDL {
-		t.Fatal("expected result type tree.DDL, got", result.Type)
-	}
-	if result.RowsAffected != 0 {
-		t.Fatal("expected 0 rows affected, got", result.RowsAffected)
+	for _, testCase := range testCases {
+		t.Run(testCase.sql, func(t *testing.T) {
+			_, err := sqlDB.Exec(testCase.sql)
+			if testCase.errString != "" {
+				if !testutils.IsError(err, testCase.errString) {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 
-	result = res.ResultList[2]
-	if result.Err != nil {
-		t.Fatal("expected no error, got", err)
+	testCases = []struct {
+		sql       string
+		errString string
+	}{
+		{"CREATE USER $1 WITH PASSWORD $2", errFail},
+		{"ALTER USER $1 WITH PASSWORD $2", errFail},
 	}
-	if result.PGTag != "SELECT" {
-		t.Fatal("expected SELECT, got", result.PGTag)
-	}
-	if result.Type != tree.RowsAffected {
-		t.Fatal("expected result type tree.RowsAffected, got", result.Type)
-	}
-	if result.RowsAffected != 10 {
-		t.Fatal("expected 10 rows affected, got", result.RowsAffected)
+
+	for _, testCase := range testCases {
+		t.Run(testCase.sql, func(t *testing.T) {
+			stmt, err := sqlDB.Prepare(testCase.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = stmt.Exec("user3", "cockroach")
+			if testCase.errString != "" {
+				if !testutils.IsError(err, testCase.errString) {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -39,16 +40,14 @@ func TestDesiredAggregateOrder(t *testing.T) {
 		{`(MIN(a), AVG(a))`, nil},
 		{`(MIN(a), COUNT(a))`, nil},
 		{`(MIN(a), SUM(a))`, nil},
-		// TODO(pmattis): This could/should return []int{1} (or perhaps []int{2}),
-		// since both aggregations are for the same function and the same column.
-		{`(MIN(a), MIN(a))`, nil},
+		{`(MIN(a), MIN(a))`, sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}},
 		{`(MIN(a+1), MIN(a))`, nil},
 		{`(COUNT(a), MIN(a))`, nil},
 	}
 	p := makeTestPlanner()
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
-			p.extendedEvalCtx = makeTestingExtendedEvalContext()
+			p.extendedEvalCtx = makeTestingExtendedEvalContext(cluster.MakeTestingClusterSettings())
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			expr := parseAndNormalizeExpr(t, p, d.expr, sel)
@@ -71,7 +70,7 @@ func TestDesiredAggregateOrder(t *testing.T) {
 				t.Fatalf("%s: expected %v, but found %v", d.expr, d.ordering, ordering)
 			}
 			// Verify we never have a desired ordering if there is a GROUP BY.
-			group.numGroupCols = 1
+			group.groupCols = []int{0}
 			ordering = group.desiredAggregateOrdering(p.EvalContext())
 			if len(ordering) > 0 {
 				t.Fatalf("%s: expected no ordering when there is a GROUP BY, found %v", d.expr, ordering)

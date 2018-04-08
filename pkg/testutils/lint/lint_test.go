@@ -119,7 +119,7 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestTabsInShellScripts", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nF", "\t", "--", "*.sh")
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", "^ *\t", "--", "*.sh")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,10 +153,11 @@ func TestLint(t *testing.T) {
 				excludes: []string{
 					":!acceptance",
 					":!ccl/acceptanceccl/backup_test.go",
-					":!ccl/sqlccl/backup_cloud_test.go",
+					":!ccl/backupccl/backup_cloud_test.go",
 					":!ccl/storageccl/export_storage_test.go",
-					":!ccl/testutilsccl/workloadccl/fixture_test.go",
+					":!ccl/workloadccl/fixture_test.go",
 					":!cmd",
+					":!nightly",
 					":!testutils/lint",
 					":!util/envutil/env.go",
 					":!util/log/clog.go",
@@ -733,6 +734,7 @@ func TestLint(t *testing.T) {
 			}),
 			stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
 			stream.GrepNot(`\.pb\.gw\.go:[0-9]+: declaration of "?ctx"? shadows`),
+			stream.GrepNot(`\.og\.go:[0-9]+: declaration of ".*" shadows`),
 		), func(s string) {
 			t.Error(s)
 		}); err != nil {
@@ -775,6 +777,7 @@ func TestLint(t *testing.T) {
 			"github.com/golang/protobuf/proto": "github.com/gogo/protobuf/proto",
 			"github.com/satori/go.uuid":        "util/uuid",
 			"golang.org/x/sync/singleflight":   "github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight",
+			"syscall":                          "sysutil",
 		}
 
 		// grepBuf creates a grep string that matches any forbidden import pkgs.
@@ -825,11 +828,13 @@ func TestLint(t *testing.T) {
 			stream.Grep(`^`+settingsPkgPrefix+`: | `+grepBuf.String()),
 			stream.GrepNot(`cockroach/pkg/cmd/`),
 			stream.GrepNot(`cockroach/pkg/testutils/lint: log$`),
-			stream.GrepNot(`cockroach/pkg/(cli|security): syscall$`),
+			stream.GrepNot(`cockroach/pkg/util/sysutil: syscall$`),
 			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
+			stream.GrepNot(`cockroach/pkg/server/debug/pprofui: path$`),
 			stream.GrepNot(`cockroach/pkg/util/caller: path$`),
 			stream.GrepNot(`cockroach/pkg/ccl/storageccl: path$`),
+			stream.GrepNot(`cockroach/pkg/ccl/workloadccl: path$`),
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
 		), func(s string) {
 			pkgStr := strings.Split(s, ": ")
@@ -846,6 +851,7 @@ func TestLint(t *testing.T) {
 				case strings.HasSuffix(s, "humanizeutil"):
 				case strings.HasSuffix(s, "protoutil"):
 				case strings.HasSuffix(s, "testutils"):
+				case strings.HasSuffix(s, "syncutil"):
 				case strings.HasSuffix(s, settingsPkgPrefix):
 				default:
 					t.Errorf("%s <- please don't add CRDB dependencies to settings pkg", s)
@@ -944,6 +950,7 @@ func TestLint(t *testing.T) {
 				filter,
 				// _fsm.go files are allowed to dot-import the util/fsm package.
 				stream.GrepNot("_fsm.go.*should not use dot imports"),
+				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
 			), func(s string) {
 				t.Error(s)
 			}); err != nil {
@@ -1077,8 +1084,8 @@ func TestLint(t *testing.T) {
 					Ignores:   ignores,
 					GoVersion: goVersion,
 				}
-				for _, p := range linter.Lint(lprog) {
-					t.Errorf("%s: %s", p.Position, p)
+				for _, p := range linter.Lint(lprog, &conf) {
+					t.Errorf("%s: %s", p.Position, &p)
 				}
 			})
 		}

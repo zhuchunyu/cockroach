@@ -16,6 +16,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -37,6 +39,33 @@ func mapType(typ string) string {
 
 	default:
 		return "PrivateID"
+	}
+}
+
+func mapPrivateType(typ string) string {
+	switch typ {
+	case "ColumnID":
+		return "opt.ColumnID"
+	case "ColSet":
+		return "opt.ColSet"
+	case "ColList":
+		return "opt.ColList"
+	case "Ordering":
+		return "memo.Ordering"
+	case "FuncOpDef":
+		return "*memo.FuncOpDef"
+	case "ScanOpDef":
+		return "*memo.ScanOpDef"
+	case "SetOpColMap":
+		return "*memo.SetOpColMap"
+	case "Datum":
+		return "tree.Datum"
+	case "Type":
+		return "types.T"
+	case "TypedExpr":
+		return "tree.TypedExpr"
+	default:
+		panic(fmt.Sprintf("unrecognized private type: %s", typ))
 	}
 }
 
@@ -89,4 +118,49 @@ func privateField(d *lang.DefineExpr) *lang.DefineFieldExpr {
 	}
 
 	return nil
+}
+
+// getUniquePrivateTypes returns a list of the distinct private value types used
+// in the given set of define expressions. These are used to generating methods
+// to intern private values.
+func getUniquePrivateTypes(defines lang.DefineSetExpr) []string {
+	var types []string
+	unique := make(map[lang.StringExpr]bool)
+
+	for _, define := range defines {
+		defineField := privateField(define)
+		if defineField != nil {
+			if !unique[defineField.Type] {
+				types = append(types, string(defineField.Type))
+				unique[defineField.Type] = true
+			}
+		}
+	}
+
+	return types
+}
+
+// generateDefineComments is a helper function that generates a block of
+// op definition comments by converting the Optgen comment to a Go comment.
+// The comments are assumed to start with the name of the op and follow with a
+// description of the op, like this:
+//   # <opname> <description of what this op does>
+//   # ...
+//
+// The initial opname is replaced with the given replaceName, in order to adapt
+// it to different enums and structs that are generated.
+func generateDefineComments(w io.Writer, define *lang.DefineExpr, replaceName string) {
+	for i, comment := range define.Comments {
+		// Replace the # comment character used in Optgen with the Go
+		// comment character.
+		s := strings.Replace(string(comment), "#", "//", 1)
+
+		// Replace the definition name if it is the first word in the first
+		// comment.
+		if i == 0 && strings.HasPrefix(string(comment), "# "+string(define.Name)) {
+			s = strings.Replace(s, string(define.Name), replaceName, 1)
+		}
+
+		fmt.Fprintf(w, "  %s\n", s)
+	}
 }

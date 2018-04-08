@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Data structures and basic infrastructure for distributed SQL APIs. See
-// docs/RFCS/distributed_sql.md.  // All the concepts here are "physical plan" concepts.
 
 package stats
 
@@ -22,6 +19,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
@@ -141,7 +139,7 @@ func TestEquiDepthHistogram(t *testing.T) {
 		},
 	}
 
-	evalCtx := tree.NewTestingEvalContext()
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {

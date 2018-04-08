@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -236,7 +237,10 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	// periods; this simplifies verification.
 	seriesName := "test.metric"
 	sourceName := "source1"
-	now := tsrv.Clock().PhysicalNow()
+	// "now" is five minutes in the past to avoid any sort of shenanigans with the
+	// various adjustments we make in the very-recent-past to create consistent
+	// graphs.
+	now := tsrv.Clock().PhysicalNow() - int64(5*time.Minute)
 	nearPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 2)
 	farPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 4)
 	sampleDuration := ts.Resolution10s.SampleDuration()
@@ -282,6 +286,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 		nil,           /* maxHist */
 		-1,            /* increment: use default block size */
 		math.MaxInt64, /* noteworthy */
+		cluster.MakeTestingClusterSettings(),
 	)
 	memMon.Start(context.TODO(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer memMon.Stop(context.TODO())
@@ -300,6 +305,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 			now+ts.Resolution10s.SlabDuration(),
 			0,
 			&acc,
+			&memMon,
 		)
 		return dps, err
 	}

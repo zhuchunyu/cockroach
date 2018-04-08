@@ -139,7 +139,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 		{&roachpb.PutRequest{}, enginepb.SERIALIZABLE, false, 1},
 		// Read/write conflicts.
 		{&roachpb.GetRequest{}, enginepb.SNAPSHOT, true, 1},
-		{&roachpb.GetRequest{}, enginepb.SERIALIZABLE, true, 2},
+		{&roachpb.GetRequest{}, enginepb.SERIALIZABLE, true, 1},
 		{&roachpb.GetRequest{}, enginepb.SNAPSHOT, false, 1},
 		{&roachpb.GetRequest{}, enginepb.SERIALIZABLE, false, 1},
 	}
@@ -412,7 +412,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 
 	zoneConfig := config.ZoneConfig{
 		NumReplicas:   2,
-		Constraints:   config.Constraints{Constraints: []config.Constraint{{Value: "mem"}}},
+		Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "mem"}}}},
 		RangeMinBytes: 1 << 10, // 1k
 		RangeMaxBytes: 1 << 18, // 256k
 	}
@@ -783,59 +783,68 @@ func TestConcurrentIncrements(t *testing.T) {
 	}
 }
 
-// TestInconsistentReads tests that the methods that generate inconsistent reads
-// generate outgoing requests with an INCONSISTENT read consistency.
-func TestInconsistentReads(t *testing.T) {
+// TestReadConsistencyTypes tests that the methods that generate reads with
+// different read consistency types generate outgoing requests with the
+// corresponding read consistency type set.
+func TestReadConsistencyTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Mock out DistSender's sender function to check the read consistency for
-	// outgoing BatchRequests and return an empty reply.
-	factory := client.TxnSenderFactoryFunc(func(_ client.TxnType) client.TxnSender {
-		return client.TxnSenderFunc(func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-			if ba.ReadConsistency != roachpb.INCONSISTENT {
-				return nil, roachpb.NewErrorf("BatchRequest has unexpected ReadConsistency %s", ba.ReadConsistency)
+	for _, rc := range []roachpb.ReadConsistencyType{
+		roachpb.CONSISTENT,
+		roachpb.READ_UNCOMMITTED,
+		roachpb.INCONSISTENT,
+	} {
+		t.Run(rc.String(), func(t *testing.T) {
+			// Mock out DistSender's sender function to check the read consistency for
+			// outgoing BatchRequests and return an empty reply.
+			factory := client.TxnSenderFactoryFunc(func(_ client.TxnType) client.TxnSender {
+				return client.TxnSenderFunc(func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+					if ba.ReadConsistency != rc {
+						return nil, roachpb.NewErrorf("BatchRequest has unexpected ReadConsistency %s", ba.ReadConsistency)
+					}
+					return ba.CreateReply(), nil
+				})
+			})
+			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+			db := client.NewDB(factory, clock)
+			ctx := context.TODO()
+
+			prepWithRC := func() *client.Batch {
+				b := &client.Batch{}
+				b.Header.ReadConsistency = rc
+				return b
 			}
-			return ba.CreateReply(), nil
+
+			// Perform reads through the mocked sender function.
+			{
+				key := roachpb.Key([]byte("key"))
+				b := prepWithRC()
+				b.Get(key)
+				if err := db.Run(ctx, b); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			{
+				b := prepWithRC()
+				key1 := roachpb.Key([]byte("key1"))
+				key2 := roachpb.Key([]byte("key2"))
+				b.Scan(key1, key2)
+				if err := db.Run(ctx, b); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			{
+				key := roachpb.Key([]byte("key"))
+				b := &client.Batch{}
+				b.Header.ReadConsistency = rc
+				b.Get(key)
+				if err := db.Run(ctx, b); err != nil {
+					t.Fatal(err)
+				}
+			}
 		})
-	})
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	db := client.NewDB(factory, clock)
-	ctx := context.TODO()
-
-	prepInconsistent := func() *client.Batch {
-		b := &client.Batch{}
-		b.Header.ReadConsistency = roachpb.INCONSISTENT
-		return b
-	}
-
-	// Perform inconsistent reads through the mocked sender function.
-	{
-		key := roachpb.Key([]byte("key"))
-		b := prepInconsistent()
-		b.Get(key)
-		if err := db.Run(ctx, b); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	{
-		b := prepInconsistent()
-		key1 := roachpb.Key([]byte("key1"))
-		key2 := roachpb.Key([]byte("key2"))
-		b.Scan(key1, key2)
-		if err := db.Run(ctx, b); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	{
-		key := roachpb.Key([]byte("key"))
-		b := &client.Batch{}
-		b.Header.ReadConsistency = roachpb.INCONSISTENT
-		b.Get(key)
-		if err := db.Run(ctx, b); err != nil {
-			t.Fatal(err)
-		}
 	}
 }
 
@@ -870,7 +879,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 			txn.Proto().Timestamp.Forward(s.Clock().Now())
 			_, err := txn.Get(ctx, "k")
 			return err
-		}); !testutils.IsError(err, "txn aborted") {
+		}); !testutils.IsError(err, "deadline exceeded before transaction finalization") {
 		// We test for TransactionAbortedError. If this was not a read-only txn,
 		// the error returned by the server would have been different - a
 		// TransactionStatusError. This inconsistency is unfortunate.
@@ -953,5 +962,69 @@ func TestTxn_ReverseScan(t *testing.T) {
 
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNodeIDAndObservedTimestamps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Mock out sender function to check that created transactions
+	// have the observed timestamp set for the configured node ID.
+	factory := client.TxnSenderFactoryFunc(func(_ client.TxnType) client.TxnSender {
+		return client.TxnSenderFunc(func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+			return ba.CreateReply(), nil
+		})
+	})
+
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	dbCtx := client.DefaultDBContext()
+	dbCtx.NodeID = &base.NodeIDContainer{}
+	db := client.NewDBWithContext(factory, clock, dbCtx)
+	ctx := context.Background()
+
+	// Verify direct creation of Txns.
+	directCases := []struct {
+		typ         client.TxnType
+		nodeID      roachpb.NodeID
+		expObserved bool
+	}{
+		{typ: client.RootTxn, nodeID: 0, expObserved: false},
+		{typ: client.RootTxn, nodeID: 1, expObserved: true},
+		{typ: client.LeafTxn, nodeID: 0, expObserved: false},
+		{typ: client.LeafTxn, nodeID: 1, expObserved: false},
+	}
+	for i, test := range directCases {
+		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
+			txn := client.NewTxn(db, test.nodeID, test.typ)
+			if ots := txn.Proto().ObservedTimestamps; (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {
+				t.Errorf("expected observed ts %t; got %+v", test.expObserved, ots)
+			}
+		})
+	}
+
+	// Verify node ID container using DB.Txn().
+	indirectCases := []struct {
+		nodeID      roachpb.NodeID
+		expObserved bool
+	}{
+		{nodeID: 0, expObserved: false},
+		{nodeID: 1, expObserved: true},
+	}
+	for i, test := range indirectCases {
+		t.Run(fmt.Sprintf("indirect-txn-%d", i), func(t *testing.T) {
+			if test.nodeID != 0 {
+				dbCtx.NodeID.Set(ctx, test.nodeID)
+			}
+			if err := db.Txn(
+				ctx, func(_ context.Context, txn *client.Txn) error {
+					if ots := txn.Proto().ObservedTimestamps; (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {
+						t.Errorf("expected observed ts %t; got %+v", test.expObserved, ots)
+					}
+					return nil
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

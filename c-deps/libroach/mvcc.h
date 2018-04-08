@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "chunked_buffer.h"
 #include "db.h"
 #include "encoding.h"
 #include "iterator.h"
@@ -49,7 +50,7 @@ static const int kMaxItersBeforeSeek = 10;
 template <bool reverse> class mvccScanner {
  public:
   mvccScanner(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp, int64_t max_keys,
-              DBTxn txn, bool consistent)
+              DBTxn txn, bool consistent, bool tombstones)
       : iter_(iter),
         iter_rep_(iter->rep.get()),
         start_key_(ToSlice(start)),
@@ -60,8 +61,9 @@ template <bool reverse> class mvccScanner {
         txn_epoch_(txn.epoch),
         txn_max_timestamp_(txn.max_timestamp),
         consistent_(consistent),
+        tombstones_(tombstones),
         check_uncertainty_(timestamp < txn.max_timestamp),
-        kvs_(new rocksdb::WriteBatch),
+        kvs_(new chunkedBuffer),
         intents_(new rocksdb::WriteBatch),
         peeked_(false),
         is_get_(false),
@@ -148,7 +150,8 @@ template <bool reverse> class mvccScanner {
   const DBScanResults& fillResults() {
     if (results_.status.len == 0) {
       if (kvs_->Count() > 0) {
-        results_.data = ToDBSlice(kvs_->Data());
+        kvs_->GetChunks(&results_.data.bufs, &results_.data.len);
+        results_.data.count = kvs_->Count();
       }
       if (intents_->Count() > 0) {
         results_.intents = ToDBSlice(intents_->Data());
@@ -416,7 +419,9 @@ template <bool reverse> class mvccScanner {
   }
 
   bool addAndAdvance(const rocksdb::Slice& value) {
-    if (value.size() > 0) {
+    // Don't include deleted versions (value.size() == 0), unless we've been
+    // instructed to include tombstones in the results.
+    if (value.size() > 0 || tombstones_) {
       kvs_->Put(cur_raw_key_, value);
       if (kvs_->Count() > max_keys_) {
         return false;
@@ -603,9 +608,10 @@ template <bool reverse> class mvccScanner {
   const uint32_t txn_epoch_;
   const DBTimestamp txn_max_timestamp_;
   const bool consistent_;
+  const bool tombstones_;
   const bool check_uncertainty_;
   DBScanResults results_;
-  std::unique_ptr<rocksdb::WriteBatch> kvs_;
+  std::unique_ptr<chunkedBuffer> kvs_;
   std::unique_ptr<rocksdb::WriteBatch> intents_;
   std::string key_buf_;
   std::string saved_buf_;

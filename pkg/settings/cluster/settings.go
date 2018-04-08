@@ -16,13 +16,11 @@ package cluster
 
 import (
 	"context"
-	"math"
 	"sync/atomic"
-
-	"golang.org/x/time/rate"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -69,9 +67,8 @@ type Settings struct {
 
 	Version ExposedClusterVersion
 
-	Tracer             *tracing.Tracer
-	BulkIOWriteLimiter *rate.Limiter
-	ExternalIODir      string
+	Tracer        *tracing.Tracer
+	ExternalIODir string
 
 	Initialized bool
 }
@@ -80,22 +77,13 @@ type Settings struct {
 // (for example, a CLI subcommand that does not connect to a cluster).
 var NoSettings *Settings // = nil
 
-const keyVersionSetting = "version"
+// KeyVersionSetting is the "version" settings key.
+const KeyVersionSetting = "version"
 
-var version = settings.RegisterStateMachineSetting(keyVersionSetting,
+var version = settings.RegisterStateMachineSetting(KeyVersionSetting,
 	"set the active cluster version in the format '<major>.<minor>'.", // hide optional `-<unstable>`
 	settings.TransformerFn(versionTransformer),
 )
-
-// BulkIOWriteLimit is defined here because it is used by BulkIOWriteLimiter.
-var BulkIOWriteLimit = settings.RegisterByteSizeSetting(
-	"kv.bulk_io_write.max_rate",
-	"the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops",
-	math.MaxInt64,
-)
-
-// BulkIOWriteLimiterBurst is the burst for the BulkIOWriteLimiter cluster setting.
-const BulkIOWriteLimiterBurst = 2 * 1024 * 1024 // 2MB
 
 // InitializeVersion initializes the Version field of this setting. Before this
 // method has been called, usage of the Version field is illegal and leads to a
@@ -107,7 +95,7 @@ func (s *Settings) InitializeVersion(cv ClusterVersion) error {
 	}
 	// Note that we don't call `updater.ResetRemaining()`.
 	updater := settings.NewUpdater(&s.SV)
-	if err := updater.Set(keyVersionSetting, string(b), version.Typ()); err != nil {
+	if err := updater.Set(KeyVersionSetting, string(b), version.Typ()); err != nil {
 		return err
 	}
 	s.Version.baseVersion.Store(&cv)
@@ -152,6 +140,13 @@ func (ecv *ExposedClusterVersion) Version() ClusterVersion {
 	return v
 }
 
+// HasBeenInitialized returns whether the cluster version has been initialized
+// yet and if Version can be safely called.
+func (ecv *ExposedClusterVersion) HasBeenInitialized() bool {
+	v := *ecv.baseVersion.Load().(*ClusterVersion)
+	return v != ClusterVersion{}
+}
+
 // BootstrapVersion returns the version a newly initialized cluster should have.
 func (ecv *ExposedClusterVersion) BootstrapVersion() ClusterVersion {
 	return ClusterVersion{
@@ -182,6 +177,20 @@ func (ecv *ExposedClusterVersion) IsActive(versionKey VersionKey) bool {
 // permanently available (i.e. cannot be downgraded away).
 func (ecv *ExposedClusterVersion) IsMinSupported(versionKey VersionKey) bool {
 	return ecv.Version().IsMinSupported(versionKey)
+}
+
+// CheckVersion is like IsMinSupported but returns an appropriate error in the
+// case of a cluster version which is too low.
+func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature string) error {
+	if !ecv.Version().IsMinSupported(versionKey) {
+		return pgerror.NewErrorf(
+			pgerror.CodeFeatureNotSupportedError,
+			"cluster version does not support %s (>= %s required)",
+			feature,
+			VersionByKey(versionKey).String(),
+		)
+	}
+	return nil
 }
 
 // MakeTestingClusterSettings returns a Settings object that has had its version
@@ -238,14 +247,6 @@ func MakeClusterSettings(minVersion, serverVersion roachpb.Version) *Settings {
 		s.Version.baseVersion.Store(&newV)
 	})
 
-	// TODO(dan): This limiting should be per-store and shared between any
-	// operations that need lots of disk throughput.
-	s.BulkIOWriteLimiter = rate.NewLimiter(rate.Limit(BulkIOWriteLimit.Get(sv)), BulkIOWriteLimiterBurst)
-
-	BulkIOWriteLimit.SetOnChange(sv, func() {
-		s.BulkIOWriteLimiter.SetLimit(rate.Limit(BulkIOWriteLimit.Get(sv)))
-	})
-
 	s.Initialized = true
 
 	return s
@@ -272,6 +273,8 @@ func (sv *stringedVersion) String() string {
 
 // versionTransformer is the transformer function for the version StateMachine.
 // It has access to the Settings struct via the opaque member of settings.Values.
+// The returned versionStringer must, when printed, only return strings that are
+// safe to include in diagnostics reporting.
 func versionTransformer(
 	sv *settings.Values, curRawProto []byte, versionBump *string,
 ) (newRawProto []byte, versionStringer interface{}, _ error) {

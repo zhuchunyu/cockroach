@@ -144,11 +144,6 @@ func (s *Iterator) UnsafeValue() []byte {
 	return s.i.UnsafeValue()
 }
 
-// Less is part of the engine.Iterator interface.
-func (s *Iterator) Less(key engine.MVCCKey) bool {
-	return s.i.Less(key)
-}
-
 // ComputeStats is part of the engine.Iterator interface.
 func (s *Iterator) ComputeStats(
 	start, end engine.MVCCKey, nowNanos int64,
@@ -171,12 +166,12 @@ func (s *Iterator) FindSplitKey(
 
 // MVCCGet is part of the engine.Iterator interface.
 func (s *Iterator) MVCCGet(
-	key roachpb.Key, timestamp hlc.Timestamp, txn *roachpb.Transaction, consistent bool,
+	key roachpb.Key, timestamp hlc.Timestamp, txn *roachpb.Transaction, consistent, tombstones bool,
 ) (*roachpb.Value, []roachpb.Intent, error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: key}); err != nil {
 		return nil, nil, err
 	}
-	return s.i.MVCCGet(key, timestamp, txn, consistent)
+	return s.i.MVCCGet(key, timestamp, txn, consistent, tombstones)
 }
 
 // MVCCScan is part of the engine.Iterator interface.
@@ -185,12 +180,12 @@ func (s *Iterator) MVCCScan(
 	max int64,
 	timestamp hlc.Timestamp,
 	txn *roachpb.Transaction,
-	consistent, reverse bool,
-) (kvs []byte, intents []byte, err error) {
+	consistent, reverse, tombstones bool,
+) (kvs []byte, numKvs int64, intents []byte, err error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
-	return s.i.MVCCScan(start, end, max, timestamp, txn, consistent, reverse)
+	return s.i.MVCCScan(start, end, max, timestamp, txn, consistent, reverse, tombstones)
 }
 
 type spanSetReader struct {
@@ -312,6 +307,12 @@ func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) spanSetReadWrit
 	}
 }
 
+// NewReadWriter returns an engine.ReadWriter that asserts access of the
+// underlying ReadWriter against the given SpanSet.
+func NewReadWriter(rw engine.ReadWriter, spans *SpanSet) engine.ReadWriter {
+	return makeSpanSetReadWriter(rw, spans)
+}
+
 type spanSetBatch struct {
 	spanSetReadWriter
 	b     engine.Batch
@@ -326,6 +327,10 @@ func (s spanSetBatch) Commit(sync bool) error {
 
 func (s spanSetBatch) Distinct() engine.ReadWriter {
 	return makeSpanSetReadWriter(s.b.Distinct(), s.spans)
+}
+
+func (s spanSetBatch) Empty() bool {
+	return s.b.Empty()
 }
 
 func (s spanSetBatch) Repr() []byte {

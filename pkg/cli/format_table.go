@@ -15,12 +15,14 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/csv"
 	"fmt"
 	"html"
 	"io"
 	"reflect"
 	"strings"
+	"text/tabwriter"
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -208,18 +210,43 @@ func render(
 }
 
 type prettyReporter struct {
-	cols  []string
 	table *tablewriter.Table
+	buf   bytes.Buffer
+	w     *tabwriter.Writer
+}
+
+func newPrettyReporter() *prettyReporter {
+	n := &prettyReporter{}
+	// 4-wide columns, 1 character minimum width.
+	n.w = tabwriter.NewWriter(&n.buf, 4, 0, 1, ' ', 0)
+	return n
 }
 
 func (p *prettyReporter) describe(w io.Writer, cols []string) error {
-	p.cols = cols
 	if len(cols) > 0 {
+		// Ensure that tabs are converted to spaces and newlines are
+		// doubled so they can be recognized in the output.
+		expandedCols := make([]string, len(cols))
+		for i, c := range cols {
+			p.buf.Reset()
+			fmt.Fprint(p.w, c)
+			_ = p.w.Flush()
+			expandedCols[i] = p.buf.String()
+		}
+
 		// Initialize tablewriter and set column names as the header row.
 		p.table = tablewriter.NewWriter(w)
 		p.table.SetAutoFormatHeaders(false)
-		p.table.SetAutoWrapText(false)
-		p.table.SetHeader(p.cols)
+		p.table.SetAutoWrapText(true)
+		p.table.SetReflowDuringAutoWrap(false)
+		p.table.SetHeader(expandedCols)
+		// This width is sufficient to show a "standard text line width"
+		// on the screen when viewed as a single column on a 80-wide terminal.
+		//
+		// It's also wide enough for the output of SHOW CREATE TABLE on
+		// moderately long column definitions (e.g. including FK
+		// constraints).
+		p.table.SetColWidth(72)
 	}
 	return nil
 }
@@ -235,7 +262,10 @@ func (p *prettyReporter) iter(_ io.Writer, _ int, row []string) error {
 	}
 
 	for i, r := range row {
-		row[i] = expandTabsAndNewLines(r)
+		p.buf.Reset()
+		fmt.Fprint(p.w, r)
+		_ = p.w.Flush()
+		row[i] = p.buf.String()
 	}
 	p.table.Append(row)
 	return nil
@@ -286,7 +316,6 @@ func (p *csvReporter) doneNoRows(_ io.Writer) error                   { return n
 
 func (p *csvReporter) doneRows(w io.Writer, seenRows int) error {
 	p.csvWriter.Flush()
-	fmt.Fprintf(w, "# %d row%s\n", seenRows, util.Pluralize(int64(seenRows)))
 	return nil
 }
 
@@ -323,7 +352,7 @@ func (p *htmlReporter) describe(w io.Writer, cols []string) error {
 	fmt.Fprint(w, "<table>\n<thead><tr>")
 	fmt.Fprint(w, "<th>row</th>")
 	for _, col := range cols {
-		fmt.Fprintf(w, "<th>%s</th>", html.EscapeString(col))
+		fmt.Fprintf(w, "<th>%s</th>", strings.Replace(html.EscapeString(col), "\n", "<br/>", -1))
 	}
 	fmt.Fprintln(w, "</tr></head>")
 	return nil
@@ -357,16 +386,21 @@ func (p *htmlReporter) doneRows(w io.Writer, nRows int) error {
 
 type recordReporter struct {
 	cols        []string
+	colRest     [][]string
 	maxColWidth int
 }
 
 func (p *recordReporter) describe(w io.Writer, cols []string) error {
-	p.cols = cols
 	for _, col := range cols {
-		colLen := utf8.RuneCountInString(col)
-		if colLen > p.maxColWidth {
-			p.maxColWidth = colLen
+		parts := strings.Split(col, "\n")
+		for _, part := range parts {
+			colLen := utf8.RuneCountInString(part)
+			if colLen > p.maxColWidth {
+				p.maxColWidth = colLen
+			}
 		}
+		p.cols = append(p.cols, parts[0])
+		p.colRest = append(p.colRest, parts[1:])
 	}
 	return nil
 }
@@ -384,10 +418,25 @@ func (p *recordReporter) iter(w io.Writer, rowIdx int, row []string) error {
 			if l > 0 {
 				colLabel = ""
 			}
+			lineCont := "+"
+			if l == len(lines)-1 {
+				lineCont = ""
+			}
 			// Note: special characters, including a vertical bar, in
 			// the colLabel are not escaped here. This is in accordance
-			// with the same behavior in PostgreSQL.
-			fmt.Fprintf(w, "%-*s | %s\n", p.maxColWidth, colLabel, line)
+			// with the same behavior in PostgreSQL. However there is
+			// special behavior for newlines.
+			contChar := " "
+			if len(p.colRest[j]) > 0 {
+				contChar = "+"
+			}
+			fmt.Fprintf(w, "%-*s%s| %s%s\n", p.maxColWidth, colLabel, contChar, line, lineCont)
+			for k, cont := range p.colRest[j] {
+				if k == len(p.colRest[j])-1 {
+					contChar = " "
+				}
+				fmt.Fprintf(w, "%-*s%s|\n", p.maxColWidth, cont, contChar)
+			}
 		}
 	}
 	return nil
@@ -442,12 +491,15 @@ func (p *sqlReporter) iter(w io.Writer, _ int, row []string) error {
 
 func (p *sqlReporter) beforeFirstRow(_ io.Writer, _ rowStrIter) error { return nil }
 func (p *sqlReporter) doneNoRows(_ io.Writer) error                   { return nil }
-func (p *sqlReporter) doneRows(_ io.Writer, _ int) error              { return nil }
+func (p *sqlReporter) doneRows(w io.Writer, seenRows int) error {
+	fmt.Fprintf(w, "-- %d row%s\n", seenRows, util.Pluralize(int64(seenRows)))
+	return nil
+}
 
 func makeReporter() (rowReporter, error) {
 	switch cliCtx.tableDisplayFormat {
 	case tableDisplayPretty:
-		return &prettyReporter{}, nil
+		return newPrettyReporter(), nil
 
 	case tableDisplayTSV:
 		fallthrough

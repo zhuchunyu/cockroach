@@ -3,14 +3,14 @@
 set -euo pipefail
 
 image=cockroachdb/builder
-version=20180129-142711
+version=20180405-182035
 
 function init() {
   docker build --tag="${image}" "$(dirname "${0}")/builder"
 }
 
 if [ "${1-}" = "pull" ]; then
-  docker pull "${image}"
+  docker pull "${image}:${version}"
   exit 0
 fi
 
@@ -164,19 +164,6 @@ mkdir -p "${gocache}"/docker/native
 vols="${vols} --volume=${gocache}/docker/native:/go/native${delegated_volume_mode}"
 mkdir -p "${gocache}"/docker/pkg
 vols="${vols} --volume=${gocache}/docker/pkg:/go/pkg${delegated_volume_mode}"
-
-# TODO(tamird,benesch): this is horrible, but we do it because we want to
-# cache stdlib artifacts and we can't mount over GOROOT. Replace with
-# `-pkgdir` when the kinks are worked out.
-for pkgdir in {darwin,windows}_amd64{,_race}; do
-  mkdir -p "${gocache}/docker/pkg/${pkgdir}"
-  vols="${vols} --volume=${gocache}/docker/pkg/${pkgdir}:/usr/local/go/pkg/${pkgdir}${delegated_volume_mode}"
-done
-# Linux supports more stuff, so it needs a separate loop.
-for pkgdir in linux_amd64{,_release-{gnu,musl}}{,_msan,_race}; do
-  mkdir -p "${gocache}/docker/pkg/${pkgdir}"
-  vols="${vols} --volume=${gocache}/docker/pkg/${pkgdir}:/usr/local/go/pkg/${pkgdir}${delegated_volume_mode}"
-done
 
 # -i causes some commands (including `git diff`) to attempt to use
 # a pager, so we override $PAGER to disable.

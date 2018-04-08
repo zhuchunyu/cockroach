@@ -7,11 +7,11 @@ import _ from "lodash";
 import "./nodeOverview.styl";
 
 import {
-  NodesSummary, nodesSummarySelector, LivenessStatus,
+  livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid,
 } from "src/redux/nodes";
 import { nodeIDAttr } from "src/util/constants";
 import { AdminUIState } from "src/redux/state";
-import { refreshNodes } from "src/redux/apiReducers";
+import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
 import { NodeStatus$Properties, MetricConstants, StatusMetrics } from  "src/util/proto";
 import { Bytes, Percentage } from "src/util/format";
 import { LongToMoment } from "src/util/convert";
@@ -23,6 +23,10 @@ interface NodeOverviewProps extends RouterState {
   node: NodeStatus$Properties;
   nodesSummary: NodesSummary;
   refreshNodes: typeof refreshNodes;
+  refreshLiveness: typeof refreshLiveness;
+  // True if current status results are still valid. Needed so that this
+  // component refreshes status query when it becomes invalid.
+  nodesSummaryValid: boolean;
 }
 
 /**
@@ -32,12 +36,14 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
   componentWillMount() {
     // Refresh nodes status query when mounting.
     this.props.refreshNodes();
+    this.props.refreshLiveness();
   }
 
   componentWillReceiveProps(props: NodeOverviewProps) {
     // Refresh nodes status query when props are received; this will immediately
     // trigger a new request if previous results are invalidated.
     props.refreshNodes();
+    props.refreshLiveness();
   }
 
   render() {
@@ -50,14 +56,11 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
       );
     }
 
-    const liveness = nodesSummary.livenessStatusByNodeID[node.desc.node_id] || LivenessStatus.HEALTHY;
-    const livenessString = LivenessStatus[liveness].toLowerCase();
+    const liveness = nodesSummary.livenessStatusByNodeID[node.desc.node_id] || LivenessStatus.LIVE;
+    const livenessString = livenessNomenclature(liveness);
 
     return (
       <div>
-        <section className="section parent-link">
-          <Link to="/cluster/nodes">&lt; Back to Node List</Link>
-        </section>
         <div className="section section--heading">
           <h2>{`Node ${node.desc.node_id} / ${node.desc.address.address_field}`}</h2>
         </div>
@@ -135,7 +138,7 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
               <SummaryValue title="Build" value={node.build_info.tag} />
               <SummaryValue
                 title="Logs"
-                value={<Link to={`/cluster/nodes/${node.desc.node_id}/logs`}>View Logs</Link>}
+                value={<Link to={`/node/${node.desc.node_id}/logs`}>View Logs</Link>}
                 classModifier="link"
               />
             </SummaryBar>
@@ -180,9 +183,11 @@ export default connect(
     return {
       node: currentNode(state, ownProps),
       nodesSummary: nodesSummarySelector(state),
+      nodesSummaryValid: selectNodesSummaryValid(state),
     };
   },
   {
     refreshNodes,
+    refreshLiveness,
   },
 )(NodeOverview);

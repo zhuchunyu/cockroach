@@ -4,7 +4,7 @@ import _ from "lodash";
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeAddress, storeIDsForNode } from "./dashboardUtils";
+import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
   const { nodeIDs, nodesSummary, storeSources } = props;
@@ -28,7 +28,7 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.store.replicas"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -49,7 +49,7 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.store.replicas.leaseholders"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -64,22 +64,7 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.store.totalbytes"
-              title={nodeAddress(nodesSummary, nid)}
-              sources={storeIDsForNode(nodesSummary, nid)}
-            />
-          ))
-        }
-      </Axis>
-    </LineGraph>,
-
-    <LineGraph title="Keys Written per Second per Store" tooltip={`The average number of KV keys written (i.e. applied by raft) per second on each store.`}>
-      <Axis label="writes per second">
-        {
-          _.map(nodeIDs, (nid) => (
-            <Metric
-              key={nid}
-              name="cr.store.rebalancing.writespersecond"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -105,8 +90,8 @@ export default function (props: GraphDashboardProps) {
     <LineGraph title="Snapshots" sources={storeSources}>
       <Axis label="snapshots">
         <Metric name="cr.store.range.snapshots.generated" title="Generated" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.normal-applied" title="Normal-applied" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.preemptive-applied" title="Preemptive-applied" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.normal-applied" title="Applied (Raft-initiated)" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.preemptive-applied" title="Applied (Preemptive)" nonNegativeRate />
         <Metric name="cr.store.replicas.reserved" title="Reserved" nonNegativeRate />
       </Axis>
     </LineGraph>,

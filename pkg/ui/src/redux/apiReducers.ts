@@ -111,6 +111,11 @@ const tableStatsReducerObj = new KeyedCachedDataReducer(
 );
 export const refreshTableStats = tableStatsReducerObj.refresh;
 
+const nonTableStatsReducerObj = new CachedDataReducer(
+  api.getNonTableStats, "nonTableStats", moment.duration(1, "m"),
+);
+export const refreshNonTableStats = nonTableStatsReducerObj.refresh;
+
 const logsReducerObj = new CachedDataReducer(
   api.getLogs,
   "logs",
@@ -215,6 +220,14 @@ const commandQueueReducerObj = new KeyedCachedDataReducer(
 );
 export const refreshCommandQueue = commandQueueReducerObj.refresh;
 
+export const settingsReducerObj = new CachedDataReducer(
+  api.getSettings,
+  "settings",
+  moment.duration(0),
+  moment.duration(1, "m"),
+);
+export const refreshSettings = settingsReducerObj.refresh;
+
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
   events: CachedDataReducerState<api.EventsResponseMessage>;
@@ -227,6 +240,7 @@ export interface APIReducersState {
   databaseDetails: KeyedCachedDataReducerState<api.DatabaseDetailsResponseMessage>;
   tableDetails: KeyedCachedDataReducerState<api.TableDetailsResponseMessage>;
   tableStats: KeyedCachedDataReducerState<api.TableStatsResponseMessage>;
+  nonTableStats: CachedDataReducerState<api.NonTableStatsResponseMessage>;
   logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
   jobs: KeyedCachedDataReducerState<api.JobsResponseMessage>;
@@ -237,6 +251,7 @@ export interface APIReducersState {
   allocatorRange: KeyedCachedDataReducerState<api.AllocatorRangeResponseMessage>;
   rangeLog: KeyedCachedDataReducerState<api.RangeLogResponseMessage>;
   commandQueue: KeyedCachedDataReducerState<api.CommandQueueResponseMessage>;
+  settings: CachedDataReducerState<api.SettingsResponseMessage>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -251,6 +266,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [databaseDetailsReducerObj.actionNamespace]: databaseDetailsReducerObj.reducer,
   [tableDetailsReducerObj.actionNamespace]: tableDetailsReducerObj.reducer,
   [tableStatsReducerObj.actionNamespace]: tableStatsReducerObj.reducer,
+  [nonTableStatsReducerObj.actionNamespace]: nonTableStatsReducerObj.reducer,
   [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,
   [jobsReducerObj.actionNamespace]: jobsReducerObj.reducer,
@@ -261,6 +277,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [allocatorRangeReducerObj.actionNamespace]: allocatorRangeReducerObj.reducer,
   [rangeLogReducerObj.actionNamespace]: rangeLogReducerObj.reducer,
   [commandQueueReducerObj.actionNamespace]: commandQueueReducerObj.reducer,
+  [settingsReducerObj.actionNamespace]: settingsReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

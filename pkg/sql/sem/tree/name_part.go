@@ -30,10 +30,6 @@ import (
 // `unrestricted_name` nonterminals. See UnrestrictedName for details.
 type Name string
 
-// NoName is a pre-allocated instance of the empty string, suitable
-// for passing to methods that want a pointer to a name.
-var NoName Name
-
 // Format implements the NodeFormatter interface.
 func (n *Name) Format(ctx *FmtCtx) {
 	f := ctx.flags
@@ -118,14 +114,6 @@ func (l *NameList) Format(ctx *FmtCtx) {
 	}
 }
 
-// UnqualifiedStar corresponds to a standalone '*' in an expression or
-// a '*' as name part of an UnresolvedName.
-type UnqualifiedStar struct{}
-
-// Format implements the NodeFormatter interface.
-func (UnqualifiedStar) Format(ctx *FmtCtx) { ctx.WriteByte('*') }
-func (u UnqualifiedStar) String() string   { return AsString(u) }
-
 // ArraySubscript corresponds to the syntax `<name>[ ... ]`.
 type ArraySubscript struct {
 	Begin Expr
@@ -148,60 +136,62 @@ func (a *ArraySubscript) Format(ctx *FmtCtx) {
 	ctx.WriteByte(']')
 }
 
-// NamePart is the interface for the sub-parts of an UnresolvedName or
-// the Selector/Context members of ColumnItem and FunctionName.
-type NamePart interface {
-	NodeFormatter
-	namePart()
+// UnresolvedName corresponds to an unresolved qualified name.
+type UnresolvedName struct {
+	// NumParts indicates the number of name parts specified, including
+	// the star. Always 1 or greater.
+	NumParts int
+
+	// Star indicates the name ends with a star.
+	// In that case, Parts below is empty in the first position.
+	Star bool
+
+	// Parts are the name components, in reverse order.
+	// There are at most 4: column, table, schema, catalog/db.
+	//
+	// Note: NameParts has a fixed size so that we avoid a heap
+	// allocation for the slice every time we construct an
+	// UnresolvedName. It does imply however that Parts does not have
+	// a meaningful "length"; its actual length (the number of parts
+	// specified) is populated in NumParts above.
+	Parts NameParts
 }
 
-var _ NamePart = func() *Name { n := Name(""); return &n }()
-var _ NamePart = func() *UnrestrictedName { n := UnrestrictedName(""); return &n }()
-var _ NamePart = &ArraySubscript{}
-var _ NamePart = UnqualifiedStar{}
-
-func (Name) namePart()              {}
-func (UnrestrictedName) namePart()  {}
-func (a *ArraySubscript) namePart() {}
-func (UnqualifiedStar) namePart()   {}
-
-// NameParts represents a combination of names with array and
-// sub-field subscripts.
-type NameParts []NamePart
-
-// Format implements the NodeFormatter interface.
-func (l *NameParts) Format(ctx *FmtCtx) {
-	for i, p := range *l {
-		_, isArraySubscript := p.(*ArraySubscript)
-		if !isArraySubscript && i > 0 {
-			ctx.WriteByte('.')
-		}
-		ctx.FormatNode(p)
-	}
-}
-
-// UnresolvedName holds the initial syntax of a name as
-// determined during parsing.
-type UnresolvedName NameParts
+// NameParts is the array of strings that composes the path in an
+// UnresolvedName.
+type NameParts = [4]string
 
 // Format implements the NodeFormatter interface.
 func (u *UnresolvedName) Format(ctx *FmtCtx) {
-	ctx.FormatNode((*NameParts)(u))
+	stopAt := 1
+	if u.Star {
+		stopAt = 2
+	}
+	// Every part after that is necessarily an unrestricted name.
+	for i := u.NumParts; i >= stopAt; i-- {
+		// The first part to print is the last item in u.Parts.  It is also
+		// a potentially restricted name to disambiguate from keywords in
+		// the grammar, so print it out as a "Name".
+		if i == u.NumParts {
+			ctx.FormatNode((*Name)(&u.Parts[i-1]))
+		} else {
+			ctx.FormatNode((*UnrestrictedName)(&u.Parts[i-1]))
+		}
+		if i > 1 {
+			ctx.WriteByte('.')
+		}
+	}
+	if u.Star {
+		ctx.WriteByte('*')
+	}
 }
 func (u *UnresolvedName) String() string { return AsString(u) }
 
-// UnresolvedNames corresponds to a comma-separate list of unresolved
-// names.  Note: this should be treated as immutable when embedded in
-// an Expr context, otherwise the Walk code must be updated to
-// duplicate the array an Expr node is duplicated.
-type UnresolvedNames []UnresolvedName
-
-// Format implements the NodeFormatter interface.
-func (u *UnresolvedNames) Format(ctx *FmtCtx) {
-	for i := range *u {
-		if i > 0 {
-			ctx.WriteString(", ")
-		}
-		ctx.FormatNode(&(*u)[i])
+// NewUnresolvedName constructs an UnresolvedName from some strings.
+func NewUnresolvedName(args ...string) *UnresolvedName {
+	n := &UnresolvedName{NumParts: len(args)}
+	for i := 0; i < len(args); i++ {
+		n.Parts[i] = args[len(args)-1-i]
 	}
+	return n
 }

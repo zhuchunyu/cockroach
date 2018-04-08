@@ -30,6 +30,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime/debug"
+	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,9 +38,6 @@ import (
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 
 	"github.com/pkg/errors"
 
@@ -50,6 +48,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -328,6 +328,10 @@ var (
 	flexTypes = flag.Bool(
 		"flex-types", false,
 		"do not fail when a test expects a column of a numeric type but the query provides another type",
+	)
+	metadataTestOff = flag.Bool(
+		"metadata-test-off", false,
+		"disable DistSQL metadata propagation tests",
 	)
 
 	// Output parameters
@@ -715,6 +719,31 @@ type logicTest struct {
 	varMap map[string]string
 
 	rewriteResTestBuf bytes.Buffer
+
+	curPath   string
+	curLineNo int
+}
+
+func (t *logicTest) traceStart(filename string) {
+	if t.traceFile != nil {
+		t.Fatalf("tracing already active")
+	}
+	var err error
+	t.traceFile, err = os.Create(filename)
+	if err != nil {
+		t.Fatalf("unable to open trace output file: %s", err)
+	}
+	if err := trace.Start(t.traceFile); err != nil {
+		t.Fatalf("unable to start tracing: %s", err)
+	}
+}
+
+func (t *logicTest) traceStop() {
+	if t.traceFile != nil {
+		trace.Stop()
+		t.traceFile.Close()
+		t.traceFile = nil
+	}
 }
 
 // substituteVars replaces all occurrences of "$abc", where "abc" is a variable
@@ -776,25 +805,6 @@ func (t *logicTest) outf(format string, args ...interface{}) {
 // It returns a cleanup function to be run when the credentials
 // are no longer needed.
 func (t *logicTest) setUser(user string) func() {
-	var outDBName string
-
-	if t.db != nil {
-		var inDBName string
-
-		if err := t.db.QueryRow("SHOW DATABASE").Scan(&inDBName); err != nil {
-			t.Fatal(err)
-		}
-
-		defer func() {
-			if inDBName != outDBName {
-				// Propagate the DATABASE setting to the newly-live connection.
-				if _, err := t.db.Exec(fmt.Sprintf("SET DATABASE = '%s'", inDBName)); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}()
-	}
-
 	if t.clients == nil {
 		t.clients = map[string]*gosql.DB{}
 	}
@@ -802,16 +812,13 @@ func (t *logicTest) setUser(user string) func() {
 		t.db = db
 		t.user = user
 
-		if err := t.db.QueryRow("SHOW DATABASE").Scan(&outDBName); err != nil {
-			t.Fatal(err)
-		}
-
 		// No cleanup necessary, but return a no-op func to avoid nil pointer dereference.
 		return func() {}
 	}
 
 	addr := t.cluster.Server(t.nodeIdx).ServingAddr()
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.t, addr, "TestLogic", url.User(user))
+	pgURL.Path = "test"
 	db, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
@@ -837,7 +844,6 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 			SQLMemoryPoolSize: 192 * 1024 * 1024,
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WaitForGossipUpdate:   true,
 					CheckStmtStringChange: true,
 				},
 				Store: &storage.StoreTestingKnobs{
@@ -849,16 +855,23 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 					AssertFuncExprReturnTypes:   true,
 				},
 			},
+			UseDatabase: "test",
 		},
 		// For distributed SQL tests, we use the fake span resolver; it doesn't
 		// matter where the data really is.
 		ReplicationMode: base.ReplicationManual,
 	}
-	if cfg.distSQLUseDisk {
-		params.ServerArgs.Knobs.DistSQL = &distsqlrun.TestingKnobs{
-			MemoryLimitBytes: 1,
-		}
+
+	distSQLKnobs := &distsqlrun.TestingKnobs{
+		MetadataTestLevel: distsqlrun.NoExplain,
 	}
+	if cfg.distSQLUseDisk {
+		distSQLKnobs.MemoryLimitBytes = 1
+	}
+	if *metadataTestOff {
+		distSQLKnobs.MetadataTestLevel = distsqlrun.Off
+	}
+	params.ServerArgs.Knobs.DistSQL = distSQLKnobs
 
 	if cfg.serverVersion != nil {
 		// If we want to run a specific server version, we assume that it
@@ -888,7 +901,10 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		wantedMode := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode) // off => 0, etc
+		wantedMode, ok := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
+		if !ok {
+			t.Fatalf("invalid distsql mode override: %s", cfg.overrideDistSQLMode)
+		}
 		// Wait until all servers are aware of the setting.
 		testutils.SucceedsSoon(t.t, func() error {
 			for i := 0; i < t.cluster.NumServers(); i++ {
@@ -915,7 +931,6 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 
 	if _, err := t.db.Exec(`
 CREATE DATABASE test;
-SET DATABASE = test;
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -1101,6 +1116,7 @@ func (t *logicTest) processSubtest(
 
 	repeat := 1
 	for s.Scan() {
+		t.curPath, t.curLineNo = path, s.line+subtest.lineLineIndexIntoFile
 		if *maxErrs > 0 && t.failures >= *maxErrs {
 			return errors.Errorf("%s:%d: too many errors encountered, skipping the rest of the input",
 				path, s.line+subtest.lineLineIndexIntoFile,
@@ -1172,8 +1188,11 @@ func (t *logicTest) processSubtest(
 			}
 			if !s.skip {
 				for i := 0; i < repeat; i++ {
-					if ok := t.execStatement(stmt); !ok {
-						return errors.Errorf("%s: error in statement, skipping to next file", stmt.pos)
+					if cont, err := t.execStatement(stmt); err != nil {
+						if !cont {
+							return err
+						}
+						t.Error(err)
 					}
 				}
 			} else {
@@ -1429,14 +1448,24 @@ func (t *logicTest) processSubtest(
 }
 
 // verifyError checks that either no error was found where none was
-// expected, or that an error was found when one was expected. Returns
-// "true" to indicate the behavior was as expected.
-func (t *logicTest) verifyError(sql, pos, expectErr, expectErrCode string, err error) bool {
+// expected, or that an error was found when one was expected.
+// Returns a nil error to indicate the behavior was as expected.  If
+// non-nil, returns also true in the boolean flag whether it is safe
+// to continue (i.e. an error was expected, an error was obtained, and
+// the errors didn't match).
+func (t *logicTest) verifyError(
+	sql, pos, expectErr, expectErrCode string, err error,
+) (bool, error) {
 	if expectErr == "" && expectErrCode == "" && err != nil {
-		return t.unexpectedError(sql, pos, err)
+		cont := t.unexpectedError(sql, pos, err)
+		if cont {
+			// unexpectedError() already reported via t.Errorf. no need for more.
+			err = nil
+		}
+		return cont, err
 	}
 	if !testutils.IsError(err, expectErr) {
-		t.Errorf("%s: %s\nexpected %q, but found %v", pos, sql, expectErr, err)
+		newErr := errors.Errorf("%s: %s\nexpected %q, but found %v", pos, sql, expectErr, err)
 		if err != nil && strings.Contains(err.Error(), expectErr) {
 			if t.subtestT != nil {
 				t.subtestT.Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
@@ -1446,28 +1475,28 @@ func (t *logicTest) verifyError(sql, pos, expectErr, expectErrCode string, err e
 					"query error %s", regexp.QuoteMeta(err.Error()))
 			}
 		}
-		return false
+		return (err == nil) == (expectErr == ""), newErr
 	}
 	if expectErrCode != "" {
 		if err != nil {
 			pqErr, ok := err.(*pq.Error)
 			if !ok {
-				t.Errorf("%s %s\n: expected error code %q, but the error we found is not "+
+				newErr := errors.Errorf("%s %s\n: expected error code %q, but the error we found is not "+
 					"a libpq error: %s", pos, sql, expectErrCode, err)
-				return false
+				return true, newErr
 			}
 			if pqErr.Code != pq.ErrorCode(expectErrCode) {
-				t.Errorf("%s: %s\nexpected error code %q, but found code %q (%s)",
+				newErr := errors.Errorf("%s: %s\nexpected error code %q, but found code %q (%s)",
 					pos, sql, expectErrCode, pqErr.Code, pqErr.Code.Name())
-				return false
+				return true, newErr
 			}
 		} else {
-			t.Errorf("%s: %s\nexpected error code %q, but found success",
+			newErr := errors.Errorf("%s: %s\nexpected error code %q, but found success",
 				pos, sql, expectErrCode)
-			return false
+			return (err != nil), newErr
 		}
 	}
-	return true
+	return true, nil
 }
 
 // unexpectedError handles ignoring queries that fail during prepare
@@ -1496,7 +1525,7 @@ func (t *logicTest) unexpectedError(sql string, pos string, err error) bool {
 	return false
 }
 
-func (t *logicTest) execStatement(stmt logicStatement) bool {
+func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
 	if *showSQL {
 		t.outf("%s;", stmt.sql)
 	}
@@ -1509,11 +1538,11 @@ func (t *logicTest) execStatement(stmt logicStatement) bool {
 	//   the database in an improper state, so we stop there;
 	// - error on expected error is worth going further, even
 	//   if the obtained error does not match the expected error.
-	ok := t.verifyError("", stmt.pos, stmt.expectErr, stmt.expectErrCode, err)
-	if ok {
+	cont, err := t.verifyError("", stmt.pos, stmt.expectErr, stmt.expectErrCode, err)
+	if err != nil {
 		t.finishOne("OK")
 	}
-	return ok
+	return cont, err
 }
 
 func (t *logicTest) hashResults(results []string) (string, error) {
@@ -1533,8 +1562,8 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		t.outf("%s;", query.sql)
 	}
 	rows, err := t.db.Query(query.sql)
-	if ok := t.verifyError(query.sql, query.pos, query.expectErr, query.expectErrCode, err); !ok {
-		return nil
+	if _, err := t.verifyError(query.sql, query.pos, query.expectErr, query.expectErrCode, err); err != nil {
+		return err
 	}
 	if err != nil {
 		// An error occurred, but it was expected.
@@ -2097,8 +2126,10 @@ func (t *logicTest) Fatal(args ...interface{}) {
 	}
 	log.Error(context.Background(), args...)
 	if t.subtestT != nil {
+		t.subtestT.Logf("\n%s:%d: error while processing", t.curPath, t.curLineNo)
 		t.subtestT.Fatal(args...)
 	} else {
+		t.t.Logf("\n%s:%d: error while processing", t.curPath, t.curLineNo)
 		t.t.Fatal(args...)
 	}
 }

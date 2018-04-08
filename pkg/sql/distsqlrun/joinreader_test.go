@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 func TestJoinReader(t *testing.T) {
@@ -50,6 +51,10 @@ func TestJoinReader(t *testing.T) {
 	sumFn := func(row int) tree.Datum {
 		return tree.NewDInt(tree.DInt(row/10 + row%10))
 	}
+	v := [10]tree.Datum{}
+	for i := range v {
+		v[i] = tree.NewDInt(tree.DInt(i))
+	}
 
 	sqlutils.CreateTable(t, sqlDB, "t",
 		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), INDEX bs (b,s)",
@@ -59,12 +64,16 @@ func TestJoinReader(t *testing.T) {
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	testCases := []struct {
+		description string
 		post        PostProcessSpec
+		onExpr      string
 		input       [][]tree.Datum
+		lookupCols  columns
 		outputTypes []sqlbase.ColumnType
 		expected    string
 	}{
 		{
+			description: "Test selecting rows using the primary index",
 			post: PostProcessSpec{
 				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
@@ -79,6 +88,56 @@ func TestJoinReader(t *testing.T) {
 			expected:    "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
 		},
 		{
+			description: "Test selecting columns from second table",
+			post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 4},
+			},
+			input: [][]tree.Datum{
+				{aFn(2), bFn(2)},
+				{aFn(5), bFn(5)},
+				{aFn(10), bFn(10)},
+				{aFn(15), bFn(15)},
+			},
+			lookupCols:  []uint32{0, 1},
+			outputTypes: threeIntCols,
+			expected:    "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
+		},
+		{
+			description: "Test duplicates in the input of lookup joins",
+			post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 3},
+			},
+			input: [][]tree.Datum{
+				{aFn(2), bFn(2)},
+				{aFn(2), bFn(2)},
+				{aFn(5), bFn(5)},
+				{aFn(10), bFn(10)},
+				{aFn(15), bFn(15)},
+			},
+			lookupCols:  []uint32{0, 1},
+			outputTypes: threeIntCols,
+			expected:    "[[0 2 2] [0 2 2] [0 5 5] [1 0 0] [1 5 5]]",
+		},
+		{
+			description: "Test selecting rows using the primary index in lookup join",
+			post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 4},
+			},
+			input: [][]tree.Datum{
+				{aFn(2), bFn(2)},
+				{aFn(5), bFn(5)},
+				{aFn(10), bFn(10)},
+				{aFn(15), bFn(15)},
+			},
+			lookupCols:  []uint32{0, 1},
+			outputTypes: threeIntCols,
+			expected:    "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
+		},
+		{
+			description: "Test a filter in the post process spec and using a secondary index",
 			post: PostProcessSpec{
 				Filter:        Expression{Expr: "@3 <= 5"}, // sum <= 5
 				Projection:    true,
@@ -97,15 +156,33 @@ func TestJoinReader(t *testing.T) {
 			outputTypes: []sqlbase.ColumnType{strType},
 			expected:    "[['one'] ['five'] ['two-one'] ['one-three'] ['five-zero']]",
 		},
+		{
+			description: "Test lookup join with onExpr",
+			post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 4},
+			},
+			input: [][]tree.Datum{
+				{aFn(2), bFn(2)},
+				{aFn(5), bFn(5)},
+				{aFn(10), bFn(10)},
+				{aFn(15), bFn(15)},
+			},
+			lookupCols:  []uint32{0, 1},
+			outputTypes: threeIntCols,
+			onExpr:      "@2 < @5",
+			expected:    "[[1 0 1] [1 5 6]]",
+		},
 	}
 	for _, c := range testCases {
-		t.Run("", func(t *testing.T) {
-			evalCtx := tree.MakeTestingEvalContext()
+		t.Run(c.description, func(t *testing.T) {
+			st := cluster.MakeTestingClusterSettings()
+			evalCtx := tree.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := FlowCtx{
 				Ctx:      context.Background(),
 				EvalCtx:  evalCtx,
-				Settings: cluster.MakeTestingClusterSettings(),
+				Settings: st,
 				txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
 			}
 
@@ -120,7 +197,13 @@ func TestJoinReader(t *testing.T) {
 			in := NewRowBuffer(twoIntCols, encRows, RowBufferArgs{})
 
 			out := &RowBuffer{}
-			jr, err := newJoinReader(&flowCtx, &JoinReaderSpec{Table: *td}, in, &c.post, out)
+			jr, err := newJoinReader(
+				&flowCtx,
+				&JoinReaderSpec{Table: *td, LookupColumns: c.lookupCols, OnExpr: Expression{Expr: c.onExpr}},
+				in,
+				&c.post,
+				out,
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -168,13 +251,22 @@ func TestJoinReaderDrain(t *testing.T) {
 	)
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
-	evalCtx := tree.MakeTestingEvalContext()
+	evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
 	defer evalCtx.Stop(context.Background())
+
+	// Run the flow in a snowball trace so that we can test for tracing info.
+	tracer := tracing.NewTracer()
+	ctx, sp, err := tracing.StartSnowballTrace(context.Background(), tracer, "test flow ctx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Finish()
+
 	flowCtx := FlowCtx{
-		Ctx:      context.Background(),
+		Ctx:      ctx,
 		EvalCtx:  evalCtx,
 		Settings: s.ClusterSettings(),
-		txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+		txn:      client.NewTxn(s.DB(), s.NodeID(), client.LeafTxn),
 	}
 
 	encRow := make(sqlbase.EncDatumRow, 1)
@@ -217,6 +309,30 @@ func TestJoinReaderDrain(t *testing.T) {
 		}
 		if meta.Err != expectedMetaErr {
 			t.Fatalf("unexpected error in metadata: %v", meta.Err)
+		}
+
+		// Check for trailing metadata.
+		var traceSeen, txnMetaSeen bool
+		for {
+			row, meta = out.Next()
+			if row != nil {
+				t.Fatalf("row was pushed unexpectedly: %s", row.String(oneIntCol))
+			}
+			if meta == nil {
+				break
+			}
+			if meta.TraceData != nil {
+				traceSeen = true
+			}
+			if meta.TxnMeta != nil {
+				txnMetaSeen = true
+			}
+		}
+		if !traceSeen {
+			t.Fatal("missing tracing trailing metadata")
+		}
+		if !txnMetaSeen {
+			t.Fatal("missing txn trailing metadata")
 		}
 	})
 }

@@ -39,9 +39,11 @@ type updateNode struct {
 	editNodeBase
 	n             *tree.Update
 	updateCols    []sqlbase.ColumnDescriptor
+	computedCols  []sqlbase.ColumnDescriptor
 	updateColsIdx map[sqlbase.ColumnID]int // index in updateCols slice
+	computeExprs  []tree.TypedExpr
 	tw            tableUpdater
-	checkHelper   checkHelper
+	checkHelper   *sqlbase.CheckHelper
 	sourceSlots   []sourceSlot
 
 	run        updateRun
@@ -84,11 +86,11 @@ func (p *planner) Update(
 	setExprs := make([]*tree.UpdateExpr, len(n.Exprs))
 	for i, expr := range n.Exprs {
 		// Analyze the sub-query nodes.
-		newExpr, err := p.analyzeSubqueries(ctx, expr.Expr, len(expr.Names))
+		err := p.analyzeSubqueries(ctx, expr.Expr, len(expr.Names))
 		if err != nil {
 			return nil, err
 		}
-		setExprs[i] = &tree.UpdateExpr{Tuple: expr.Tuple, Expr: newExpr, Names: expr.Names}
+		setExprs[i] = &tree.UpdateExpr{Tuple: expr.Tuple, Expr: expr.Expr, Names: expr.Names}
 	}
 
 	// Determine which columns we're inserting into.
@@ -97,7 +99,8 @@ func (p *planner) Update(
 		return nil, err
 	}
 
-	updateCols, err := p.processColumns(en.tableDesc, names)
+	updateCols, err := p.processColumns(en.tableDesc, names,
+		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
 	}
@@ -108,15 +111,36 @@ func (p *planner) Update(
 		return nil, err
 	}
 
+	// TODO(justin): this is incorrect: we should allow this, but then it should
+	// error unless we both have a VALUES clause and every value being "inserted"
+	// into a computed column is DEFAULT. See #22434.
+	if err := checkHasNoComputedCols(updateCols); err != nil {
+		return nil, err
+	}
+
+	// We update the set of columns being updated into with any computed columns.
+	updateCols, computedCols, computeExprs, err :=
+		ProcessComputedColumns(ctx, updateCols, tn, en.tableDesc, &p.txCtx, p.EvalContext())
+	if err != nil {
+		return nil, err
+	}
+
 	var requestedCols []sqlbase.ColumnDescriptor
 	if _, retExprs := n.Returning.(*tree.ReturningExprs); retExprs || len(en.tableDesc.Checks) > 0 {
 		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
 		// exprs.
+		// TODO(nvanbenschoten): This could be made tighter, just the rows needed for
+		// the CHECK exprs.
 		requestedCols = en.tableDesc.Columns
 	}
 
 	fkTables, err := sqlbase.TablesNeededForFKs(
-		ctx, *en.tableDesc, sqlbase.CheckUpdates, p.lookupFKTable, p.CheckPrivilege,
+		ctx,
+		*en.tableDesc,
+		sqlbase.CheckUpdates,
+		p.lookupFKTable,
+		p.CheckPrivilege,
+		p.analyzeExpr,
 	)
 	if err != nil {
 		return nil, err
@@ -250,12 +274,12 @@ func (p *planner) Update(
 		n:             n,
 		editNodeBase:  en,
 		updateCols:    ru.UpdateCols,
+		computedCols:  computedCols,
+		computeExprs:  computeExprs,
 		updateColsIdx: updateColsIdx,
 		tw:            tw,
 		sourceSlots:   sourceSlots,
-	}
-	if err := un.checkHelper.init(ctx, p, tn, en.tableDesc); err != nil {
-		return nil, err
+		checkHelper:   fkTables[en.tableDesc.ID].CheckHelper,
 	}
 	if err := un.run.initEditNode(
 		ctx, &un.editNodeBase, rows, &un.tw, alias, n.Returning, desiredTypes); err != nil {
@@ -308,13 +332,37 @@ func (u *updateNode) Next(params runParams) (bool, error) {
 		}
 	}
 
-	if err := u.checkHelper.loadRow(u.tw.ru.FetchColIDtoRowIndex, oldValues, false); err != nil {
+	if len(u.computeExprs) > 0 {
+		// Evaluate computed columns if necessary.
+		newVals := make(tree.Datums, len(oldValues))
+		copy(newVals, oldValues)
+		for i, col := range u.tw.ru.UpdateCols {
+			newVals[u.tw.ru.FetchColIDtoRowIndex[col.ID]] = updateValues[i]
+		}
+
+		iv := &rowIndexedVarContainer{newVals, u.tableDesc.Columns, u.tw.ru.FetchColIDtoRowIndex}
+		params.EvalContext().IVarContainer = iv
+
+		for i := range u.computedCols {
+			d, err := u.computeExprs[i].Eval(params.EvalContext())
+			if err != nil {
+				return false, err
+			}
+			updateValues[u.updateColsIdx[u.computedCols[i].ID]] = d
+		}
+	}
+
+	params.EvalContext().IVarContainer = nil
+
+	// TODO(justin): we have actually constructed the whole row at this point and
+	// thus should be able to avoid loading it separately like this now.
+	if err := u.checkHelper.LoadRow(u.tw.ru.FetchColIDtoRowIndex, oldValues, false); err != nil {
 		return false, err
 	}
-	if err := u.checkHelper.loadRow(u.updateColsIdx, updateValues, true); err != nil {
+	if err := u.checkHelper.LoadRow(u.updateColsIdx, updateValues, true); err != nil {
 		return false, err
 	}
-	if err := u.checkHelper.check(params.EvalContext()); err != nil {
+	if err := u.checkHelper.Check(params.EvalContext()); err != nil {
 		return false, err
 	}
 
@@ -353,6 +401,9 @@ func (u *updateNode) Values() tree.Datums {
 	return u.run.resultRow
 }
 
+// requireSpool implements the planNodeRequireSpool interface.
+func (u *updateNode) requireSpool() {}
+
 func (u *updateNode) Close(ctx context.Context) {
 	u.run.rows.Close(ctx)
 	u.tw.close(ctx)
@@ -379,24 +430,9 @@ type editNodeBase struct {
 func (p *planner) makeEditNode(
 	ctx context.Context, tn *tree.TableName, priv privilege.Kind,
 ) (editNodeBase, error) {
-	tableDesc, err := p.Tables().getTableVersion(ctx, p.txn, p.getVirtualTabler(), tn)
+	tableDesc, err := ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
 	if err != nil {
 		return editNodeBase{}, err
-	}
-	// We don't support update on views or sequences, only real tables.
-	if !tableDesc.IsTable() {
-		return editNodeBase{},
-			pgerror.NewErrorf(
-				pgerror.CodeWrongObjectTypeError,
-				"cannot run %s on %s %q - %ss are not updateable",
-				priv, tableDesc.Kind(), tn, tableDesc.Kind())
-	}
-
-	// TODO(justin): temporary to split up computed columns PR.
-	for _, col := range tableDesc.Columns {
-		if col.ComputeExpr != nil {
-			return editNodeBase{}, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "TODO(justin)")
-		}
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, priv); err != nil {
@@ -520,9 +556,14 @@ func (p *planner) addOrMergeExpr(
 	return render.addOrReuseRender(col, expr, true), nil
 }
 
-// namesForExprs expands names in the tuples and subqueries in exprs.
-func (p *planner) namesForExprs(exprs tree.UpdateExprs) (tree.UnresolvedNames, error) {
-	var names tree.UnresolvedNames
+// namesForExprs collects all the names mentioned in the LHS of the
+// UpdateExprs.  That is, it will transform SET (a,b) = (1,2), b = 3,
+// (a,c) = 4 into [a,b,b,a,c].
+//
+// It also checks that the arity of the LHS and RHS match when
+// assigning tuples.
+func (p *planner) namesForExprs(exprs tree.UpdateExprs) (tree.NameList, error) {
+	var names tree.NameList
 	for _, expr := range exprs {
 		if expr.Tuple {
 			n := -1

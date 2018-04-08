@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -178,15 +179,15 @@ Outer:
 	}, nil
 }
 
-func (c *cascader) close(ctx context.Context) {
+func (c *cascader) clear(ctx context.Context) {
 	for _, container := range c.deletedRows {
-		container.Close(ctx)
+		container.Clear(ctx)
 	}
 	for _, container := range c.originalRows {
-		container.Close(ctx)
+		container.Clear(ctx)
 	}
 	for _, container := range c.updatedRows {
-		container.Close(ctx)
+		container.Clear(ctx)
 	}
 }
 
@@ -506,8 +507,8 @@ func (c *cascader) deleteRows(
 	defer primaryKeysToDelete.Close(ctx)
 
 	for _, resp := range br.Responses {
-		fetcher := spanKVFetcher{
-			kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+		fetcher := SpanKVFetcher{
+			KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 		}
 		if err := indexPKRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 			return nil, nil, 0, err
@@ -566,11 +567,11 @@ func (c *cascader) deleteRows(
 	deletedRowsStartIndex := deletedRows.Len()
 
 	// Delete all the rows in a new batch.
-	deleteBatch := c.txn.NewBatch()
+	batch := c.txn.NewBatch()
 
 	for _, resp := range pkResp.Responses {
-		fetcher := spanKVFetcher{
-			kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+		fetcher := SpanKVFetcher{
+			KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 		}
 		if err := pkRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 			return nil, nil, 0, err
@@ -587,15 +588,15 @@ func (c *cascader) deleteRows(
 			}
 
 			// Delete the row.
-			if err := rowDeleter.DeleteRow(ctx, deleteBatch, rowToDelete, SkipFKs, traceKV); err != nil {
+			if err := rowDeleter.DeleteRow(ctx, batch, rowToDelete, SkipFKs, traceKV); err != nil {
 				return nil, nil, 0, err
 			}
 		}
 	}
 
 	// Run the batch.
-	if err := c.txn.Run(ctx, deleteBatch); err != nil {
-		return nil, nil, 0, err
+	if err := c.txn.Run(ctx, batch); err != nil {
+		return nil, nil, 0, ConvertBatchError(ctx, referencingTable, batch)
 	}
 
 	return deletedRows, rowDeleter.FetchColIDtoRowIndex, deletedRowsStartIndex, nil
@@ -653,10 +654,35 @@ func (c *cascader) updateRows(
 	// Populate a map of all columns that need to be set if the action is not
 	// cascade.
 	var referencingIndexValuesByColIDs map[ColumnID]tree.Datum
-	if action == ForeignKeyReference_SET_NULL {
+	switch action {
+	case ForeignKeyReference_SET_NULL:
 		referencingIndexValuesByColIDs = make(map[ColumnID]tree.Datum)
 		for _, columnID := range referencingIndex.ColumnIDs {
 			referencingIndexValuesByColIDs[columnID] = tree.DNull
+		}
+	case ForeignKeyReference_SET_DEFAULT:
+		referencingIndexValuesByColIDs = make(map[ColumnID]tree.Datum)
+		for _, columnID := range referencingIndex.ColumnIDs {
+			column, err := referencingTable.FindColumnByID(columnID)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			parsedExpr, err := parser.ParseExpr(*column.DefaultExpr)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			typedExpr, err := tree.TypeCheck(parsedExpr, nil, column.Type.ToDatumType())
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			normalizedExpr, err := c.evalCtx.NormalizeExpr(typedExpr)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			referencingIndexValuesByColIDs[columnID], err = normalizedExpr.Eval(c.evalCtx)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
 		}
 	}
 
@@ -702,8 +728,8 @@ func (c *cascader) updateRows(
 		defer primaryKeysToUpdate.Close(ctx)
 
 		for _, resp := range br.Responses {
-			fetcher := spanKVFetcher{
-				kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+			fetcher := SpanKVFetcher{
+				KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 			}
 			if err := indexPKRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 				return nil, nil, nil, 0, err
@@ -739,8 +765,8 @@ func (c *cascader) updateRows(
 		}
 
 		for _, resp := range pkResp.Responses {
-			fetcher := spanKVFetcher{
-				kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+			fetcher := SpanKVFetcher{
+				KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 			}
 			if err := rowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 				return nil, nil, nil, 0, err
@@ -772,14 +798,7 @@ func (c *cascader) updateRows(
 									}
 									return nil, nil, nil, 0, pgerror.NewErrorf(pgerror.CodeNullValueNotAllowedError,
 										"cannot cascade a null value into %q as it violates a NOT NULL constraint",
-										tree.ErrString(&tree.ColumnItem{
-											TableName: tree.TableName{
-												DatabaseName: tree.Name(database.Name),
-												TableName:    tree.Name(referencingTable.Name),
-											},
-											ColumnName: tree.Name(column.Name),
-										}),
-									)
+										tree.ErrString(tree.NewUnresolvedName(database.Name, tree.PublicSchema, referencingTable.Name, column.Name)))
 								}
 							}
 							continue
@@ -793,9 +812,10 @@ func (c *cascader) updateRows(
 							colID,
 						)
 					}
-				case ForeignKeyReference_SET_NULL:
-					// Create the updateRow based on the original values and nulls for
-					// all values in the index.
+				case ForeignKeyReference_SET_NULL, ForeignKeyReference_SET_DEFAULT:
+					// Create the updateRow based on the original values and for all
+					// values in the index, either nulls (for SET NULL), or default (for
+					// SET DEFAULT).
 					for colID, rowIndex := range rowUpdater.updateColIDtoRowIndex {
 						if value, exists := referencingIndexValuesByColIDs[colID]; exists {
 							updateRow[rowIndex] = value
@@ -838,7 +858,7 @@ func (c *cascader) updateRows(
 		}
 	}
 	if err := c.txn.Run(ctx, batch); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, nil, nil, 0, ConvertBatchError(ctx, referencingTable, batch)
 	}
 
 	return originalRows, updatedRows, rowUpdater.FetchColIDtoRowIndex, startIndex, nil
@@ -903,7 +923,7 @@ func (c *cascader) cascadeAll(
 	colIDtoRowIndex map[ColumnID]int,
 	traceKV bool,
 ) error {
-	defer c.close(ctx)
+	defer c.clear(ctx)
 	var cascadeQ cascadeQueue
 
 	// Enqueue the first values.
@@ -936,7 +956,7 @@ func (c *cascader) cascadeAll(
 	for {
 		select {
 		case <-ctx.Done():
-			return NewQueryCanceledError()
+			return QueryCanceledError
 		default:
 		}
 		elem, exists := cascadeQ.dequeue()
@@ -988,14 +1008,14 @@ func (c *cascader) cascadeAll(
 								return err
 							}
 						}
-					case ForeignKeyReference_SET_NULL:
+					case ForeignKeyReference_SET_NULL, ForeignKeyReference_SET_DEFAULT:
 						originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
 							ctx,
 							&referencedIndex,
 							referencingTable.Table,
 							referencingIndex,
 							elem,
-							ForeignKeyReference_SET_NULL,
+							referencingIndex.ForeignKey.OnDelete,
 							traceKV,
 						)
 						if err != nil {
@@ -1018,7 +1038,7 @@ func (c *cascader) cascadeAll(
 				} else {
 					// Updating a row.
 					switch referencingIndex.ForeignKey.OnUpdate {
-					case ForeignKeyReference_CASCADE, ForeignKeyReference_SET_NULL:
+					case ForeignKeyReference_CASCADE, ForeignKeyReference_SET_NULL, ForeignKeyReference_SET_DEFAULT:
 						originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
 							ctx,
 							&referencedIndex,
@@ -1113,6 +1133,14 @@ func (c *cascader) cascadeAll(
 			if err := rowUpdater.Fks.runIndexChecks(ctx, originalRows.At(0), updatedRows.At(0)); err != nil {
 				return err
 			}
+			// Now check all check constraints for the table.
+			checkHelper := c.tablesByID[tableID].CheckHelper
+			if err := checkHelper.LoadRow(rowUpdater.updateColIDtoRowIndex, updatedRows.At(0), false); err != nil {
+				return err
+			}
+			if err := checkHelper.Check(c.evalCtx); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -1137,6 +1165,14 @@ func (c *cascader) cascadeAll(
 				}
 			}
 			if err := rowUpdater.Fks.runIndexChecks(ctx, originalRows.At(i), finalRow); err != nil {
+				return err
+			}
+			// Now check all check constraints for the table.
+			checkHelper := c.tablesByID[tableID].CheckHelper
+			if err := checkHelper.LoadRow(rowUpdater.updateColIDtoRowIndex, finalRow, false); err != nil {
+				return err
+			}
+			if err := checkHelper.Check(c.evalCtx); err != nil {
 				return err
 			}
 		}

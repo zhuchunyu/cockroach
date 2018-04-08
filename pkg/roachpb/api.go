@@ -68,6 +68,40 @@ func (r RangeIDSlice) Len() int           { return len(r) }
 func (r RangeIDSlice) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
 func (r RangeIDSlice) Less(i, j int) bool { return r[i] < r[j] }
 
+// RequiresReadLease returns whether the ReadConsistencyType requires
+// that a read-only request be performed on an active valid leaseholder.
+func (rc ReadConsistencyType) RequiresReadLease() bool {
+	switch rc {
+	case CONSISTENT:
+		return true
+	case READ_UNCOMMITTED:
+		return true
+	case INCONSISTENT:
+		return false
+	}
+	panic("unreachable")
+}
+
+// SupportsBatch determines whether the methods in the provided batch
+// are supported by the ReadConsistencyType, returning an error if not.
+func (rc ReadConsistencyType) SupportsBatch(ba BatchRequest) error {
+	switch rc {
+	case CONSISTENT:
+		return nil
+	case READ_UNCOMMITTED, INCONSISTENT:
+		for _, ru := range ba.Requests {
+			m := ru.GetInner().Method()
+			switch m {
+			case Get, Scan, ReverseScan:
+			default:
+				return errors.Errorf("method %s not allowed with %s batch", m, rc)
+			}
+		}
+		return nil
+	}
+	panic("unreachable")
+}
+
 const (
 	isAdmin    = 1 << iota // admin cmds don't go through raft, but run on lease holder
 	isRead                 // read-only cmds don't go through raft, but may run on lease holder
@@ -81,8 +115,10 @@ const (
 	// proposing replica has a valid lease.
 	skipLeaseCheck
 	consultsTSCache       // mutating commands which write data at a timestamp
-	updatesTSCache        // commands which read data at a timestamp
+	updatesReadTSCache    // commands which update the read timestamp cache
+	updatesWriteTSCache   // commands which update the write timestamp cache
 	updatesTSCacheOnError // commands which make read data available on errors
+	needsRefresh          // commands which require refreshes to avoid serializable retries
 )
 
 // IsReadOnly returns true iff the request is read-only.
@@ -112,11 +148,17 @@ func ConsultsTimestampCache(args Request) bool {
 }
 
 // UpdatesTimestampCache returns whether the command must update
-// the timestamp cache in order to set a low water mark for the
+// the read timestamp cache in order to set a low water mark for the
 // timestamp at which mutations to overlapping key(s) can write
 // such that they don't re-write history.
 func UpdatesTimestampCache(args Request) bool {
-	return (args.flags() & updatesTSCache) != 0
+	return (args.flags() & (updatesReadTSCache | updatesWriteTSCache)) != 0
+}
+
+// UpdatesWriteTimestampCache returns whether the command must update
+// the write timestamp cache.
+func UpdatesWriteTimestampCache(args Request) bool {
+	return (args.flags() & updatesWriteTSCache) != 0
 }
 
 // UpdatesTimestampCacheOnError returns whether the command must
@@ -124,6 +166,12 @@ func UpdatesTimestampCache(args Request) bool {
 // which was read is returned (e.g. ConditionalPut ConditionFailedError).
 func UpdatesTimestampCacheOnError(args Request) bool {
 	return (args.flags() & updatesTSCacheOnError) != 0
+}
+
+// NeedsRefresh returns whether the command must be refreshed in
+// order to avoid client-side retries on serializable transactions.
+func NeedsRefresh(args Request) bool {
+	return (args.flags() & needsRefresh) != 0
 }
 
 // Request is an interface for RPC requests.
@@ -188,6 +236,7 @@ func (rh *ResponseHeader) combine(otherRH ResponseHeader) error {
 		panic(fmt.Sprintf("combining %+v with %+v", rh.ResumeSpan, otherRH.ResumeSpan))
 	}
 	rh.ResumeSpan = otherRH.ResumeSpan
+	rh.ResumeReason = otherRH.ResumeReason
 	rh.NumKeys += otherRH.NumKeys
 	rh.RangeInfos = append(rh.RangeInfos, otherRH.RangeInfos...)
 	return nil
@@ -473,7 +522,7 @@ func (*PushTxnRequest) Method() Method { return PushTxn }
 func (*QueryTxnRequest) Method() Method { return QueryTxn }
 
 // Method implements the Request interface.
-func (*RangeLookupRequest) Method() Method { return RangeLookup }
+func (*DeprecatedRangeLookupRequest) Method() Method { return DeprecatedRangeLookup }
 
 // Method implements the Request interface.
 func (*ResolveIntentRequest) Method() Method { return ResolveIntent }
@@ -522,6 +571,12 @@ func (*AddSSTableRequest) Method() Method { return AddSSTable }
 
 // Method implements the Request interface.
 func (*RecomputeStatsRequest) Method() Method { return RecomputeStats }
+
+// Method implements the Request interface.
+func (*RefreshRequest) Method() Method { return Refresh }
+
+// Method implements the Request interface.
+func (*RefreshRangeRequest) Method() Method { return RefreshRange }
 
 // ShallowCopy implements the Request interface.
 func (gr *GetRequest) ShallowCopy() Request {
@@ -650,7 +705,7 @@ func (qtr *QueryTxnRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
-func (rlr *RangeLookupRequest) ShallowCopy() Request {
+func (rlr *DeprecatedRangeLookupRequest) ShallowCopy() Request {
 	shallowCopy := *rlr
 	return &shallowCopy
 }
@@ -747,6 +802,18 @@ func (r *AddSSTableRequest) ShallowCopy() Request {
 
 // ShallowCopy implements the Request interface.
 func (r *RecomputeStatsRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *RefreshRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *RefreshRangeRequest) ShallowCopy() Request {
 	shallowCopy := *r
 	return &shallowCopy
 }
@@ -885,21 +952,39 @@ func NewReverseScan(key, endKey Key) Request {
 	}
 }
 
-func (*GetRequest) flags() int { return isRead | isTxn | updatesTSCache }
+func (*GetRequest) flags() int { return isRead | isTxn | updatesReadTSCache | needsRefresh }
 func (*PutRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsTSCache }
 
-// ConditionalPut and InitPut effectively read and may not write, so
-// must update the timestamp cache. Note that on ConditionFailedErrors
+// ConditionalPut effectively reads and may not write, so must update
+// the timestamp cache. Note that on ConditionFailedErrors
 // ConditionalPut returns the read data and must update the timestamp
-// cache.
+// cache. ConditionalPuts do not require a refresh because on write-too-old
+// errors, they return an error immediately instead of continuing a
+// serializable transaction to be retried at end transaction.
 func (*ConditionalPutRequest) flags() int {
-	return isRead | isWrite | isTxn | isTxnWrite | updatesTSCache | updatesTSCacheOnError | consultsTSCache
+	return isRead | isWrite | isTxn | isTxnWrite | updatesReadTSCache | updatesTSCacheOnError | consultsTSCache
 }
+
+// InitPut, like ConditionalPut, effectively reads and may not write.
+// It also may return the actual data read on ConditionFailedErrors,
+// so must update the timestamp cache on errors. Unlike CPut, InitPuts
+// require a refresh because they may execute successfully without
+// leaving an intent (i.e., when the existing value is equal to the
+// proposed value).
 func (*InitPutRequest) flags() int {
-	return isRead | isWrite | isTxn | isTxnWrite | updatesTSCache | consultsTSCache
+	return isRead | isWrite | isTxn | isTxnWrite | updatesReadTSCache | updatesTSCacheOnError | needsRefresh | consultsTSCache
 }
-func (*IncrementRequest) flags() int { return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache }
-func (*DeleteRequest) flags() int    { return isWrite | isTxn | isTxnWrite | consultsTSCache }
+
+// Increment reads the existing value, but always leaves an intent so
+// it does not need to update the timestamp cache. It also does not
+// require refresh because on write-too-old errors experienced during
+// serializable transactions, increment returns the error instead of
+// continuing the transaction.
+func (*IncrementRequest) flags() int {
+	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache
+}
+
+func (*DeleteRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsTSCache }
 func (drr *DeleteRangeRequest) flags() int {
 	// DeleteRangeRequest has different properties if the "inline" flag is set.
 	// This flag indicates that the request is deleting inline MVCC values,
@@ -922,34 +1007,36 @@ func (drr *DeleteRangeRequest) flags() int {
 	// intents or tombstones for keys which don't yet exist. By updating
 	// the write timestamp cache, it forces subsequent writes to get a
 	// write-too-old error and avoids the phantom delete anomaly.
-	return isWrite | isTxn | isTxnWrite | isRange | updatesTSCache | consultsTSCache
+	return isWrite | isTxn | isTxnWrite | isRange | updatesWriteTSCache | needsRefresh | consultsTSCache
 }
 
 // Note that ClearRange commands cannot be part of a transaction as
 // they clear all MVCC versions.
-func (*ClearRangeRequest) flags() int       { return isWrite | isRange | isAlone }
-func (*ScanRequest) flags() int             { return isRead | isRange | isTxn | updatesTSCache }
-func (*ReverseScanRequest) flags() int      { return isRead | isRange | isReverse | isTxn | updatesTSCache }
+func (*ClearRangeRequest) flags() int { return isWrite | isRange | isAlone }
+func (*ScanRequest) flags() int       { return isRead | isRange | isTxn | updatesReadTSCache | needsRefresh }
+func (*ReverseScanRequest) flags() int {
+	return isRead | isRange | isReverse | isTxn | updatesReadTSCache | needsRefresh
+}
 func (*BeginTransactionRequest) flags() int { return isWrite | isTxn | consultsTSCache }
 
 // EndTransaction updates the write timestamp cache to prevent
 // replays. Replays for the same transaction key and timestamp will
 // have Txn.WriteTooOld=true and must retry on EndTransaction.
-func (*EndTransactionRequest) flags() int      { return isWrite | isTxn | isAlone | updatesTSCache }
-func (*AdminSplitRequest) flags() int          { return isAdmin | isAlone }
-func (*AdminMergeRequest) flags() int          { return isAdmin | isAlone }
-func (*AdminTransferLeaseRequest) flags() int  { return isAdmin | isAlone }
-func (*AdminChangeReplicasRequest) flags() int { return isAdmin | isAlone }
-func (*HeartbeatTxnRequest) flags() int        { return isWrite | isTxn }
-func (*GCRequest) flags() int                  { return isWrite | isRange }
-func (*PushTxnRequest) flags() int             { return isWrite | isAlone }
-func (*QueryTxnRequest) flags() int            { return isRead | isAlone }
-func (*RangeLookupRequest) flags() int         { return isRead }
-func (*ResolveIntentRequest) flags() int       { return isWrite }
-func (*ResolveIntentRangeRequest) flags() int  { return isWrite | isRange }
-func (*NoopRequest) flags() int                { return isRead } // slightly special
-func (*TruncateLogRequest) flags() int         { return isWrite }
-func (*MergeRequest) flags() int               { return isWrite }
+func (*EndTransactionRequest) flags() int        { return isWrite | isTxn | isAlone | updatesWriteTSCache }
+func (*AdminSplitRequest) flags() int            { return isAdmin | isAlone }
+func (*AdminMergeRequest) flags() int            { return isAdmin | isAlone }
+func (*AdminTransferLeaseRequest) flags() int    { return isAdmin | isAlone }
+func (*AdminChangeReplicasRequest) flags() int   { return isAdmin | isAlone }
+func (*HeartbeatTxnRequest) flags() int          { return isWrite | isTxn }
+func (*GCRequest) flags() int                    { return isWrite | isRange }
+func (*PushTxnRequest) flags() int               { return isWrite | isAlone }
+func (*QueryTxnRequest) flags() int              { return isRead | isAlone }
+func (*DeprecatedRangeLookupRequest) flags() int { return isRead }
+func (*ResolveIntentRequest) flags() int         { return isWrite }
+func (*ResolveIntentRangeRequest) flags() int    { return isWrite | isRange }
+func (*NoopRequest) flags() int                  { return isRead } // slightly special
+func (*TruncateLogRequest) flags() int           { return isWrite }
+func (*MergeRequest) flags() int                 { return isWrite }
 
 func (*RequestLeaseRequest) flags() int {
 	return isWrite | isAlone | skipLeaseCheck
@@ -978,10 +1065,16 @@ func (*ComputeChecksumRequest) flags() int          { return isWrite | isRange }
 func (*DeprecatedVerifyChecksumRequest) flags() int { return isWrite }
 func (*CheckConsistencyRequest) flags() int         { return isAdmin | isRange }
 func (*WriteBatchRequest) flags() int               { return isWrite | isRange }
-func (*ExportRequest) flags() int                   { return isRead | isRange | updatesTSCache }
+func (*ExportRequest) flags() int                   { return isRead | isRange | updatesReadTSCache }
 func (*ImportRequest) flags() int                   { return isAdmin | isAlone }
 func (*AdminScatterRequest) flags() int             { return isAdmin | isAlone | isRange }
 func (*AddSSTableRequest) flags() int               { return isWrite | isAlone | isRange }
+
+// RefreshRequest and RefreshRangeRequest both list
+// updates(Read)TSCache, though they actually update the read or write
+// timestamp cache depending on the write parameter in the request.
+func (*RefreshRequest) flags() int      { return isRead | isTxn | updatesReadTSCache }
+func (*RefreshRangeRequest) flags() int { return isRead | isTxn | isRange | updatesReadTSCache }
 
 // Keys returns credentials in an aws.Config.
 func (b *ExportStorage_S3) Keys() *aws.Config {

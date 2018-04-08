@@ -185,12 +185,12 @@ func TestSendRPCOrder(t *testing.T) {
 	g, clock := makeGossip(t, stopper)
 	rangeID := roachpb.RangeID(99)
 
-	nodeAttrs := map[int32][]string{
+	nodeTiers := map[int32][]roachpb.Tier{
 		1: {}, // The local node, set in each test case.
-		2: {"us", "west", "gpu"},
-		3: {"eu", "dublin", "pdu2", "gpu"},
-		4: {"us", "east", "gpu"},
-		5: {"us", "east", "gpu", "flaky"},
+		2: {roachpb.Tier{Key: "country", Value: "us"}, roachpb.Tier{Key: "region", Value: "west"}},
+		3: {roachpb.Tier{Key: "country", Value: "eu"}, roachpb.Tier{Key: "city", Value: "dublin"}},
+		4: {roachpb.Tier{Key: "country", Value: "us"}, roachpb.Tier{Key: "region", Value: "east"}, roachpb.Tier{Key: "city", Value: "nyc"}},
+		5: {roachpb.Tier{Key: "country", Value: "us"}, roachpb.Tier{Key: "region", Value: "east"}, roachpb.Tier{Key: "city", Value: "mia"}},
 	}
 
 	// Gets filled below to identify the replica by its address.
@@ -216,7 +216,7 @@ func TestSendRPCOrder(t *testing.T) {
 
 	testCases := []struct {
 		args        roachpb.Request
-		attrs       []string
+		tiers       []roachpb.Tier
 		expReplica  []roachpb.NodeID
 		leaseHolder int32 // 0 for not caching a lease holder.
 		// Naming is somewhat off, as eventually consistent reads usually
@@ -229,7 +229,7 @@ func TestSendRPCOrder(t *testing.T) {
 		// Inconsistent Scan without matching attributes.
 		{
 			args:       &roachpb.ScanRequest{},
-			attrs:      []string{},
+			tiers:      []roachpb.Tier{},
 			expReplica: []roachpb.NodeID{1, 2, 3, 4, 5},
 		},
 		// Inconsistent Scan with matching attributes.
@@ -237,7 +237,7 @@ func TestSendRPCOrder(t *testing.T) {
 		// go stable.
 		{
 			args:  &roachpb.ScanRequest{},
-			attrs: nodeAttrs[5],
+			tiers: nodeTiers[5],
 			// Compare only the first two resulting addresses.
 			expReplica: []roachpb.NodeID{5, 4, 0, 0, 0},
 		},
@@ -246,7 +246,7 @@ func TestSendRPCOrder(t *testing.T) {
 		// a lease holder.
 		{
 			args:       &roachpb.ScanRequest{},
-			attrs:      []string{},
+			tiers:      []roachpb.Tier{},
 			expReplica: []roachpb.NodeID{1, 2, 3, 4, 5},
 			consistent: true,
 		},
@@ -254,14 +254,14 @@ func TestSendRPCOrder(t *testing.T) {
 		// Should go random and not change anything.
 		{
 			args:       &roachpb.PutRequest{},
-			attrs:      []string{"nomatch"},
+			tiers:      []roachpb.Tier{{Key: "nomatch", Value: ""}},
 			expReplica: []roachpb.NodeID{1, 2, 3, 4, 5},
 		},
 		// Put with matching attributes but no lease holder.
 		// Should move the two nodes matching the attributes to the front.
 		{
 			args:  &roachpb.PutRequest{},
-			attrs: append(nodeAttrs[5], "irrelevant"),
+			tiers: append(nodeTiers[5], roachpb.Tier{Key: "irrelevant", Value: ""}),
 			// Compare only the first two resulting addresses.
 			expReplica: []roachpb.NodeID{5, 4, 0, 0, 0},
 		},
@@ -270,7 +270,7 @@ func TestSendRPCOrder(t *testing.T) {
 		// (the last and second to last) in that order.
 		{
 			args:  &roachpb.PutRequest{},
-			attrs: append(nodeAttrs[5], "irrelevant"),
+			tiers: append(nodeTiers[5], roachpb.Tier{Key: "irrelevant", Value: ""}),
 			// Compare only the first resulting addresses as we have a lease holder
 			// and that means we're only trying to send there.
 			expReplica:  []roachpb.NodeID{2, 5, 4, 0, 0},
@@ -280,7 +280,7 @@ func TestSendRPCOrder(t *testing.T) {
 		// go random as the lease holder does not matter.
 		{
 			args:        &roachpb.GetRequest{},
-			attrs:       []string{},
+			tiers:       []roachpb.Tier{},
 			expReplica:  []roachpb.NodeID{1, 2, 3, 4, 5},
 			leaseHolder: 2,
 		},
@@ -296,8 +296,8 @@ func TestSendRPCOrder(t *testing.T) {
 		nd := &roachpb.NodeDescriptor{
 			NodeID:  roachpb.NodeID(i),
 			Address: util.MakeUnresolvedAddr(addr.Network(), addr.String()),
-			Attrs: roachpb.Attributes{
-				Attrs: nodeAttrs[i],
+			Locality: roachpb.Locality{
+				Tiers: nodeTiers[i],
 			},
 		}
 		if err := g.AddInfoProto(gossip.MakeNodeIDKey(roachpb.NodeID(i)), nd, time.Hour); err != nil {
@@ -343,8 +343,8 @@ func TestSendRPCOrder(t *testing.T) {
 			// The local node needs to get its attributes during sendRPC.
 			nd := &roachpb.NodeDescriptor{
 				NodeID: 6,
-				Attrs: roachpb.Attributes{
-					Attrs: tc.attrs,
+				Locality: roachpb.Locality{
+					Tiers: tc.tiers,
 				},
 			}
 			g.NodeID.Reset(nd.NodeID)
@@ -468,66 +468,6 @@ var threeReplicaMockRangeDescriptorDB = mockRangeDescriptorDBForDescs(
 	testMetaRangeDescriptor,
 	testUserRangeDescriptor3Replicas,
 )
-
-func TestOwnNodeCertain(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-
-	g, clock := makeGossip(t, stopper)
-	const expNodeID = 42
-	nd := &roachpb.NodeDescriptor{
-		NodeID:  expNodeID,
-		Address: util.MakeUnresolvedAddr("tcp", "foobar:1234"),
-	}
-	g.NodeID.Reset(nd.NodeID)
-	if err := g.SetNodeDescriptor(nd); err != nil {
-		t.Fatal(err)
-	}
-	if err := g.AddInfoProto(gossip.MakeNodeIDKey(expNodeID), nd, time.Hour); err != nil {
-		t.Fatal(err)
-	}
-
-	act := make(map[roachpb.NodeID]hlc.Timestamp)
-	var testFn rpcSendFn = func(
-		_ context.Context,
-		_ SendOptions,
-		_ ReplicaSlice,
-		ba roachpb.BatchRequest,
-		_ *rpc.Context,
-	) (*roachpb.BatchResponse, error) {
-		for _, v := range ba.Txn.ObservedTimestamps {
-			act[v.NodeID] = v.Timestamp
-		}
-		return ba.CreateReply(), nil
-	}
-
-	cfg := DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Clock:      clock,
-		TestingKnobs: DistSenderTestingKnobs{
-			TransportFactory: adaptLegacyTransport(testFn),
-		},
-		RangeDescriptorDB: defaultMockRangeDescriptorDB,
-	}
-	expTS := hlc.Timestamp{WallTime: 1, Logical: 2}
-	ds := NewDistSender(cfg, g)
-	v := roachpb.MakeValueFromString("value")
-	put := roachpb.NewPut(roachpb.Key("a"), v)
-	if _, err := client.SendWrappedWith(context.Background(), ds, roachpb.Header{
-		// MaxTimestamp is set very high so that all uncertainty updates have
-		// effect.
-		Txn: &roachpb.Transaction{OrigTimestamp: expTS, MaxTimestamp: hlc.MaxTimestamp},
-	}, put); err != nil {
-		t.Fatalf("put encountered error: %s", err)
-	}
-	exp := map[roachpb.NodeID]hlc.Timestamp{
-		expNodeID: expTS,
-	}
-	if !reflect.DeepEqual(exp, act) {
-		t.Fatalf("wanted %v, got %v", exp, act)
-	}
-}
 
 func TestImmutableBatchArgs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -1849,115 +1789,6 @@ func TestSequenceUpdate(t *testing.T) {
 	}
 }
 
-// TestSequenceUpdateOnMultiRangeQueryLoop reproduces #3206 and
-// verifies that the sequence is updated in the DistSender
-// multi-range-query loop.
-//
-// More specifically, the issue was that DistSender might send
-// multiple batch requests to the same replica when it finds a
-// post-split range descriptor in the cache while the split has not
-// yet been fully completed. By giving a higher sequence to the second
-// request, we can avoid an infinite txn restart error (otherwise
-// caused by hitting the sequence cache).
-func TestSequenceUpdateOnMultiRangeQueryLoop(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-
-	g, clock := makeGossip(t, stopper)
-	if err := g.SetNodeDescriptor(&roachpb.NodeDescriptor{NodeID: 1}); err != nil {
-		t.Fatal(err)
-	}
-	nd := &roachpb.NodeDescriptor{
-		NodeID:  roachpb.NodeID(1),
-		Address: util.MakeUnresolvedAddr(testAddress.Network(), testAddress.String()),
-	}
-	if err := g.AddInfoProto(gossip.MakeNodeIDKey(roachpb.NodeID(1)), nd, time.Hour); err != nil {
-		t.Fatal(err)
-
-	}
-
-	// Fill MockRangeDescriptorDB with two descriptors.
-	var descriptor1 = roachpb.RangeDescriptor{
-		RangeID:  2,
-		StartKey: testMetaEndKey,
-		EndKey:   roachpb.RKey("b"),
-		Replicas: []roachpb.ReplicaDescriptor{
-			{
-				NodeID:  1,
-				StoreID: 1,
-			},
-		},
-	}
-	var descriptor2 = roachpb.RangeDescriptor{
-		RangeID:  3,
-		StartKey: roachpb.RKey("b"),
-		EndKey:   roachpb.RKeyMax,
-		Replicas: []roachpb.ReplicaDescriptor{
-			{
-				NodeID:  1,
-				StoreID: 1,
-			},
-		},
-	}
-	descDB := mockRangeDescriptorDBForDescs(
-		testMetaRangeDescriptor,
-		descriptor1,
-		descriptor2,
-	)
-
-	// Define our rpcSend stub which checks the span of the batch
-	// requests. Because of parallelization, the requests for the
-	// two batches won't necessarily arrive in a stable order. The
-	// request to "a" should have a sequence number that immediately
-	// precedes the request to "b".
-	var aSequence, bSequence int32
-	var testFn rpcSendFn = func(
-		_ context.Context,
-		_ SendOptions,
-		_ ReplicaSlice,
-		ba roachpb.BatchRequest,
-		_ *rpc.Context,
-	) (*roachpb.BatchResponse, error) {
-		rs, err := keys.Range(ba)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rs.Key.Equal(roachpb.RKey("a")) && rs.EndKey.Equal(roachpb.RKey("a").Next()) {
-			aSequence = ba.Txn.Sequence
-		} else if rs.Key.Equal(roachpb.RKey("b")) && rs.EndKey.Equal(roachpb.RKey("b").Next()) {
-			bSequence = ba.Txn.Sequence
-		} else {
-			t.Fatalf("unexpected request for span %s", rs)
-		}
-		return ba.CreateReply(), nil
-	}
-
-	cfg := DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Clock:      clock,
-		TestingKnobs: DistSenderTestingKnobs{
-			TransportFactory: adaptLegacyTransport(testFn),
-		},
-		RangeDescriptorDB: descDB,
-	}
-	ds := NewDistSender(cfg, g)
-
-	// Send a batch request containing two puts.
-	var ba roachpb.BatchRequest
-	ba.Txn = &roachpb.Transaction{Name: "test"}
-	val := roachpb.MakeValueFromString("val")
-	ba.Add(roachpb.NewPut(roachpb.Key("a"), val))
-	val = roachpb.MakeValueFromString("val")
-	ba.Add(roachpb.NewPut(roachpb.Key("b"), val))
-	if _, pErr := ds.Send(context.Background(), ba); pErr != nil {
-		t.Fatal(pErr)
-	}
-	if bSequence != aSequence+1 {
-		t.Errorf("unexpected sequence; expected %d, but got %d", aSequence+1, bSequence)
-	}
-}
-
 type batchMethods struct {
 	sequence int32
 	methods  []roachpb.Method
@@ -2310,12 +2141,13 @@ func TestErrorIndexAlignment(t *testing.T) {
 	// partial batch.
 	testCases := []struct {
 		// The nth request to return an error.
-		nthPartialBatch  int
-		expectedFinalIdx int32
+		nthPartialBatch      int
+		expectedFinalIdx     int32
+		expectedMixedSuccess bool
 	}{
-		{0, 0},
-		{1, 1},
-		{2, 3},
+		{0, 0, false},
+		{1, 1, true},
+		{2, 3, true},
 	}
 
 	descDB := mockRangeDescriptorDBForDescs(
@@ -2379,9 +2211,16 @@ func TestErrorIndexAlignment(t *testing.T) {
 			if pErr == nil {
 				t.Fatalf("expected an error to be returned from distSender")
 			}
+			aPS, ok := pErr.GetDetail().(*roachpb.MixedSuccessError)
+			if a, e := ok, tc.expectedMixedSuccess; a != e {
+				t.Fatalf("expected mixed success %t; got %t", e, a)
+			}
+			if ok {
+				pErr = aPS.Wrapped
+			}
 
 			if pErr.Index == nil {
-				t.Fatalf("expected error index to be set")
+				t.Fatalf("expected error index to be set for err %T", pErr.GetDetail())
 			}
 
 			if pErr.Index.Index != tc.expectedFinalIdx {

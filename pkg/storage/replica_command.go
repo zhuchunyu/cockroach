@@ -267,13 +267,13 @@ func evalEndTransaction(
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
-		return result.Result{}, roachpb.NewTransactionStatusError("does not exist")
+		return result.Result{}, roachpb.NewTransactionNotFoundStatusError()
 	}
-	// We're using existingTxn on the reply, even though it can be stale compared
-	// to the Transaction in the request (e.g. the Sequence can be stale). This is
-	// OK since we're processing an EndTransaction and so there's not going to be
-	// more requests using the transaction from this reply (or, in case of a
-	// restart, we'll reset the Transaction anyway).
+	// We're using existingTxn on the reply, although it can be stale
+	// compared to the Transaction in the request (e.g. the Sequence,
+	// and various timestamps). We must be careful to update it with the
+	// supplied ba.Txn if we return it with an error which might be
+	// retried, as for example to avoid client-side serializable restart.
 	reply.Txn = &existingTxn
 
 	// Verify that we can either commit it or abort it (according
@@ -289,8 +289,10 @@ func evalEndTransaction(
 			// Do not return TransactionAbortedError since the client anyway
 			// wanted to abort the transaction.
 			desc := cArgs.EvalCtx.Desc()
-			externalIntents := resolveLocalIntents(ctx, desc,
-				batch, ms, *args, reply.Txn, cArgs.EvalCtx.EvalKnobs())
+			externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, *args, reply.Txn, cArgs.EvalCtx)
+			if err != nil {
+				return result.Result{}, err
+			}
 			if err := updateTxnWithExternalIntents(
 				ctx, batch, ms, *args, reply.Txn, externalIntents,
 			); err != nil {
@@ -298,7 +300,7 @@ func evalEndTransaction(
 			}
 			// Use alwaysReturn==true because the transaction is definitely
 			// aborted, no matter what happens to this command.
-			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */), nil
+			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison), nil
 		}
 		// If the transaction was previously aborted by a concurrent writer's
 		// push, any intents written are still open. It's only now that we know
@@ -309,7 +311,7 @@ func evalEndTransaction(
 		// to abort, but the transaction is definitely aborted and its intents
 		// can go.
 		reply.Txn.Intents = args.IntentSpans
-		return result.FromEndTxn(reply.Txn, true /* alwaysReturn */), roachpb.NewTransactionAbortedError()
+		return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison), roachpb.NewTransactionAbortedError()
 
 	case roachpb.PENDING:
 		if h.Txn.Epoch < reply.Txn.Epoch {
@@ -337,27 +339,13 @@ func evalEndTransaction(
 		)
 	}
 
-	// Take max of requested epoch and existing epoch. The requester
-	// may have incremented the epoch on retries.
-	if reply.Txn.Epoch < h.Txn.Epoch {
-		reply.Txn.Epoch = h.Txn.Epoch
-	}
-	// Take max of requested priority and existing priority. This isn't
-	// terribly useful, but we do it for completeness.
-	if reply.Txn.Priority < h.Txn.Priority {
-		reply.Txn.Priority = h.Txn.Priority
-	}
-
-	// Take max of supplied txn's timestamp and persisted txn's
-	// timestamp. It may have been pushed by another transaction.
-	// Note that we do not use the batch request timestamp, which for
-	// a transaction is always set to the txn's original timestamp.
-	reply.Txn.Timestamp.Forward(h.Txn.Timestamp)
+	// Update the existing txn with the supplied txn.
+	reply.Txn.Update(h.Txn)
 
 	// Set transaction status to COMMITTED or ABORTED as per the
 	// args.Commit parameter.
 	if args.Commit {
-		if retry, reason := isEndTransactionTriggeringRetryError(h.Txn, reply.Txn); retry {
+		if retry, reason := isEndTransactionTriggeringRetryError(reply.Txn, *args); retry {
 			return result.Result{}, roachpb.NewTransactionRetryError(reason)
 		}
 
@@ -383,8 +371,10 @@ func evalEndTransaction(
 	}
 
 	desc := cArgs.EvalCtx.Desc()
-	externalIntents := resolveLocalIntents(ctx, desc,
-		batch, ms, *args, reply.Txn, cArgs.EvalCtx.EvalKnobs())
+	externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, *args, reply.Txn, cArgs.EvalCtx)
+	if err != nil {
+		return result.Result{}, err
+	}
 	if err := updateTxnWithExternalIntents(ctx, batch, ms, *args, reply.Txn, externalIntents); err != nil {
 		return result.Result{}, err
 	}
@@ -418,7 +408,7 @@ func evalEndTransaction(
 	// We specify alwaysReturn==false because if the commit fails below Raft, we
 	// don't want the intents to be up for resolution. That should happen only
 	// if the commit actually happens; otherwise, we risk losing writes.
-	intentsResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */)
+	intentsResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */, args.Poison)
 	intentsResult.Local.UpdatedTxns = &[]*roachpb.Transaction{reply.Txn}
 	if err := pd.MergeAndDestroy(intentsResult); err != nil {
 		return result.Result{}, err
@@ -436,29 +426,46 @@ func isEndTransactionExceedingDeadline(t hlc.Timestamp, args roachpb.EndTransact
 // EndTransactionRequest cannot be committed and needs to return a
 // TransactionRetryError.
 func isEndTransactionTriggeringRetryError(
-	headerTxn, currentTxn *roachpb.Transaction,
-) (bool, roachpb.TransactionRetryReason) {
+	txn *roachpb.Transaction, args roachpb.EndTransactionRequest,
+) (retry bool, reason roachpb.TransactionRetryReason) {
 	// If we saw any WriteTooOldErrors, we must restart to avoid lost
 	// update anomalies.
-	if headerTxn.WriteTooOld {
-		return true, roachpb.RETRY_WRITE_TOO_OLD
+	if txn.WriteTooOld {
+		retry, reason = true, roachpb.RETRY_WRITE_TOO_OLD
+	} else {
+		origTimestamp := txn.OrigTimestamp
+		origTimestamp.Forward(txn.RefreshedTimestamp)
+		isTxnPushed := txn.Timestamp != origTimestamp
+
+		// If the isolation level is SERIALIZABLE, return a transaction
+		// retry error if the commit timestamp isn't equal to the txn
+		// timestamp.
+		if isTxnPushed {
+			if txn.Isolation == enginepb.SERIALIZABLE {
+				retry, reason = true, roachpb.RETRY_SERIALIZABLE
+			} else if txn.RetryOnPush {
+				// If pushing requires a retry and the transaction was pushed, retry.
+				retry, reason = true, roachpb.RETRY_DELETE_RANGE
+			}
+		}
 	}
 
-	isTxnPushed := currentTxn.Timestamp != headerTxn.OrigTimestamp
-
-	// If the isolation level is SERIALIZABLE, return a transaction
-	// retry error if the commit timestamp isn't equal to the txn
-	// timestamp.
-	if headerTxn.Isolation == enginepb.SERIALIZABLE && isTxnPushed {
-		return true, roachpb.RETRY_SERIALIZABLE
+	// A serializable transaction can still avoid a retry under certain conditions.
+	if retry && txn.IsSerializable() && canForwardSerializableTimestamp(txn, args.NoRefreshSpans) {
+		retry, reason = false, 0
 	}
 
-	// If pushing requires a retry and the transaction was pushed, retry.
-	if headerTxn.RetryOnPush && isTxnPushed {
-		return true, roachpb.RETRY_DELETE_RANGE
-	}
+	return retry, reason
+}
 
-	return false, 0
+// canForwardSerializableTimestamp returns whether a serializable txn can
+// be safely committed with a forwarded timestamp. This requires that
+// the transaction's timestamp has not leaked and that the transaction
+// has encountered no spans which require refreshing at the forwarded
+// timestamp. If either of those conditions are true, a cient-side
+// retry is required.
+func canForwardSerializableTimestamp(txn *roachpb.Transaction, noRefreshSpans bool) bool {
+	return !txn.OrigTimestampWasObserved && noRefreshSpans
 }
 
 // resolveLocalIntents synchronously resolves any intents that are
@@ -476,8 +483,8 @@ func resolveLocalIntents(
 	ms *enginepb.MVCCStats,
 	args roachpb.EndTransactionRequest,
 	txn *roachpb.Transaction,
-	knobs batcheval.TestingKnobs,
-) []roachpb.Span {
+	evalCtx batcheval.EvalContext,
+) ([]roachpb.Span, error) {
 	var preMergeDesc *roachpb.RangeDescriptor
 	if mergeTrigger := args.InternalCommitTrigger.GetMergeTrigger(); mergeTrigger != nil {
 		// If this is a merge, then use the post-merge descriptor to determine
@@ -530,8 +537,8 @@ func resolveLocalIntents(
 				if err != nil {
 					return err
 				}
-				if knobs.NumKeysEvaluatedForRangeIntentResolution != nil {
-					atomic.AddInt64(knobs.NumKeysEvaluatedForRangeIntentResolution, num)
+				if evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution != nil {
+					atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, num)
 				}
 				resolveAllowance -= num
 				if resumeSpan != nil {
@@ -550,7 +557,14 @@ func resolveLocalIntents(
 			panic(fmt.Sprintf("error resolving intent at %s on end transaction [%s]: %s", span, txn.Status, err))
 		}
 	}
-	return externalIntents
+	// If the poison arg is set, make sure to set the abort span entry.
+	if args.Poison && txn.Status == roachpb.ABORTED {
+		if err := batcheval.SetAbortSpan(ctx, evalCtx, batch, ms, txn.TxnMeta, true /* poison */); err != nil {
+			return nil, err
+		}
+	}
+
+	return externalIntents, nil
 }
 
 // updateTxnWithExternalIntents persists the transaction record with
@@ -702,12 +716,24 @@ func runCommitTrigger(
 // AdminSplit divides the range into into two ranges using args.SplitKey.
 func (r *Replica) AdminSplit(
 	ctx context.Context, args roachpb.AdminSplitRequest,
-) (roachpb.AdminSplitResponse, *roachpb.Error) {
+) (reply roachpb.AdminSplitResponse, pErr *roachpb.Error) {
 	if len(args.SplitKey) == 0 {
 		return roachpb.AdminSplitResponse{}, roachpb.NewErrorf("cannot split range with no key provided")
 	}
-	for retryable := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); retryable.Next(); {
-		reply, _, pErr := r.adminSplitWithDescriptor(ctx, args, r.Desc())
+
+	retryOpts := base.DefaultRetryOptions()
+	retryOpts.MaxRetries = 10
+	for retryable := retry.StartWithCtx(ctx, retryOpts); retryable.Next(); {
+		// Admin commands always require the range lease to begin (see
+		// executeAdminBatch), but we may have lost it while in this retry loop.
+		// Without the lease, a replica's local descriptor can be arbitrarily
+		// stale, which will result in a ConditionFailedError. To avoid this,
+		// we make sure that we still have the lease before each attempt.
+		if _, pErr = r.redirectOnOrAcquireLease(ctx); pErr != nil {
+			return roachpb.AdminSplitResponse{}, pErr
+		}
+
+		reply, _, pErr = r.adminSplitWithDescriptor(ctx, args, r.Desc())
 		// On seeing a ConditionFailedError or an AmbiguousResultError, retry the
 		// command with the updated descriptor.
 		switch pErr.GetDetail().(type) {
@@ -717,7 +743,8 @@ func (r *Replica) AdminSplit(
 			return reply, pErr
 		}
 	}
-	return roachpb.AdminSplitResponse{}, roachpb.NewError(ctx.Err())
+	// If we broke out of the loop after MaxRetries, return the last error.
+	return roachpb.AdminSplitResponse{}, pErr
 }
 
 func maybeDescriptorChangedError(desc *roachpb.RangeDescriptor, err error) (string, bool) {
@@ -1455,7 +1482,7 @@ func mergeTrigger(
 
 	// Add in stats for right hand side of merge, excluding system-local
 	// stats, which will need to be recomputed.
-	rightMS, err := engine.MVCCGetRangeStats(ctx, batch, rightRangeID)
+	rightMS, err := stateloader.Make(rec.ClusterSettings(), rightRangeID).LoadMVCCStats(ctx, batch)
 	if err != nil {
 		return result.Result{}, err
 	}

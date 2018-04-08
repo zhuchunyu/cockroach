@@ -130,7 +130,7 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       errors.push(this.props.state.lastError.message);
     }
 
-    if (this.props.state.inFlight) {
+    if (!this.props.state.data) {
       content = <div className="section">Loading...</div>;
     } else if (statuses) {
       errors = errors.concat(statuses.errors.map(err => err.message));
@@ -148,7 +148,7 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
         nodeIDIndex[id] = i + 1;
         columns.push((
           <th key={i}>
-            <Link className="debug-link" to={"/cluster/nodes/" + id}>Node {id}</Link>
+            <Link className="debug-link" to={"/nodes/" + id}>Node {id}</Link>
           </th>
         ));
       });

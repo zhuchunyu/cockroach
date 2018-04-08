@@ -75,6 +75,8 @@ const (
 	cloudstorageGSDefaultKey = cloudstorageGSDefault + cloudstorageKey
 
 	cloudstorageHTTPCASetting = cloudstorageHTTP + ".custom_ca"
+
+	cloudStorageTimeout = cloudstoragePrefix + ".timeout"
 )
 
 // ExportStorageConfFromURI generates an ExportStorage config from a URI string.
@@ -102,6 +104,14 @@ func ExportStorageConfFromURI(path string) (roachpb.ExportStorage, error) {
 			return conf, errors.Errorf("s3 uri missing %q parameter", S3SecretParam)
 		}
 		conf.S3Config.Prefix = strings.TrimLeft(conf.S3Config.Prefix, "/")
+		// AWS secrets often contain + characters, which must be escaped when
+		// included in a query string; otherwise, they represent a space character.
+		// More than a few users have been bitten by this.
+		//
+		// Luckily, AWS secrets are base64-encoded data and thus will never actually
+		// contain spaces. We can convert any space characters we see to +
+		// characters to recover the original secret.
+		conf.S3Config.Secret = strings.Replace(conf.S3Config.Secret, " ", "+", -1)
 	case "gs":
 		conf.Provider = roachpb.ExportStorageProvider_GoogleCloud
 		conf.GoogleCloudConfig = &roachpb.ExportStorage_GCS{
@@ -140,6 +150,17 @@ func ExportStorageConfFromURI(path string) (roachpb.ExportStorage, error) {
 	return conf, nil
 }
 
+// ExportStorageFromURI returns an ExportStorage for the given URI.
+func ExportStorageFromURI(
+	ctx context.Context, uri string, settings *cluster.Settings,
+) (ExportStorage, error) {
+	conf, err := ExportStorageConfFromURI(uri)
+	if err != nil {
+		return nil, err
+	}
+	return MakeExportStorage(ctx, conf, settings)
+}
+
 // SanitizeExportStorageURI returns the export storage URI with sensitive
 // credentials stripped.
 func SanitizeExportStorageURI(path string) (string, error) {
@@ -167,7 +188,7 @@ func MakeExportStorage(
 	case roachpb.ExportStorageProvider_GoogleCloud:
 		return makeGCSStorage(ctx, dest.GoogleCloudConfig, settings)
 	case roachpb.ExportStorageProvider_Azure:
-		return makeAzureStorage(dest.AzureConfig)
+		return makeAzureStorage(dest.AzureConfig, settings)
 	}
 	return nil, errors.Errorf("unsupported export destination type: %s", dest.Provider.String())
 }
@@ -214,6 +235,10 @@ var (
 		"custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage",
 		"",
 	)
+	timeoutSetting = settings.RegisterDurationSetting(
+		cloudStorageTimeout,
+		"the timeout for import/export storage operations",
+		10*time.Minute)
 )
 
 type localFileStorage struct {
@@ -303,9 +328,10 @@ func (*localFileStorage) Close() error {
 }
 
 type httpStorage struct {
-	client *http.Client
-	base   *url.URL
-	hosts  []string
+	base     *url.URL
+	client   *http.Client
+	hosts    []string
+	settings *cluster.Settings
 }
 
 var _ ExportStorage = &httpStorage{}
@@ -338,7 +364,12 @@ func makeHTTPStorage(base string, settings *cluster.Settings) (ExportStorage, er
 	if err != nil {
 		return nil, err
 	}
-	return &httpStorage{client: client, base: uri, hosts: strings.Split(uri.Host, ",")}, nil
+	return &httpStorage{
+		base:     uri,
+		client:   client,
+		hosts:    strings.Split(uri.Host, ","),
+		settings: settings,
+	}, nil
 }
 
 func (h *httpStorage) Conf() roachpb.ExportStorage {
@@ -350,26 +381,33 @@ func (h *httpStorage) Conf() roachpb.ExportStorage {
 	}
 }
 
-func (h *httpStorage) ReadFile(_ context.Context, basename string) (io.ReadCloser, error) {
-	resp, err := h.req("GET", basename, nil)
+func (h *httpStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
+	// https://github.com/cockroachdb/cockroach/issues/23859
+	resp, err := h.req(ctx, "GET", basename, nil)
 	if err != nil {
 		return nil, err
 	}
 	return resp.Body, nil
 }
 
-func (h *httpStorage) WriteFile(_ context.Context, basename string, content io.ReadSeeker) error {
-	_, err := h.reqNoBody("PUT", basename, content)
+func (h *httpStorage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&h.settings.SV))
+	defer cancel()
+	_, err := h.reqNoBody(ctx, "PUT", basename, content)
 	return err
 }
 
-func (h *httpStorage) Delete(_ context.Context, basename string) error {
-	_, err := h.reqNoBody("DELETE", basename, nil)
+func (h *httpStorage) Delete(ctx context.Context, basename string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&h.settings.SV))
+	defer cancel()
+	_, err := h.reqNoBody(ctx, "DELETE", basename, nil)
 	return err
 }
 
-func (h *httpStorage) Size(_ context.Context, basename string) (int64, error) {
-	resp, err := h.reqNoBody("HEAD", basename, nil)
+func (h *httpStorage) Size(ctx context.Context, basename string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&h.settings.SV))
+	defer cancel()
+	resp, err := h.reqNoBody(ctx, "HEAD", basename, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -384,15 +422,19 @@ func (h *httpStorage) Close() error {
 }
 
 // reqNoBody is like req but it closes the response body.
-func (h *httpStorage) reqNoBody(method, file string, body io.Reader) (*http.Response, error) {
-	resp, err := h.req(method, file, body)
+func (h *httpStorage) reqNoBody(
+	ctx context.Context, method, file string, body io.Reader,
+) (*http.Response, error) {
+	resp, err := h.req(ctx, method, file, body)
 	if resp != nil {
 		resp.Body.Close()
 	}
 	return resp, err
 }
 
-func (h *httpStorage) req(method, file string, body io.Reader) (*http.Response, error) {
+func (h *httpStorage) req(
+	ctx context.Context, method, file string, body io.Reader,
+) (*http.Response, error) {
 	dest := *h.base
 	if hosts := len(h.hosts); hosts > 1 {
 		if file == "" {
@@ -407,6 +449,7 @@ func (h *httpStorage) req(method, file string, body io.Reader) (*http.Response, 
 	dest.Path = path.Join(dest.Path, file)
 	url := dest.String()
 	req, err := http.NewRequest(method, url, body)
+	req = req.WithContext(ctx)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error constructing request %s %q", method, url)
 	}
@@ -426,10 +469,11 @@ func (h *httpStorage) req(method, file string, body io.Reader) (*http.Response, 
 }
 
 type s3Storage struct {
-	conf   *roachpb.ExportStorage_S3
-	prefix string
-	bucket *string
-	s3     *s3.S3
+	bucket   *string
+	conf     *roachpb.ExportStorage_S3
+	prefix   string
+	s3       *s3.S3
+	settings *cluster.Settings
 }
 
 func s3Retry(ctx context.Context, fn func() error) error {
@@ -488,10 +532,11 @@ func makeS3Storage(
 	}
 	sess.Config.Region = aws.String(region)
 	return &s3Storage{
-		conf:   conf,
-		prefix: conf.Prefix,
-		bucket: aws.String(conf.Bucket),
-		s3:     s3.New(sess),
+		bucket:   aws.String(conf.Bucket),
+		conf:     conf,
+		prefix:   conf.Prefix,
+		s3:       s3.New(sess),
+		settings: settings,
 	}, nil
 }
 
@@ -502,8 +547,10 @@ func (s *s3Storage) Conf() roachpb.ExportStorage {
 	}
 }
 
-func (s *s3Storage) WriteFile(_ context.Context, basename string, content io.ReadSeeker) error {
-	_, err := s.s3.PutObject(&s3.PutObjectInput{
+func (s *s3Storage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
+	defer cancel()
+	_, err := s.s3.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(path.Join(s.prefix, basename)),
 		Body:   content,
@@ -511,8 +558,9 @@ func (s *s3Storage) WriteFile(_ context.Context, basename string, content io.Rea
 	return errors.Wrap(err, "failed to put s3 object")
 }
 
-func (s *s3Storage) ReadFile(_ context.Context, basename string) (io.ReadCloser, error) {
-	out, err := s.s3.GetObject(&s3.GetObjectInput{
+func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
+	// https://github.com/cockroachdb/cockroach/issues/23859
+	out, err := s.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(path.Join(s.prefix, basename)),
 	})
@@ -522,16 +570,20 @@ func (s *s3Storage) ReadFile(_ context.Context, basename string) (io.ReadCloser,
 	return out.Body, nil
 }
 
-func (s *s3Storage) Delete(_ context.Context, basename string) error {
-	_, err := s.s3.DeleteObject(&s3.DeleteObjectInput{
+func (s *s3Storage) Delete(ctx context.Context, basename string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
+	defer cancel()
+	_, err := s.s3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(path.Join(s.prefix, basename)),
 	})
 	return err
 }
 
-func (s *s3Storage) Size(_ context.Context, basename string) (int64, error) {
-	out, err := s.s3.HeadObject(&s3.HeadObjectInput{
+func (s *s3Storage) Size(ctx context.Context, basename string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
+	defer cancel()
+	out, err := s.s3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(path.Join(s.prefix, basename)),
 	})
@@ -546,10 +598,11 @@ func (s *s3Storage) Close() error {
 }
 
 type gcsStorage struct {
-	conf   *roachpb.ExportStorage_GCS
-	client *gcs.Client
-	bucket *gcs.BucketHandle
-	prefix string
+	bucket   *gcs.BucketHandle
+	client   *gcs.Client
+	conf     *roachpb.ExportStorage_GCS
+	prefix   string
+	settings *cluster.Settings
 }
 
 var _ ExportStorage = &gcsStorage{}
@@ -568,9 +621,7 @@ func makeGCSStorage(
 		return nil, errors.Errorf("google cloud storage upload requested but info missing")
 	}
 	const scope = gcs.ScopeReadWrite
-	opts := []option.ClientOption{
-		option.WithScopes(scope),
-	}
+	opts := []option.ClientOption{option.WithScopes(scope)}
 
 	// "default": only use the key in the settings; error if not present.
 	// "implicit": only use the environment data.
@@ -603,21 +654,24 @@ func makeGCSStorage(
 		return nil, errors.Wrap(err, "failed to create google cloud client")
 	}
 	return &gcsStorage{
-		conf:   conf,
-		client: g,
-		bucket: g.Bucket(conf.Bucket),
-		prefix: conf.Prefix,
+		bucket:   g.Bucket(conf.Bucket),
+		client:   g,
+		conf:     conf,
+		prefix:   conf.Prefix,
+		settings: settings,
 	}, nil
 }
 
 func (g *gcsStorage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
 	const maxAttempts = 3
-
 	err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxAttempts, func() error {
+		// Set the timeout within the retry loop.
+		deadlineCtx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&g.settings.SV))
+		defer cancel()
 		if _, err := content.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(ctx)
+		w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(deadlineCtx)
 		if _, err := io.Copy(w, content); err != nil {
 			_ = w.Close()
 			return err
@@ -628,14 +682,19 @@ func (g *gcsStorage) WriteFile(ctx context.Context, basename string, content io.
 }
 
 func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
+	// https://github.com/cockroachdb/cockroach/issues/23859
 	return g.bucket.Object(path.Join(g.prefix, basename)).NewReader(ctx)
 }
 
 func (g *gcsStorage) Delete(ctx context.Context, basename string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&g.settings.SV))
+	defer cancel()
 	return g.bucket.Object(path.Join(g.prefix, basename)).Delete(ctx)
 }
 
 func (g *gcsStorage) Size(ctx context.Context, basename string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&g.settings.SV))
+	defer cancel()
 	r, err := g.bucket.Object(path.Join(g.prefix, basename)).NewReader(ctx)
 	if err != nil {
 		return 0, err
@@ -653,11 +712,14 @@ type azureStorage struct {
 	conf      *roachpb.ExportStorage_Azure
 	container *azr.Container
 	prefix    string
+	settings  *cluster.Settings
 }
 
 var _ ExportStorage = &azureStorage{}
 
-func makeAzureStorage(conf *roachpb.ExportStorage_Azure) (ExportStorage, error) {
+func makeAzureStorage(
+	conf *roachpb.ExportStorage_Azure, settings *cluster.Settings,
+) (ExportStorage, error) {
 	if conf == nil {
 		return nil, errors.Errorf("azure upload requested but info missing")
 	}
@@ -670,6 +732,7 @@ func makeAzureStorage(conf *roachpb.ExportStorage_Azure) (ExportStorage, error) 
 		conf:      conf,
 		container: blobClient.GetContainerReference(conf.Container),
 		prefix:    conf.Prefix,
+		settings:  settings,
 	}, err
 }
 
@@ -698,7 +761,7 @@ func (s *azureStorage) WriteFile(
 
 	blob := s.container.GetBlobReference(name)
 
-	writeFile := func() error {
+	writeFile := func(ctx context.Context) error {
 		if err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxAttempts, func() error {
 			return blob.CreateBlockBlob(nil)
 		}); err != nil {
@@ -750,7 +813,10 @@ func (s *azureStorage) WriteFile(
 		if _, err := content.Seek(0, io.SeekStart); err != nil {
 			return errors.Wrap(err, "seek")
 		}
-		return writeFile()
+		// Set the timeout within the retry loop.
+		deadlineCtx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
+		defer cancel()
+		return writeFile(deadlineCtx)
 	})
 	return errors.Wrap(err, "write file")
 }
@@ -785,15 +851,23 @@ func chunkReader(r io.Reader, size int, f func([]byte) error) error {
 }
 
 func (s *azureStorage) ReadFile(_ context.Context, basename string) (io.ReadCloser, error) {
+	// Would need to upgrade to https://github.com/Azure/azure-storage-blob-go for Context support
+	// https://github.com/cockroachdb/cockroach/issues/23860
+	// But, solve this first:
+	// https://github.com/cockroachdb/cockroach/issues/23859
 	r, err := s.container.GetBlobReference(path.Join(s.prefix, basename)).Get(nil)
 	return r, errors.Wrap(err, "failed to create azure reader")
 }
 
 func (s *azureStorage) Delete(_ context.Context, basename string) error {
+	// Would need to upgrade to https://github.com/Azure/azure-storage-blob-go for Context support
+	// https://github.com/cockroachdb/cockroach/issues/23860
 	return errors.Wrap(s.container.GetBlobReference(path.Join(s.prefix, basename)).Delete(nil), "failed to delete blob")
 }
 
 func (s *azureStorage) Size(_ context.Context, basename string) (int64, error) {
+	// Would need to upgrade to https://github.com/Azure/azure-storage-blob-go for Context support
+	// https://github.com/cockroachdb/cockroach/issues/23860
 	b := s.container.GetBlobReference(path.Join(s.prefix, basename))
 	err := b.GetProperties(nil)
 	return b.Properties.ContentLength, errors.Wrap(err, "failed to get blob properties")

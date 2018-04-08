@@ -19,11 +19,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/coreos/etcd/raft"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -34,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -60,7 +61,7 @@ type ProposalData struct {
 
 	// command is serialized and proposed to raft. In the event of
 	// reproposals its MaxLeaseIndex field is mutated.
-	command storagebase.RaftCommand
+	command *storagebase.RaftCommand
 
 	// endCmds.finish is called after command execution to update the timestamp cache &
 	// command queue.
@@ -70,7 +71,7 @@ type ProposalData struct {
 	// proposalResult come from LocalEvalResult).
 	//
 	// Attention: this channel is not to be signaled directly downstream of Raft.
-	// Always use ProposalData.finishRaftApplication().
+	// Always use ProposalData.finishApplication().
 	doneCh chan proposalResult
 
 	// Local contains the results of evaluating the request
@@ -89,9 +90,10 @@ type ProposalData struct {
 	Request *roachpb.BatchRequest
 }
 
-// finishRaftApplication is called downstream of Raft when a command application
-// has finished. proposal.doneCh is signaled with pr so that the proposer is
-// unblocked.
+// finishApplication is when a command application has finished. This will be
+// called downstream of Raft if the command required consensus, but can be
+// called upstream of Raft if the command did not and was never proposed.
+// proposal.doneCh is signaled with pr so that the proposer is unblocked.
 //
 // It first invokes the endCmds function and then sends the specified
 // proposalResult on the proposal's done channel. endCmds is invoked here in
@@ -105,7 +107,7 @@ type ProposalData struct {
 // encountered upstream of Raft, we might still want to resolve intents:
 // upstream of Raft, pr.intents represent intents encountered by a request, not
 // the current txn's intents.
-func (proposal *ProposalData) finishRaftApplication(pr proposalResult) {
+func (proposal *ProposalData) finishApplication(pr proposalResult) {
 	if proposal.endCmds != nil {
 		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
 		proposal.endCmds = nil
@@ -187,7 +189,11 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease) {
 	r.mu.Unlock()
 
 	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
-	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID
+	// NB: in the case in which a node restarts, minLeaseProposedTS forces it to
+	// get a new lease and we make sure it gets a new sequence number, thus
+	// causing the right half of the disjunction to fire so that we update the
+	// timestamp cache.
+	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID || prevLease.Sequence != newLease.Sequence
 
 	if iAmTheLeaseHolder {
 		// Always log lease acquisition for epoch-based leases which are
@@ -319,7 +325,8 @@ func addSSTablePreApply(
 	sideloaded sideloadStorage,
 	term, index uint64,
 	sst storagebase.ReplicatedEvalResult_AddSSTable,
-) {
+	limiter *rate.Limiter,
+) bool {
 	checksum := util.CRC32(sst.Data)
 
 	if checksum != sst.CRC32 {
@@ -330,24 +337,56 @@ func addSSTablePreApply(
 		)
 	}
 
-	// TODO(danhhz,tschottdorf): we can hardlink directly to the sideloaded
-	// SSTable and ingest that if we also put a "sanitizer" in the
-	// implementation of sideloadedStorage that undoes the serial number that
-	// RocksDB may add to the SSTable. This avoids copying the file entirely.
+	const modify, noModify = true, false
+
 	path, err := sideloaded.Filename(ctx, index, term)
 	if err != nil {
 		log.Fatalf(ctx, "sideloaded SSTable at term %d, index %d is missing", term, index)
 	}
-	path += ".ingested"
 
-	limitBulkIOWrite(ctx, st, len(sst.Data))
-
+	copied := false
 	if inmem, ok := eng.(engine.InMem); ok {
 		path = fmt.Sprintf("%x", checksum)
 		if err := inmem.WriteFile(path, sst.Data); err != nil {
 			panic(err)
 		}
 	} else {
+		ingestPath := path + ".ingested"
+
+		// The SST may already be on disk, thanks to the sideloading mechanism.  If
+		// so we can try to add that file directly, via a new hardlink if the file-
+		// system support it, rather than writing a new copy of it. However, this is
+		// only safe if we can do so without modifying the file since it is still
+		// part of an immutable raft log message, but in some cases, described in
+		// DBIngestExternalFile, RocksDB would modify the file. Fortunately we can
+		// tell Rocks that it is not allowed to modify the file, in which case it
+		// will return and error if it would have tried to do so, at which point we
+		// can fall back to writing a new copy for Rocks to ingest.
+		if _, err := os.Stat(path); err == nil {
+			// If the fs supports it, make a hard-link for rocks to ingest. We cannot
+			// pass it the path in the sideload store as it deletes the passed path on
+			// success.
+			if linkErr := os.Link(path, ingestPath); linkErr == nil {
+				ingestErr := eng.IngestExternalFile(ctx, ingestPath, noModify)
+				if ingestErr == nil {
+					// Adding without modification succeeded, no copy necessary.
+					log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
+					return false
+				}
+				if rmErr := os.Remove(ingestPath); rmErr != nil {
+					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
+				}
+				const seqNoMsg = "Global seqno is required, but disabled"
+				if err, ok := err.(*engine.RocksDBError); ok && !strings.Contains(err.Error(), seqNoMsg) {
+					log.Fatalf(ctx, "while ingesting %s: %s", ingestPath, err)
+				}
+			}
+		}
+
+		path = ingestPath
+
+		log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, path)
+
 		// TODO(tschottdorf): remove this once sideloaded storage guarantees its
 		// existence.
 		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -363,16 +402,17 @@ func addSSTablePreApply(
 			}
 		}
 
-		if err := fileutil.WriteFileSyncing(path, sst.Data, 0600, sstWriteSyncRate.Get(&st.SV)); err != nil {
+		if err := writeFileSyncing(ctx, path, sst.Data, 0600, st, limiter); err != nil {
 			log.Fatalf(ctx, "while ingesting %s: %s", path, err)
 		}
+		copied = true
 	}
 
-	const move = true
-	if err := eng.IngestExternalFile(ctx, path, move); err != nil {
-		panic(err)
+	if err := eng.IngestExternalFile(ctx, path, modify); err != nil {
+		log.Fatalf(ctx, "while ingesting %s: %s", path, err)
 	}
 	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, path)
+	return copied
 }
 
 // maybeTransferRaftLeadership attempts to transfer the leadership
@@ -383,8 +423,11 @@ func (r *Replica) maybeTransferRaftLeadership(ctx context.Context, target roachp
 	err := r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
 		// Only the raft leader can attempt a leadership transfer.
 		if status := raftGroup.Status(); status.RaftState == raft.StateLeader {
-			// Only attempt this if the target has all the log entries.
-			if pr, ok := status.Progress[uint64(target)]; ok && pr.Match == r.mu.lastIndex {
+			// Only attempt this if the target has all the log entries. Although
+			// TransferLeader is supposed to do the right thing if the target is not
+			// caught up, this check avoids periods of 0 QPS:
+			// https://github.com/cockroachdb/cockroach/issues/22573#issuecomment-366106118
+			if pr, ok := status.Progress[uint64(target)]; (ok && pr.Match == r.mu.lastIndex) || r.mu.draining {
 				log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", target)
 				r.store.metrics.RangeRaftLeaderTransfers.Inc(1)
 				raftGroup.TransferLeader(uint64(target))
@@ -417,6 +460,7 @@ func (r *Replica) handleReplicatedEvalResult(
 		rResult.Timestamp = hlc.Timestamp{}
 		rResult.DeprecatedStartKey = nil
 		rResult.DeprecatedEndKey = nil
+		rResult.PrevLeaseProposal = nil
 	}
 
 	if rResult.BlockReads {
@@ -445,72 +489,13 @@ func (r *Replica) handleReplicatedEvalResult(
 		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
 	}
 
-	// The above are always present, so we assert only if there are
-	// "nontrivial" actions below.
-	shouldAssert = !rResult.Equal(storagebase.ReplicatedEvalResult{})
-
-	// Process Split or Merge. This needs to happen after stats update because
-	// of the ContainsEstimates hack.
-
-	if rResult.Split != nil {
-		// TODO(tschottdorf): We want to let the usual MVCCStats-delta
-		// machinery update our stats for the left-hand side. But there is no
-		// way to pass up an MVCCStats object that will clear out the
-		// ContainsEstimates flag. We should introduce one, but the migration
-		// makes this worth a separate effort (ContainsEstimates would need to
-		// have three possible values, 'UNCHANGED', 'NO', and 'YES').
-		// Until then, we're left with this rather crude hack.
-		{
-			r.mu.Lock()
-			r.mu.state.Stats.ContainsEstimates = false
-			stats := *r.mu.state.Stats
-			r.mu.Unlock()
-			if err := r.raftMu.stateLoader.SetMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
-				log.Fatal(ctx, errors.Wrap(err, "unable to write MVCC stats"))
-			}
-		}
-
-		splitPostApply(
-			r.AnnotateCtx(ctx),
-			rResult.Split.RHSDelta,
-			&rResult.Split.SplitTrigger,
-			r,
-		)
-		rResult.Split = nil
-	}
-
-	if rResult.Merge != nil {
-		if err := r.store.MergeRange(ctx, r, rResult.Merge.LeftDesc.EndKey,
-			rResult.Merge.RightDesc.RangeID,
-		); err != nil {
-			// Our in-memory state has diverged from the on-disk state.
-			log.Fatalf(ctx, "failed to update store after merging range: %s", err)
-		}
-		rResult.Merge = nil
-	}
-
-	// Update the remaining ReplicaState.
+	// The above are always present. The following are not always present but
+	// should not trigger a ReplicaState assertion because they are either too
+	// frequent to do so or because they do not change the ReplicaState.
 
 	if rResult.State != nil {
-		if newDesc := rResult.State.Desc; newDesc != nil {
-			if err := r.setDesc(newDesc); err != nil {
-				// Log the error. There's not much we can do because the commit may
-				// have already occurred at this point.
-				log.Fatalf(
-					ctx,
-					"failed to update range descriptor to %+v: %s",
-					newDesc, err,
-				)
-			}
-			rResult.State.Desc = nil
-		}
-
-		if newLease := rResult.State.Lease; newLease != nil {
-			rResult.State.Lease = nil // for assertion
-
-			r.leasePostApply(ctx, *newLease)
-		}
-
+		// Raft log truncation is too frequent to justify a replica state
+		// assertion.
 		if newTruncState := rResult.State.TruncatedState; newTruncState != nil {
 			rResult.State.TruncatedState = nil // for assertion
 
@@ -573,24 +558,6 @@ func (r *Replica) handleReplicatedEvalResult(
 			}
 		}
 
-		if newThresh := rResult.State.GCThreshold; newThresh != nil {
-			if (*newThresh != hlc.Timestamp{}) {
-				r.mu.Lock()
-				r.mu.state.GCThreshold = newThresh
-				r.mu.Unlock()
-			}
-			rResult.State.GCThreshold = nil
-		}
-
-		if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != nil {
-			if (*newThresh != hlc.Timestamp{}) {
-				r.mu.Lock()
-				r.mu.state.TxnSpanGCThreshold = newThresh
-				r.mu.Unlock()
-			}
-			rResult.State.TxnSpanGCThreshold = nil
-		}
-
 		// ReplicaState.Stats was previously non-nullable which caused nodes to
 		// send a zero-value MVCCStats structure. If the proposal was generated by
 		// an old node, we'll have decoded that zero-value structure setting
@@ -603,26 +570,6 @@ func (r *Replica) handleReplicatedEvalResult(
 		if (*rResult.State == storagebase.ReplicaState{}) {
 			rResult.State = nil
 		}
-	}
-
-	if change := rResult.ChangeReplicas; change != nil {
-		if change.ChangeType == roachpb.REMOVE_REPLICA &&
-			r.store.StoreID() == change.Replica.StoreID {
-			// This wants to run as late as possible, maximizing the chances
-			// that the other nodes have finished this command as well (since
-			// processing the removal from the queue looks up the Range at the
-			// lease holder, being too early here turns this into a no-op).
-			if _, err := r.store.replicaGCQueue.Add(r, replicaGCPriorityRemoved); err != nil {
-				// Log the error; the range should still be GC'd eventually.
-				log.Errorf(ctx, "unable to add to replica GC queue: %s", err)
-			}
-		}
-		rResult.ChangeReplicas = nil
-	}
-
-	if rResult.ComputeChecksum != nil {
-		r.computeChecksumPostApply(ctx, *rResult.ComputeChecksum)
-		rResult.ComputeChecksum = nil
 	}
 
 	if rResult.RaftLogDelta != 0 {
@@ -663,6 +610,99 @@ func (r *Replica) handleReplicatedEvalResult(
 	}
 	rResult.SuggestedCompactions = nil
 
+	// The rest of the actions are "nontrivial" and may have large effects on the
+	// in-memory and on-disk ReplicaStates. If any of these actions are present,
+	// we want to assert that these two states do not diverge.
+	shouldAssert = !rResult.Equal(storagebase.ReplicatedEvalResult{})
+
+	// Process Split or Merge. This needs to happen after stats update because
+	// of the ContainsEstimates hack.
+
+	if rResult.Split != nil {
+		splitPostApply(
+			r.AnnotateCtx(ctx),
+			rResult.Split.RHSDelta,
+			&rResult.Split.SplitTrigger,
+			r,
+		)
+		rResult.Split = nil
+	}
+
+	if rResult.Merge != nil {
+		if err := r.store.MergeRange(ctx, r, rResult.Merge.LeftDesc.EndKey,
+			rResult.Merge.RightDesc.RangeID,
+		); err != nil {
+			// Our in-memory state has diverged from the on-disk state.
+			log.Fatalf(ctx, "failed to update store after merging range: %s", err)
+		}
+		rResult.Merge = nil
+	}
+
+	// Update the remaining ReplicaState.
+
+	if rResult.State != nil {
+		if newDesc := rResult.State.Desc; newDesc != nil {
+			if err := r.setDesc(newDesc); err != nil {
+				// Log the error. There's not much we can do because the commit may
+				// have already occurred at this point.
+				log.Fatalf(
+					ctx,
+					"failed to update range descriptor to %+v: %s",
+					newDesc, err,
+				)
+			}
+			rResult.State.Desc = nil
+		}
+
+		if newLease := rResult.State.Lease; newLease != nil {
+			rResult.State.Lease = nil // for assertion
+
+			r.leasePostApply(ctx, *newLease)
+		}
+
+		if newThresh := rResult.State.GCThreshold; newThresh != nil {
+			if (*newThresh != hlc.Timestamp{}) {
+				r.mu.Lock()
+				r.mu.state.GCThreshold = newThresh
+				r.mu.Unlock()
+			}
+			rResult.State.GCThreshold = nil
+		}
+
+		if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != nil {
+			if (*newThresh != hlc.Timestamp{}) {
+				r.mu.Lock()
+				r.mu.state.TxnSpanGCThreshold = newThresh
+				r.mu.Unlock()
+			}
+			rResult.State.TxnSpanGCThreshold = nil
+		}
+
+		if (*rResult.State == storagebase.ReplicaState{}) {
+			rResult.State = nil
+		}
+	}
+
+	if change := rResult.ChangeReplicas; change != nil {
+		if change.ChangeType == roachpb.REMOVE_REPLICA &&
+			r.store.StoreID() == change.Replica.StoreID {
+			// This wants to run as late as possible, maximizing the chances
+			// that the other nodes have finished this command as well (since
+			// processing the removal from the queue looks up the Range at the
+			// lease holder, being too early here turns this into a no-op).
+			if _, err := r.store.replicaGCQueue.Add(r, replicaGCPriorityRemoved); err != nil {
+				// Log the error; the range should still be GC'd eventually.
+				log.Errorf(ctx, "unable to add to replica GC queue: %s", err)
+			}
+		}
+		rResult.ChangeReplicas = nil
+	}
+
+	if rResult.ComputeChecksum != nil {
+		r.computeChecksumPostApply(ctx, *rResult.ComputeChecksum)
+		rResult.ComputeChecksum = nil
+	}
+
 	if !rResult.Equal(storagebase.ReplicatedEvalResult{}) {
 		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, storagebase.ReplicatedEvalResult{}))
 	}
@@ -670,18 +710,10 @@ func (r *Replica) handleReplicatedEvalResult(
 }
 
 func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.LocalResult) {
-	// Enqueue failed push transactions on the txnWaitQueue.
-	if !r.store.cfg.DontRetryPushTxnFailures {
-		if tpErr, ok := lResult.Err.GetDetail().(*roachpb.TransactionPushError); ok {
-			r.txnWaitQueue.Enqueue(&tpErr.PusheeTxn)
-		}
-	}
-
 	// Fields for which no action is taken in this method are zeroed so that
 	// they don't trigger an assertion at the end of the method (which checks
 	// that all fields were handled).
 	{
-		lResult.Err = nil
 		lResult.Reply = nil
 	}
 

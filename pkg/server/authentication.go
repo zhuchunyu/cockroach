@@ -24,6 +24,13 @@ import (
 	"net/http"
 	"time"
 
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -32,12 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/pkg/errors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -202,7 +203,7 @@ WHERE id = $1`
 		hashedSecret = []byte(*datum[0].(*tree.DBytes))
 		username = string(*datum[1].(*tree.DString))
 		expiresAt = datum[2].(*tree.DTimestamp).Time
-		isRevoked = datum[3].ResolvedType() != types.Null
+		isRevoked = datum[3].ResolvedType() != types.Unknown
 		return nil
 	}); err != nil {
 		return false, "", err
@@ -237,7 +238,7 @@ func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username string, password string,
 ) (bool, error) {
 	exists, hashedPassword, err := sql.GetUserHashedPassword(
-		ctx, s.server.sqlExecutor, s.memMetrics, username,
+		ctx, s.server.execCfg, s.memMetrics, username,
 	)
 	if err != nil {
 		return false, err

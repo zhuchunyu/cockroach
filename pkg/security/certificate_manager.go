@@ -18,14 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"syscall"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 
 	"github.com/pkg/errors"
 )
@@ -33,10 +32,10 @@ import (
 var (
 	metaCAExpiration = metric.Metadata{
 		Name: "security.certificate.expiration.ca",
-		Help: "Expiration timestamp for the CA certificate. 0 means no certificate or error."}
+		Help: "Expiration timestamp in seconds since Unix epoch for the CA certificate. 0 means no certificate or error."}
 	metaNodeExpiration = metric.Metadata{
 		Name: "security.certificate.expiration.node",
-		Help: "Expiration timestamp for the node certificate. 0 means no certificate or error."}
+		Help: "Expiration timestamp in seconds since Unix epoch for the node certificate. 0 means no certificate or error."}
 )
 
 // CertificateManager lives for the duration of the process and manages certificates and keys.
@@ -117,16 +116,13 @@ func (cm *CertificateManager) Metrics() CertificateMetrics {
 // RegisterSignalHandler registers a signal handler for SIGHUP, triggering a
 // refresh of the certificates directory on notification.
 func (cm *CertificateManager) RegisterSignalHandler(stopper *stop.Stopper) {
-	// Setup signal handler.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGHUP)
 	go func() {
+		ch := sysutil.RefreshSignaledChan()
 		for {
 			select {
 			case <-stopper.ShouldStop():
-				signal.Stop(sigs)
 				return
-			case sig := <-sigs:
+			case sig := <-ch:
 				log.Infof(context.Background(), "received signal %q, triggering certificate reload", sig)
 				if err := cm.LoadCertificates(); err != nil {
 					log.Warningf(context.Background(), "could not reload certificates: %v", err)

@@ -19,42 +19,73 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"strings"
 
 	"cloud.google.com/go/storage"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"google.golang.org/api/option"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl/workloadccl"
-	"github.com/cockroachdb/cockroach/pkg/testutils/workload"
+	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/workload"
 )
 
-var useast1bFixtures = workloadccl.FixtureStore{
+var useast1bFixtures = workloadccl.FixtureConfig{
 	// TODO(dan): Keep fixtures in more than one region to better support
 	// geo-distributed clusters.
 	GCSBucket: `cockroach-fixtures`,
 	GCSPrefix: `workload`,
 }
 
+func config() workloadccl.FixtureConfig {
+	config := useast1bFixtures
+	if len(*gcsBucketOverride) > 0 {
+		config.GCSBucket = *gcsBucketOverride
+	}
+	if len(*gcsPrefixOverride) > 0 {
+		config.GCSPrefix = *gcsPrefixOverride
+	}
+	config.CSVServerURL = *fixturesMakeCSVServerURL
+	return config
+}
+
 var fixturesCmd = &cobra.Command{Use: `fixtures`}
 var fixturesListCmd = &cobra.Command{
 	Use:   `list`,
 	Short: `List all fixtures stored on GCS`,
-	RunE:  fixturesList,
+	Run:   handleErrs(fixturesList),
 }
-var fixturesStoreCmd = &cobra.Command{
-	Use:   `store`,
+var fixturesMakeCmd = &cobra.Command{
+	Use:   `make`,
 	Short: `Regenerate and store a fixture on GCS`,
 }
 var fixturesLoadCmd = &cobra.Command{
-	Use: `load`,
-	Short: `Load a fixture into a running cluster. ` +
-		`An enterprise license is required.`,
+	Use:   `load`,
+	Short: `Load a fixture into a running cluster. An enterprise license is required.`,
 }
 
-var fixturesLoadDB = fixturesLoadCmd.PersistentFlags().String(
-	`into_db`, `workload`, `SQL database to load fixture into`)
+var fixturesMakeCSVServerURL = fixturesMakeCmd.PersistentFlags().String(
+	`csv-server`, ``,
+	`Skip saving CSVs to cloud storage, instead get them from a 'csv-server' running at this url`)
+
+var fixturesMakeOnlyTable = fixturesMakeCmd.PersistentFlags().String(
+	`only-tables`, ``,
+	`Only load the tables with the given comma-separated names`)
+
+var fixturesLoadRunChecks = fixturesLoadCmd.PersistentFlags().Bool(
+	`checks`, true, `Run validity checks on the loaded fixture`)
+
+// gcs-bucket-override and gcs-prefix-override are exposed for testing.
+var gcsBucketOverride, gcsPrefixOverride *string
+
+func init() {
+	gcsBucketOverride = fixturesCmd.PersistentFlags().String(`gcs-bucket-override`, ``, ``)
+	gcsPrefixOverride = fixturesCmd.PersistentFlags().String(`gcs-prefix-override`, ``, ``)
+	_ = fixturesCmd.PersistentFlags().MarkHidden(`gcs-bucket-override`)
+	_ = fixturesCmd.PersistentFlags().MarkHidden(`gcs-prefix-override`)
+}
 
 const storageError = `failed to create google cloud client ` +
 	`(You may need to setup the GCS application default credentials: ` +
@@ -73,50 +104,50 @@ func getStorage(ctx context.Context) (*storage.Client, error) {
 func init() {
 	for _, meta := range workload.Registered() {
 		gen := meta.New()
-		genFlags := gen.Flags()
+		var genFlags *pflag.FlagSet
+		if f, ok := gen.(workload.Flagser); ok {
+			genFlags = f.Flags().FlagSet
+			// Hide runtime-only flags so they don't clutter up the help text,
+			// but don't remove them entirely so if someone switches from
+			// `./workload run` to `./workload fixtures` they don't have to
+			// remove them from the invocation.
+			for flagName, meta := range f.Flags().Meta {
+				if meta.RuntimeOnly || meta.CheckConsistencyOnly {
+					_ = genFlags.MarkHidden(flagName)
+				}
+			}
+		}
 
-		genStoreCmd := &cobra.Command{
+		genMakeCmd := &cobra.Command{
 			Use:  meta.Name + ` [CRDB URI]`,
 			Args: cobra.RangeArgs(0, 1),
 		}
-		genStoreCmd.Flags().AddFlagSet(genFlags)
-		genStoreCmd.RunE = func(cmd *cobra.Command, args []string) error {
-			crdb := crdbDefaultURI
-			if len(args) > 0 {
-				crdb = args[0]
-			}
-			return fixturesStore(cmd, gen, crdb)
-		}
-		fixturesStoreCmd.AddCommand(genStoreCmd)
+		genMakeCmd.Flags().AddFlagSet(genFlags)
+		genMakeCmd.Run = cmdHelper(gen, fixturesMake)
+		fixturesMakeCmd.AddCommand(genMakeCmd)
 
 		genLoadCmd := &cobra.Command{
 			Use:  meta.Name + ` [CRDB URI]`,
 			Args: cobra.RangeArgs(0, 1),
 		}
 		genLoadCmd.Flags().AddFlagSet(genFlags)
-		genLoadCmd.RunE = func(cmd *cobra.Command, args []string) error {
-			crdb := crdbDefaultURI
-			if len(args) > 0 {
-				crdb = args[0]
-			}
-			return fixturesLoad(cmd, gen, crdb)
-		}
+		genLoadCmd.Run = cmdHelper(gen, fixturesLoad)
 		fixturesLoadCmd.AddCommand(genLoadCmd)
 	}
 	fixturesCmd.AddCommand(fixturesListCmd)
-	fixturesCmd.AddCommand(fixturesStoreCmd)
+	fixturesCmd.AddCommand(fixturesMakeCmd)
 	fixturesCmd.AddCommand(fixturesLoadCmd)
 	rootCmd.AddCommand(fixturesCmd)
 }
 
-func fixturesList(cmd *cobra.Command, _ []string) error {
+func fixturesList(_ *cobra.Command, _ []string) error {
 	ctx := context.Background()
 	gcs, err := getStorage(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = gcs.Close() }()
-	fixtures, err := workloadccl.ListFixtures(ctx, gcs, useast1bFixtures)
+	fixtures, err := workloadccl.ListFixtures(ctx, gcs, config())
 	if err != nil {
 		return err
 	}
@@ -126,7 +157,26 @@ func fixturesList(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func fixturesStore(cmd *cobra.Command, gen workload.Generator, crdbURI string) error {
+type filteringGenerator struct {
+	gen    workload.Generator
+	filter map[string]struct{}
+}
+
+func (f filteringGenerator) Meta() workload.Meta {
+	return f.gen.Meta()
+}
+
+func (f filteringGenerator) Tables() []workload.Table {
+	ret := make([]workload.Table, 0)
+	for _, t := range f.gen.Tables() {
+		if _, ok := f.filter[t.Name]; ok {
+			ret = append(ret, t)
+		}
+	}
+	return ret
+}
+
+func fixturesMake(gen workload.Generator, urls []string, dbName string) error {
 	ctx := context.Background()
 	gcs, err := getStorage(ctx)
 	if err != nil {
@@ -134,22 +184,35 @@ func fixturesStore(cmd *cobra.Command, gen workload.Generator, crdbURI string) e
 	}
 	defer func() { _ = gcs.Close() }()
 
-	sqlDB, err := gosql.Open(`postgres`, crdbURI)
+	sqlDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return err
 	}
-
-	fixture, err := workloadccl.MakeFixture(ctx, sqlDB, gcs, useast1bFixtures, gen)
+	if *fixturesMakeOnlyTable != "" {
+		tableNames := strings.Split(*fixturesMakeOnlyTable, ",")
+		if len(tableNames) == 0 {
+			return errors.New("no table names specified")
+		}
+		filter := make(map[string]struct{}, len(tableNames))
+		for _, tableName := range tableNames {
+			filter[tableName] = struct{}{}
+		}
+		gen = filteringGenerator{
+			gen:    gen,
+			filter: filter,
+		}
+	}
+	fixture, err := workloadccl.MakeFixture(ctx, sqlDB, gcs, config(), gen)
 	if err != nil {
 		return err
 	}
 	for _, table := range fixture.Tables {
-		log.Infof(ctx, `stored %s`, table.BackupURI)
+		log.Infof(ctx, `stored backup %s`, table.BackupURI)
 	}
 	return nil
 }
 
-func fixturesLoad(cmd *cobra.Command, gen workload.Generator, crdbURI string) error {
+func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 	ctx := context.Background()
 	gcs, err := getStorage(ctx)
 	if err != nil {
@@ -157,23 +220,30 @@ func fixturesLoad(cmd *cobra.Command, gen workload.Generator, crdbURI string) er
 	}
 	defer func() { _ = gcs.Close() }()
 
-	sqlDB, err := gosql.Open(`postgres`, crdbURI)
+	sqlDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return err
 	}
-	if _, err := sqlDB.Exec(`CREATE DATABASE IF NOT EXISTS ` + *fixturesLoadDB); err != nil {
+	if _, err := sqlDB.Exec(`CREATE DATABASE IF NOT EXISTS ` + dbName); err != nil {
 		return err
 	}
 
-	fixture, err := workloadccl.GetFixture(ctx, gcs, useast1bFixtures, gen)
+	fixture, err := workloadccl.GetFixture(ctx, gcs, config(), gen)
 	if err != nil {
 		return errors.Wrap(err, `finding fixture`)
 	}
-	if err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, *fixturesLoadDB); err != nil {
+	if err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName); err != nil {
 		return errors.Wrap(err, `restoring fixture`)
 	}
-	for _, table := range fixture.Tables {
-		log.Infof(ctx, `loaded %s`, table.BackupURI)
+
+	if hooks, ok := gen.(workload.Hookser); *fixturesLoadRunChecks && ok {
+		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
+			log.Info(ctx, "fixture is restored; now running consistency checks (ctrl-c to abort)")
+			if err := consistencyCheckFn(ctx, sqlDB); err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }

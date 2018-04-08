@@ -15,11 +15,11 @@
 package sql
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,7 +30,6 @@ import (
 	"golang.org/x/net/trace"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -47,14 +46,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -106,7 +103,7 @@ const (
 	preparing queryPhase = 0
 
 	// Execution phase.
-	executing = 1
+	executing queryPhase = 1
 )
 
 // queryMeta stores metadata about a query. Stored as reference in
@@ -130,6 +127,10 @@ type queryMeta struct {
 
 	// Cancellation function for the context associated with this query's transaction.
 	ctxCancel context.CancelFunc
+
+	// If set, this query will not be reported as part of SHOW QUERIES. This is
+	// set based on the statement implementing tree.HiddenFromShowQueries.
+	hidden bool
 }
 
 // cancel cancels the query associated with this queryMeta, by closing the associated
@@ -223,13 +224,11 @@ type Session struct {
 	// bufferedResultWriter for internal uses.
 	ResultsWriter ResultsWriter
 
-	Tracing SessionTracing
-
 	tables TableCollection
 
 	// ActiveSyncQueries contains query IDs of all synchronous (i.e. non-parallel)
 	// queries in flight. All ActiveSyncQueries must also be in mu.ActiveQueries.
-	ActiveSyncQueries []uint128.Uint128
+	ActiveSyncQueries []ClusterWideID
 
 	// mu contains of all elements of the struct that can be changed
 	// after initialization, and may be accessed from another thread.
@@ -245,23 +244,12 @@ type Session struct {
 		//
 
 		// ActiveQueries contains all queries in flight.
-		ActiveQueries map[uint128.Uint128]*queryMeta
+		ActiveQueries map[ClusterWideID]*queryMeta
 
 		// LastActiveQuery contains a reference to the AST of the last
 		// query that ran on this session.
 		LastActiveQuery tree.Statement
 	}
-
-	//
-	// Testing state.
-	//
-
-	// If set, called after the Session is done executing the current SQL statement.
-	// It can be used to verify assumptions about how metadata will be asynchronously
-	// updated. Note that this can overwrite a previous callback that was waiting to be
-	// verified, which is not ideal.
-	testingVerifyMetadataFn func(config.SystemConfig) error
-	verifyFnCheckedOnce     bool
 
 	//
 	// Per-session statistics.
@@ -281,9 +269,9 @@ type Session struct {
 
 	// noCopy is placed here to guarantee that Session objects are not
 	// copied.
-	//
-	//lint:ignore U1000 this marker prevents by-value copies.
 	noCopy util.NoCopy
+
+	sessionID ClusterWideID
 }
 
 // sessionDefaults mirrors fields in Session, for restoring default
@@ -298,36 +286,46 @@ type SessionArgs struct {
 	Database        string
 	User            string
 	ApplicationName string
+	RemoteAddr      net.Addr
 }
 
 // SessionRegistry stores a set of all sessions on this node.
 // Use register() and deregister() to modify this registry.
 type SessionRegistry struct {
 	syncutil.Mutex
-	store map[*Session]struct{}
+	store map[ClusterWideID]registrySession
 }
 
 // MakeSessionRegistry creates a new SessionRegistry with an empty set
 // of sessions.
 func MakeSessionRegistry() *SessionRegistry {
-	return &SessionRegistry{store: make(map[*Session]struct{})}
+	return &SessionRegistry{store: make(map[ClusterWideID]registrySession)}
 }
 
-func (r *SessionRegistry) register(s *Session) {
+func (r *SessionRegistry) register(id ClusterWideID, s registrySession) {
 	r.Lock()
-	r.store[s] = struct{}{}
+	r.store[id] = s
 	r.Unlock()
 }
 
-func (r *SessionRegistry) deregister(s *Session) {
+func (r *SessionRegistry) deregister(id ClusterWideID) {
 	r.Lock()
-	delete(r.store, s)
+	delete(r.store, id)
 	r.Unlock()
+}
+
+type registrySession interface {
+	user() string
+	cancelQuery(queryID ClusterWideID) bool
+	cancelSession()
+	// serialize serializes a Session into a serverpb.Session
+	// that can be served over RPC.
+	serialize() serverpb.Session
 }
 
 // CancelQuery looks up the associated query in the session registry and cancels it.
 func (r *SessionRegistry) CancelQuery(queryIDStr string, username string) (bool, error) {
-	queryID, err := uint128.FromString(queryIDStr)
+	queryID, err := StringToClusterWideID(queryIDStr)
 	if err != nil {
 		return false, fmt.Errorf("query ID %s malformed: %s", queryID, err)
 	}
@@ -335,23 +333,40 @@ func (r *SessionRegistry) CancelQuery(queryIDStr string, username string) (bool,
 	r.Lock()
 	defer r.Unlock()
 
-	for session := range r.store {
-		if !(username == security.RootUser || username == session.data.User) {
+	for _, session := range r.store {
+		if !(username == security.RootUser || username == session.user()) {
 			// Skip this session.
 			continue
 		}
 
-		session.mu.Lock()
-		if queryMeta, exists := session.mu.ActiveQueries[queryID]; exists {
-			queryMeta.cancel()
-
-			session.mu.Unlock()
+		if session.cancelQuery(queryID) {
 			return true, nil
 		}
-		session.mu.Unlock()
 	}
 
 	return false, fmt.Errorf("query ID %s not found", queryID)
+}
+
+// CancelSession looks up the specified session in the session registry and cancels it.
+func (r *SessionRegistry) CancelSession(sessionIDBytes []byte, username string) (bool, error) {
+	sessionID := BytesToClusterWideID(sessionIDBytes)
+
+	r.Lock()
+	defer r.Unlock()
+
+	for id, session := range r.store {
+		if !(username == security.RootUser || username == session.user()) {
+			// Skip this session.
+			continue
+		}
+
+		if id == sessionID {
+			session.cancelSession()
+			return true, nil
+		}
+	}
+
+	return false, fmt.Errorf("session ID %s not found", sessionID)
 }
 
 // SerializeAll returns a slice of all sessions in the registry, converted to serverpb.Sessions.
@@ -361,7 +376,7 @@ func (r *SessionRegistry) SerializeAll() []serverpb.Session {
 
 	response := make([]serverpb.Session, 0, len(r.store))
 
-	for s := range r.store {
+	for _, s := range r.store {
 		response = append(response, s.serialize())
 	}
 
@@ -378,7 +393,6 @@ func NewSession(
 	ctx context.Context,
 	args SessionArgs,
 	e *Executor,
-	remote net.Addr,
 	memMetrics *MemoryMetrics,
 	conn pgwirebase.Conn,
 ) *Session {
@@ -400,10 +414,12 @@ func NewSession(
 		memMetrics:       memMetrics,
 		sqlStats:         &e.sqlStats,
 		tables: TableCollection{
-			leaseMgr:      e.cfg.LeaseManager,
-			databaseCache: e.getDatabaseCache(),
+			leaseMgr:          e.cfg.LeaseManager,
+			databaseCache:     e.dbCache.getDatabaseCache(),
+			dbCacheSubscriber: e.dbCache,
 		},
-		conn: conn,
+		conn:    conn,
+		planner: planner{execCfg: &e.cfg},
 	}
 	s.dataMutator = sessionDataMutator{
 		data: &s.data,
@@ -413,7 +429,6 @@ func NewSession(
 		},
 		settings:       e.cfg.Settings,
 		curTxnReadOnly: &s.TxnState.readOnly,
-		sessionTracing: &s.Tracing,
 		applicationNameChanged: func(newName string) {
 			if s.sqlStats != nil {
 				s.appStats = s.sqlStats.getStatsForApplication(newName)
@@ -424,13 +439,12 @@ func NewSession(
 	s.dataMutator.SetApplicationName(args.ApplicationName)
 	s.PreparedStatements = makePreparedStatements(s)
 	s.PreparedPortals = makePreparedPortals(s)
-	s.Tracing.session = s
-	s.mu.ActiveQueries = make(map[uint128.Uint128]*queryMeta)
-	s.ActiveSyncQueries = make([]uint128.Uint128, 0)
+	s.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
+	s.ActiveSyncQueries = make([]ClusterWideID, 0)
 
 	remoteStr := "<admin>"
-	if remote != nil {
-		remoteStr = remote.String()
+	if args.RemoteAddr != nil {
+		remoteStr = args.RemoteAddr.String()
 	}
 	s.ClientAddr = remoteStr
 
@@ -439,7 +453,8 @@ func NewSession(
 	}
 	s.context, s.cancel = contextutil.WithCancel(ctx)
 
-	e.cfg.SessionRegistry.register(s)
+	s.sessionID = e.generateID()
+	e.cfg.SessionRegistry.register(s.sessionID, s)
 
 	return s
 }
@@ -491,7 +506,9 @@ func (s *Session) Finish(e *Executor) {
 	// We might have unreleased tables if we're finishing the
 	// session abruptly in the middle of a transaction, or, until #7648 is
 	// addressed, there might be leases accumulated by preparing statements.
-	s.tables.releaseTables(s.context)
+	if err := s.tables.releaseTables(s.context, dontBlockForDBCacheUpdate); err != nil {
+		log.Warningf(s.context, "error releasing tables: %s", err)
+	}
 
 	s.ClearStatementsAndPortals(s.context)
 	s.sessionMon.Stop(s.context)
@@ -502,13 +519,13 @@ func (s *Session) Finish(e *Executor) {
 		s.eventLog = nil
 	}
 
-	if s.Tracing.Enabled() {
+	if s.dataMutator.sessionTracing.Enabled() {
 		if err := s.dataMutator.StopSessionTracing(); err != nil {
 			log.Infof(s.context, "error stopping tracing: %s", err)
 		}
 	}
 	// Clear this session from the sessions registry.
-	e.cfg.SessionRegistry.deregister(s)
+	e.cfg.SessionRegistry.deregister(s.sessionID)
 
 	// This will stop the heartbeating of the of the txn record.
 	// TODO(andrei): This shouldn't have any effect, since, if there was a
@@ -529,7 +546,9 @@ func (s *Session) EmergencyClose() {
 	_ = s.synchronizeParallelStmts(s.context)
 
 	// Release the leases - to ensure other sessions don't get stuck.
-	s.tables.releaseTables(s.context)
+	if err := s.tables.releaseTables(s.context, dontBlockForDBCacheUpdate); err != nil {
+		log.Warningf(s.context, "error releasing tables: %s", err)
+	}
 
 	// The KV txn may be unusable - just leave it dead. Simply
 	// shut down its memory monitor.
@@ -583,11 +602,12 @@ func (s *Session) resetPlanner(
 
 	p.extendedEvalCtx = s.extendedEvalCtx(txn, txnTimestamp, stmtTimestamp)
 	p.extendedEvalCtx.Planner = p
+	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = s.execCfg.ClusterID()
 	p.extendedEvalCtx.NodeID = s.execCfg.NodeID.Get()
 	p.extendedEvalCtx.ReCache = reCache
 
-	p.sessionDataMutator = s.dataMutator
+	p.sessionDataMutator = &s.dataMutator
 	p.preparedStatements = &s.PreparedStatements
 	p.autoCommit = false
 }
@@ -609,15 +629,18 @@ func (s *Session) FinishPlan() {
 			delete(s.mu.ActiveQueries, queryID)
 		}
 		s.mu.Unlock()
-		s.ActiveSyncQueries = make([]uint128.Uint128, 0)
+		s.ActiveSyncQueries = make([]ClusterWideID, 0)
 	}
 
-	s.planner = emptyPlanner
+	s.planner = planner{execCfg: s.execCfg}
 }
 
 // newPlanner creates a planner inside the scope of the given Session. The
 // statement executed by the planner will be executed in txn. The planner
-// should only be used to execute one statement.
+// should only be used to execute one statement. If txn is nil, none of the
+// timestamp fields of the eval ctx will be set (this is in addition to the
+// various other fields that aren't set in either case). But presumably if that
+// is the case, the caller already doesn't care about SQL semantics too much.
 func (s *Session) newPlanner(
 	txn *client.Txn,
 	txnTimestamp time.Time,
@@ -625,7 +648,7 @@ func (s *Session) newPlanner(
 	reCache *tree.RegexpCache,
 	statsCollector sqlStatsCollector,
 ) *planner {
-	p := &planner{}
+	p := &planner{execCfg: s.execCfg}
 	s.resetPlanner(p, txn, txnTimestamp, stmtTimestamp, reCache, statsCollector)
 	return p
 }
@@ -645,58 +668,63 @@ func (s *Session) extendedEvalCtx(
 		st = s.execCfg.Settings
 		statusServer = s.execCfg.StatusServer
 	}
-	var clusterTs hlc.Timestamp
-	if txn != nil {
-		clusterTs = txn.OrigTimestamp()
-	}
+
+	scInterface := newSchemaInterface(&s.tables, s.execCfg.VirtualSchemas)
 
 	return extendedEvalContext{
 		EvalContext: tree.EvalContext{
-			Txn:              txn,
-			SessionData:      &s.data,
-			ApplicationName:  s.dataMutator.ApplicationName(),
-			TxnState:         getTransactionState(&s.TxnState),
-			TxnReadOnly:      s.TxnState.readOnly,
-			TxnImplicit:      s.TxnState.implicitTxn,
-			Settings:         st,
-			CtxProvider:      s,
-			Mon:              &s.TxnState.mon,
-			TestingKnobs:     evalContextTestingKnobs,
-			StmtTimestamp:    stmtTimestamp,
-			TxnTimestamp:     txnTimestamp,
-			ClusterTimestamp: clusterTs,
+			Txn:             txn,
+			SessionData:     &s.data,
+			ApplicationName: s.dataMutator.ApplicationName(),
+			TxnState:        getTransactionState(&s.TxnState),
+			TxnReadOnly:     s.TxnState.readOnly,
+			TxnImplicit:     s.TxnState.implicitTxn,
+			Settings:        st,
+			CtxProvider:     s,
+			Mon:             &s.TxnState.mon,
+			TestingKnobs:    evalContextTestingKnobs,
+			StmtTimestamp:   stmtTimestamp,
+			TxnTimestamp:    txnTimestamp,
 		},
-		SessionMutator:        s.dataMutator,
-		VirtualSchemas:        s.execCfg.VirtualSchemas,
-		Tracing:               &s.Tracing,
-		StatusServer:          statusServer,
-		MemMetrics:            s.memMetrics,
-		Tables:                &s.tables,
-		ExecCfg:               s.execCfg,
-		DistSQLPlanner:        s.distSQLPlanner,
-		TestingVerifyMetadata: s,
-		TxnModesSetter:        &s.TxnState,
-		SchemaChangers:        &s.TxnState.schemaChangers,
+		SessionMutator:  &s.dataMutator,
+		VirtualSchemas:  s.execCfg.VirtualSchemas,
+		Tracing:         &s.dataMutator.sessionTracing,
+		StatusServer:    statusServer,
+		MemMetrics:      s.memMetrics,
+		Tables:          &s.tables,
+		ExecCfg:         s.execCfg,
+		DistSQLPlanner:  s.distSQLPlanner,
+		TxnModesSetter:  &s.TxnState,
+		SchemaChangers:  &s.TxnState.schemaChangers,
+		schemaAccessors: scInterface,
 	}
+}
+
+func newSchemaInterface(tables *TableCollection, vt VirtualTabler) *schemaInterface {
+	sc := &schemaInterface{
+		physical: &CachedPhysicalAccessor{
+			SchemaAccessor: UncachedPhysicalAccessor{},
+			tc:             tables,
+		},
+	}
+	sc.logical = &LogicalSchemaAccessor{
+		SchemaAccessor: sc.physical,
+		vt:             vt,
+	}
+	return sc
 }
 
 // resetForBatch prepares the Session for executing a new batch of statements.
 func (s *Session) resetForBatch(e *Executor) {
 	// Update the database cache to a more recent copy, so that we can use tables
 	// that we created in previous batches of the same transaction.
-	s.tables.databaseCache = e.getDatabaseCache()
-}
-
-// setTestingVerifyMetadata implements the testingVerifyMetadata interface.
-func (s *Session) setTestingVerifyMetadata(fn func(config.SystemConfig) error) {
-	s.testingVerifyMetadataFn = fn
-	s.verifyFnCheckedOnce = false
+	s.tables.databaseCache = e.dbCache.getDatabaseCache()
 }
 
 // addActiveQuery adds a running query to the session's internal store of active
 // queries, as well as to the executor's query registry. Called from executor
 // before start of execution.
-func (s *Session) addActiveQuery(queryID uint128.Uint128, queryMeta *queryMeta) {
+func (s *Session) addActiveQuery(queryID ClusterWideID, queryMeta *queryMeta) {
 	s.mu.Lock()
 	s.mu.ActiveQueries[queryID] = queryMeta
 	s.mu.Unlock()
@@ -710,7 +738,7 @@ func (s *Session) addActiveQuery(queryID uint128.Uint128, queryMeta *queryMeta) 
 // removeActiveQuery removes a query from a session's internal store of active
 // queries, as well as from the executor's query registry.
 // Called when a query finishes execution.
-func (s *Session) removeActiveQuery(queryID uint128.Uint128) {
+func (s *Session) removeActiveQuery(queryID ClusterWideID) {
 	s.mu.Lock()
 	queryMeta, ok := s.mu.ActiveQueries[queryID]
 	if ok {
@@ -723,7 +751,7 @@ func (s *Session) removeActiveQuery(queryID uint128.Uint128) {
 // setQueryExecutionMode is called upon start of execution of a query, and sets
 // the query's metadata to indicate whether it's distributed or not.
 func (s *Session) setQueryExecutionMode(
-	queryID uint128.Uint128, isDistributed bool, isParallel bool,
+	queryID ClusterWideID, isDistributed bool, isParallel bool,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -757,39 +785,52 @@ func (s *Session) synchronizeParallelStmts(ctx context.Context) error {
 		s.TxnState.mu.Lock()
 		defer s.TxnState.mu.Unlock()
 
-		// Check that all errors are retryable. If any are not, return the
-		// first non-retryable error.
-		var retryErr *roachpb.HandledRetryableTxnError
-		for _, err := range errs {
-			switch t := err.(type) {
-			case *roachpb.HandledRetryableTxnError:
-				// Ignore retryable errors to previous incarnations of this transaction.
-				curTxn := s.TxnState.mu.txn.Proto()
-				errTxn := t.Transaction
-				if errTxn.ID == curTxn.ID && errTxn.Epoch == curTxn.Epoch {
-					retryErr = t
+		// Sort the errors according to their importance.
+		curTxn := s.TxnState.mu.txn.Proto()
+		sort.Slice(errs, func(i, j int) bool {
+			errPriority := func(err error) int {
+				switch t := err.(type) {
+				case *roachpb.HandledRetryableTxnError:
+					errTxn := t.Transaction
+					if errTxn.ID == curTxn.ID && errTxn.Epoch == curTxn.Epoch {
+						// A retryable error for the current transaction
+						// incarnation is given the highest priority.
+						return 1
+					}
+					return 2
+				case *roachpb.TxnPrevAttemptError:
+					// Symptom of concurrent retry.
+					return 3
+				default:
+					// Any other error. We sort these behind retryable errors
+					// and errors we know to be their symptoms because it is
+					// impossible to conclusively determine in all cases whether
+					// one of these errors is a symptom of a concurrent retry or
+					// not. If the error is a symptom then we want to ignore it.
+					// If it is not, we expect to see the same error during a
+					// transaction retry.
+					return 4
 				}
-			case *roachpb.TxnPrevAttemptError:
-				// Symptom of concurrent retry, ignore.
-			default:
-				return err
 			}
-		}
+			return errPriority(errs[i]) < errPriority(errs[j])
+		})
 
-		if retryErr == nil {
+		// Return the "best" error.
+		bestErr := errs[0]
+		switch bestErr.(type) {
+		case *roachpb.HandledRetryableTxnError:
+			// If any of the errors are retryable, we need to bump the transaction
+			// epoch to invalidate any writes performed by any workers after the
+			// retry updated the txn's proto but before we synchronized (some of
+			// these writes might have been performed at the wrong epoch). Note
+			// that we don't need to lock the client.Txn because we're synchronized.
+			// See #17197.
+			s.TxnState.mu.txn.Proto().BumpEpoch()
+		case *roachpb.TxnPrevAttemptError:
 			log.Fatalf(ctx, "found symptoms of a concurrent retry, but did "+
 				"not find the final retry error: %v", errs)
 		}
-
-		// If all errors are retryable, we return the one meant for the current
-		// incarnation of this transaction. Before doing so though, we need to bump
-		// the transaction epoch to invalidate any writes performed by any workers
-		// after the retry updated the txn's proto but before we synchronized (some
-		// of these writes might have been performed at the wrong epoch). Note
-		// that we don't need to lock the client.Txn because we're synchronized.
-		// See #17197.
-		s.TxnState.mu.txn.Proto().BumpEpoch()
-		return retryErr
+		return bestErr
 	}
 	return nil
 }
@@ -798,8 +839,7 @@ func (s *Session) synchronizeParallelStmts(ctx context.Context) error {
 // into a serverpb.Session. Exported for testing.
 const MaxSQLBytes = 1000
 
-// serialize serializes a Session into a serverpb.Session
-// that can be served over RPC.
+// serialize is part of the registrySession interface.
 func (s *Session) serialize() serverpb.Session {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -852,6 +892,7 @@ func (s *Session) serialize() serverpb.Session {
 		ActiveQueries:   activeQueries,
 		KvTxnID:         kvTxnID,
 		LastActiveQuery: lastActiveQuery,
+		ID:              s.sessionID.GetBytes(),
 	}
 }
 
@@ -1072,7 +1113,7 @@ func (ts *txnState) resetForNewSQLTxn(
 	// traceTxnThreshold and debugTrace7881Enabled to integrate more nicely with
 	// session tracing.
 	st := s.execCfg.Settings
-	if !s.Tracing.Enabled() && (traceTxnThreshold.Get(&st.SV) > 0 || debugTrace7881Enabled) {
+	if !s.dataMutator.sessionTracing.Enabled() && (traceTxnThreshold.Get(&st.SV) > 0 || debugTrace7881Enabled) {
 		mode := tracing.SingleNodeRecording
 		if traceTxnThreshold.Get(&st.SV) > 0 {
 			mode = tracing.SnowballRecording
@@ -1090,7 +1131,6 @@ func (ts *txnState) resetForNewSQLTxn(
 	ts.sp = sp
 	ts.Ctx, ts.cancel = contextutil.WithCancel(ctx)
 	ts.SetState(AutoRetry)
-	s.Tracing.onNewSQLTxn(ts.sp)
 
 	ts.mon.Start(ctx, &s.mon, mon.BoundAccount{})
 
@@ -1156,9 +1196,6 @@ func (ts *txnState) finishSQLTxn(s *Session) {
 
 	sampledFor7881 := (ts.sp.BaggageItem(keyFor7881Sample) != "")
 	ts.sp.Finish()
-	if err := s.Tracing.onFinishSQLTxn(ts.sp); err != nil {
-		log.Errorf(s.context, "error finishing trace: %s", err)
-	}
 	// TODO(andrei): we should find a cheap way to get a trace's duration without
 	// calling the expensive GetRecording().
 	durThreshold := traceTxnThreshold.Get(&s.execCfg.Settings.SV)
@@ -1236,7 +1273,6 @@ func (ts *txnState) updateStateAndCleanupOnErr(err error, e *Executor) error {
 		// Note that TransactionAborted is also a retriable error, handled here;
 		// in this case cleanup for the txn has been done for us under the hood.
 		ts.SetState(RestartWait)
-		ts.mu.txn.ResetDeadline()
 	}
 	return err
 }
@@ -1259,25 +1295,6 @@ func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
 
 func (ts *txnState) setReadOnly(readOnly bool) {
 	ts.readOnly = readOnly
-}
-
-// isSerializableRestart returns true if the KV transaction is serializable and
-// its timestamp has been pushed. Used to detect whether the SQL txn will be
-// allowed to commit.
-//
-// Note that this method allows for false negatives: sometimes the client only
-// figures out that it's been pushed when it sends an EndTransaction - i.e. it's
-// possible for the txn to have been pushed asynchoronously by some other
-// operation (usually, but not exclusively, by a high-priority txn with
-// conflicting writes).
-func (ts *txnState) isSerializableRestart() bool {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	txn := ts.mu.txn
-	if txn == nil {
-		return false
-	}
-	return txn.IsSerializableRestart()
 }
 
 func (ts *txnState) setTransactionModes(modes tree.TransactionModes) error {
@@ -1345,26 +1362,30 @@ func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChang
 	scc.schemaChangers = append(scc.schemaChangers, schemaChanger)
 }
 
+func (scc *schemaChangerCollection) reset() {
+	scc.schemaChangers = nil
+}
+
 // execSchemaChanges releases schema leases and runs the queued
 // schema changers. This needs to be run after the transaction
 // scheduling the schema change has finished.
 //
 // The list of closures is cleared after (attempting) execution.
 func (scc *schemaChangerCollection) execSchemaChanges(
-	ctx context.Context, e *Executor, session *Session,
+	ctx context.Context, cfg *ExecutorConfig,
 ) error {
-	if e.cfg.SchemaChangerTestingKnobs.SyncFilter != nil {
-		e.cfg.SchemaChangerTestingKnobs.SyncFilter(TestingSchemaChangerCollection{scc})
+	if cfg.SchemaChangerTestingKnobs.SyncFilter != nil {
+		cfg.SchemaChangerTestingKnobs.SyncFilter(TestingSchemaChangerCollection{scc})
 	}
 	// Execute any schema changes that were scheduled, in the order of the
 	// statements that scheduled them.
 	var firstError error
 	for _, sc := range scc.schemaChangers {
-		sc.db = e.cfg.DB
-		sc.testingKnobs = e.cfg.SchemaChangerTestingKnobs
-		sc.distSQLPlanner = e.distSQLPlanner
+		sc.db = cfg.DB
+		sc.testingKnobs = cfg.SchemaChangerTestingKnobs
+		sc.distSQLPlanner = cfg.DistSQLPlanner
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-			evalCtx := createSchemaChangeEvalCtx(e.cfg.Clock.Now())
+			evalCtx := createSchemaChangeEvalCtx(cfg.Clock.Now())
 			if err := sc.exec(ctx, true /* inSession */, &evalCtx); err != nil {
 				if shouldLogSchemaChangeError(err) {
 					log.Warningf(ctx, "error executing schema change: %s", err)
@@ -1387,11 +1408,15 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 			break
 		}
 	}
-	scc.schemaChangers = scc.schemaChangers[:0]
+	scc.schemaChangers = nil
 	return firstError
 }
 
 const panicLogOutputCutoffChars = 500
+
+func anonymizeStmtAndConstants(stmt tree.Statement) string {
+	return tree.AsStringWithFlags(stmt, tree.FmtAnonymize|tree.FmtHideConstants)
+}
 
 // AnonymizeStatementsForReporting transforms an action, SQL statements, and a value
 // (usually a recovered panic) into an error that will be useful when passed to
@@ -1401,24 +1426,8 @@ func AnonymizeStatementsForReporting(action, sqlStmts string, r interface{}) err
 	{
 		stmts, err := parser.Parse(sqlStmts)
 		if err == nil {
-			var f struct {
-				buf              bytes.Buffer
-				anonCtx, hideCtx tree.FmtCtx
-			}
-			f.anonCtx = tree.MakeFmtCtx(&f.buf, tree.FmtAnonymize)
-			f.hideCtx = tree.MakeFmtCtx(&f.buf, tree.FmtHideConstants)
-			for _, stmt := range NewStatementList(stmts) {
-				f.anonCtx.FormatNode(stmt.AST)
-				stmt.AST, err = parser.ParseOne(f.buf.String())
-				f.buf.Reset()
-				if err != nil {
-					f.buf.WriteString("[unknown]")
-				} else {
-					f.hideCtx.FormatNode(stmt.AST)
-				}
-
-				anonymized = append(anonymized, f.buf.String())
-				f.buf.Reset()
+			for _, stmt := range stmts {
+				anonymized = append(anonymized, anonymizeStmtAndConstants(stmt))
 			}
 		}
 	}
@@ -1464,15 +1473,35 @@ func (s *Session) maybeRecover(action, stmts string) {
 	}
 }
 
+// cancelQuery is part of the registrySession interface.
+func (s *Session) cancelQuery(queryID ClusterWideID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if queryMeta, exists := s.mu.ActiveQueries[queryID]; exists {
+		queryMeta.cancel()
+		return true
+	}
+	return false
+}
+
+// cancelSession is part of the registrySession interface.
+func (s *Session) cancelSession() {
+	s.cancel()
+}
+
+// user is part of the registrySession interface.
+func (s *Session) user() string {
+	return s.data.User
+}
+
 // SessionTracing holds the state used by SET TRACING {ON,OFF,LOCAL} statements in
 // the context of one SQL session.
 // It holds the current trace being collected (or the last trace collected, if
 // tracing is not currently ongoing).
 //
-// SessionTracing and its interactions with the Session are thread-safe; tracing
-// can be turned on at any time.
+// SessionTracing and its interactions with the connExecutor are thread-safe;
+// tracing can be turned on at any time.
 type SessionTracing struct {
-	session *Session
 	// enabled is set at times when "session enabled" is active - i.e. when
 	// transactions are being recorded.
 	enabled bool
@@ -1482,25 +1511,53 @@ type SessionTracing struct {
 	// operators to the current context.
 	kvTracingEnabled bool
 
-	// If tracing==true, recordingType indicates the type of the current
+	// If recording==true, recordingType indicates the type of the current
 	// recording.
 	recordingType tracing.RecordingType
 
-	// txnRecording accumulates the recorded spans. Each []RawSpan represents the
-	// trace of a SQL transaction. The first element corresponds to the
-	// partially-recorded transaction in which SET TRACING ON was run (or its
-	// implicit txn, if there wasn't a SQL transaction already running). The last
-	// one will contain the partial-recording of the transaction in which SET
-	// TRACE OFF has been run.
-	txnRecordings [][]tracing.RecordedSpan
+	// ex is the connExecutor to which this SessionTracing is tied.
+	ex *connExecutor
+
+	// firstTxnSpan is the span of the first txn that was active when session
+	// tracing was enabled.
+	firstTxnSpan opentracing.Span
+
+	// connSpan is the connection's span. This is recording.
+	connSpan opentracing.Span
+
+	// lastRecording will collect the recording when stopping tracing.
+	lastRecording []traceRow
 }
 
-// StartTracing starts "session tracing". After calling this, all SQL
-// transactions running on this session will be traced. The current transaction,
-// if any, will also be traced (except that children spans of the current txn
-// span that have already been created will not be traced).
-//
+// getRecording returns the session trace. If we're not currently tracing, this
+// will be the last recorded trace. If we are currently tracing, we'll return
+// whatever was recorded so far.
+func (st *SessionTracing) getRecording() ([]traceRow, error) {
+	if !st.enabled {
+		return st.lastRecording, nil
+	}
+
+	var spans []tracing.RecordedSpan
+	if st.firstTxnSpan != nil {
+		spans = append(spans, tracing.GetRecording(st.firstTxnSpan)...)
+	}
+	spans = append(spans, tracing.GetRecording(st.connSpan)...)
+
+	return generateSessionTraceVTable(spans)
+}
+
+// StartTracing starts "session tracing". From this moment on, everything
+// happening on both the connection's context and the current txn's context (if
+// any) will be traced.
 // StopTracing() needs to be called to finish this trace.
+//
+// There's two contexts on which we must record:
+// 1) If we're inside a txn, we start recording on the txn's span. We assume
+// that the txn's ctx has a recordable span on it.
+// 2) Regardless of whether we're in a txn or not, we need to record the
+// connection's context. This context generally does not have a span, so we
+// "hijack" it with one that does. Whatever happens on that context, plus
+// whatever happens in future derived txn contexts, will be recorded.
 //
 // Args:
 // kvTracingEnabled: If set, the traces will also include "KV trace" messages -
@@ -1510,82 +1567,68 @@ func (st *SessionTracing) StartTracing(recType tracing.RecordingType, kvTracingE
 	if st.enabled {
 		return errors.Errorf("already tracing")
 	}
-	sp := opentracing.SpanFromContext(st.session.Ctx())
-	if sp == nil {
-		return errors.Errorf("no span for SessionTracing")
+
+	// If we're inside a transaction, start recording on the txn span.
+	if _, ok := st.ex.machine.CurState().(stateNoTxn); !ok {
+		sp := opentracing.SpanFromContext(st.ex.state.Ctx)
+		if sp == nil {
+			return errors.Errorf("no txn span for SessionTracing")
+		}
+		tracing.StartRecording(sp, recType)
+		st.firstTxnSpan = sp
 	}
 
-	// Reset the previous recording, if any.
-	st.txnRecordings = nil
-
-	tracing.StartRecording(sp, recType)
 	st.enabled = true
 	st.kvTracingEnabled = kvTracingEnabled
 	st.recordingType = recType
+
+	// Now hijack the conn's ctx with one that has a recording span.
+
+	opName := "session recording"
+	var sp opentracing.Span
+	if parentSp := opentracing.SpanFromContext(st.ex.ctxHolder.connCtx); parentSp != nil {
+		// Create a child span while recording.
+		sp = parentSp.Tracer().StartSpan(
+			opName, opentracing.ChildOf(parentSp.Context()), tracing.Recordable)
+	} else {
+		// Create a root span while recording.
+		sp = st.ex.server.cfg.AmbientCtx.Tracer.StartSpan(opName, tracing.Recordable)
+	}
+	tracing.StartRecording(sp, recType)
+	st.connSpan = sp
+
+	// Hijack the connections context.
+	newConnCtx := opentracing.ContextWithSpan(st.ex.ctxHolder.connCtx, sp)
+	st.ex.ctxHolder.hijack(newConnCtx)
+
 	return nil
 }
 
 // StopTracing stops the trace that was started with StartTracing().
-//
 // An error is returned if tracing was not active.
 func (st *SessionTracing) StopTracing() error {
 	if !st.enabled {
 		return errors.Errorf("not tracing")
 	}
 	st.enabled = false
-	// Stop recording the current transaction.
-	sp := opentracing.SpanFromContext(st.session.Ctx())
-	if sp == nil {
-		return errors.Errorf("no span for SessionTracing")
-	}
-	spans := tracing.GetRecording(sp)
-	tracing.StopRecording(sp)
-	if spans == nil {
-		return errors.Errorf("nil recording")
-	}
-	// Append the partially-recorded current transaction to the list of
-	// transactions.
-	st.txnRecordings = append(st.txnRecordings, spans)
-	return nil
-}
 
-// onFinishSQLTxn is called when a SQL transaction is about to be finished (i.e.
-// just before the span corresponding to the txn is Finish()ed). It saves that
-// span's recording in the SessionTracing.
-//
-// sp is the transaction's span.
-func (st *SessionTracing) onFinishSQLTxn(sp opentracing.Span) error {
-	if !st.Enabled() {
-		return nil
-	}
+	var spans []tracing.RecordedSpan
 
-	if sp == nil {
-		return errors.Errorf("no span for SessionTracing")
+	if st.firstTxnSpan != nil {
+		spans = append(spans, tracing.GetRecording(st.firstTxnSpan)...)
+		tracing.StopRecording(st.firstTxnSpan)
 	}
-	spans := tracing.GetRecording(sp)
-	if spans == nil {
-		return errors.Errorf("nil recording")
-	}
-	st.txnRecordings = append(st.txnRecordings, spans)
-	// tracing.StopRecording() is not necessary. The span is about to be closed
-	// anyway.
-	return nil
-}
+	st.connSpan.Finish()
+	spans = append(spans, tracing.GetRecording(st.connSpan)...)
+	// NOTE: We're stopping recording on the connection's ctx only; the stopping
+	// is not inherited by children. If we are inside of a txn, that span will
+	// continue recording, even though nobody will collect its recording again.
+	tracing.StopRecording(st.connSpan)
+	st.ex.ctxHolder.unhijack()
 
-// onNewSQLTxn is called when a new SQL txn is started (i.e. soon after the span
-// corresponding to that transaction has been created). It starts recording on
-// that new span. The recording will be retrieved when the transaction finishes
-// (in onFinishSQLTxn).
-//
-// sp is the span corresponding to the new SQL transaction.
-func (st *SessionTracing) onNewSQLTxn(sp opentracing.Span) {
-	if !st.Enabled() {
-		return
-	}
-	if sp == nil {
-		panic("no span for SessionTracing")
-	}
-	tracing.StartRecording(sp, st.recordingType)
+	var err error
+	st.lastRecording, err = generateSessionTraceVTable(spans)
+	return err
 }
 
 // RecordingType returns which type of tracing is currently being done.
@@ -1620,7 +1663,6 @@ func extractMsgFromRecord(rec tracing.RecordedSpan_LogRecord) string {
 
 // traceRow is the type of a single row in the session_trace vtable.
 // The columns are as follows:
-// - txn_idx
 // - span_idx
 // - message_idx
 // - timestamp
@@ -1629,7 +1671,7 @@ func extractMsgFromRecord(rec tracing.RecordedSpan_LogRecord) string {
 // - location
 // - tag
 // - message
-type traceRow [9]tree.Datum
+type traceRow [8]tree.Datum
 
 // A regular expression to split log messages.
 // It has three parts:
@@ -1643,8 +1685,7 @@ var logMessageRE = regexp.MustCompile(
 
 // generateSessionTraceVTable generates the rows of said table by using the log
 // messages from the session's trace (i.e. the ongoing trace, if any, or the
-// last one recorded). Note that, if there's an ongoing trace, the current
-// transaction is not part of it yet.
+// last one recorded).
 //
 // All the log messages from the current recording are returned, in
 // the order in which they should be presented in the crdb_internal.session_info
@@ -1674,33 +1715,28 @@ var logMessageRE = regexp.MustCompile(
 // | +-------------------+ |
 // |            7          |
 // +-----------------------+
-func (st *SessionTracing) generateSessionTraceVTable() ([]traceRow, error) {
+//
+// Note that what's described above is not the order in which SHOW TRACE FOR ...
+// displays the information.
+func generateSessionTraceVTable(spans []tracing.RecordedSpan) ([]traceRow, error) {
 	// Get all the log messages, in the right order.
 	var allLogs []logRecordRow
-	for txnIdx, spans := range st.txnRecordings {
-		seenSpans := make(map[uint64]struct{})
 
-		// The spans are recorded in the order in which they are started, so the
-		// first one will be a txn's root span.
-		// In the loop below, we expect that, once we call getMessagesForSubtrace on
-		// the first span in the transaction, all spans will be recursively marked
-		// as seen. However, if that doesn't happen (e.g. we're missing a parent
-		// span for some reason), the loop will handle the situation.
-		for spanIdx, span := range spans {
-			if _, ok := seenSpans[span.SpanID]; ok {
-				continue
-			}
-			spanWithIndex := spanWithIndex{
-				RecordedSpan: &spans[spanIdx],
-				index:        spanIdx,
-				txnIdx:       txnIdx,
-			}
-			msgs, err := getMessagesForSubtrace(spanWithIndex, spans, seenSpans)
-			if err != nil {
-				return nil, err
-			}
-			allLogs = append(allLogs, msgs...)
+	// NOTE: The spans are recorded in the order in which they are started.
+	seenSpans := make(map[uint64]struct{})
+	for spanIdx, span := range spans {
+		if _, ok := seenSpans[span.SpanID]; ok {
+			continue
 		}
+		spanWithIndex := spanWithIndex{
+			RecordedSpan: &spans[spanIdx],
+			index:        spanIdx,
+		}
+		msgs, err := getMessagesForSubtrace(spanWithIndex, spans, seenSpans)
+		if err != nil {
+			return nil, err
+		}
+		allLogs = append(allLogs, msgs...)
 	}
 
 	// Transform the log messages into table rows.
@@ -1737,7 +1773,6 @@ func (st *SessionTracing) generateSessionTraceVTable() ([]traceRow, error) {
 		}
 
 		row := traceRow{
-			tree.NewDInt(tree.DInt(lrr.span.txnIdx)),              // txn_idx
 			tree.NewDInt(tree.DInt(lrr.span.index)),               // span_idx
 			tree.NewDInt(tree.DInt(lrr.index)),                    // message_idx
 			tree.MakeDTimestampTZ(lrr.timestamp, time.Nanosecond), // timestamp
@@ -1755,9 +1790,7 @@ func (st *SessionTracing) generateSessionTraceVTable() ([]traceRow, error) {
 // getOrderedChildSpans returns all the spans in allSpans that are children of
 // spanID. It assumes the input is ordered by start time, in which case the
 // output is also ordered.
-func getOrderedChildSpans(
-	spanID uint64, txnIdx int, allSpans []tracing.RecordedSpan,
-) []spanWithIndex {
+func getOrderedChildSpans(spanID uint64, allSpans []tracing.RecordedSpan) []spanWithIndex {
 	children := make([]spanWithIndex, 0)
 	for i := range allSpans {
 		if allSpans[i].ParentSpanID == spanID {
@@ -1766,7 +1799,6 @@ func getOrderedChildSpans(
 				spanWithIndex{
 					RecordedSpan: &allSpans[i],
 					index:        i,
-					txnIdx:       txnIdx,
 				})
 		}
 	}
@@ -1775,7 +1807,7 @@ func getOrderedChildSpans(
 
 // getMessagesForSubtrace takes a span and interleaves its log messages with
 // those from its children (recursively). The order is the one defined in the
-// comment on SessionTracing.GenerateSessionTraceVTable.
+// comment on generateSessionTraceVTable().
 //
 // seenSpans is modified to record all the spans that are part of the subtrace
 // rooted at span.
@@ -1799,7 +1831,7 @@ func getMessagesForSubtrace(
 		})
 
 	seenSpans[span.SpanID] = struct{}{}
-	childSpans := getOrderedChildSpans(span.SpanID, span.txnIdx, allSpans)
+	childSpans := getOrderedChildSpans(span.SpanID, allSpans)
 	var i, j int
 	// Sentinel value - year 6000.
 	maxTime := time.Date(6000, 0, 0, 0, 0, 0, 0, time.UTC)
@@ -1850,9 +1882,6 @@ type logRecordRow struct {
 type spanWithIndex struct {
 	*tracing.RecordedSpan
 	index int
-	// txnIdx is the 0-based index of the transaction in which this span was
-	// recorded.
-	txnIdx int
 }
 
 // sessionDataMutator is the interface used by sessionVars to change the session
@@ -1864,7 +1893,7 @@ type sessionDataMutator struct {
 	settings *cluster.Settings
 	// curTxnReadOnly is a value to be mutated through SET transaction_read_only = ...
 	curTxnReadOnly *bool
-	sessionTracing *SessionTracing
+	sessionTracing SessionTracing
 	// applicationNamedChanged, if set, is called when the "application name"
 	// variable is updated.
 	applicationNameChanged func(newName string)
@@ -1902,6 +1931,14 @@ func (m *sessionDataMutator) SetDistSQLMode(val sessiondata.DistSQLExecMode) {
 	m.data.DistSQLMode = val
 }
 
+func (m *sessionDataMutator) SetLookupJoinEnabled(val bool) {
+	m.data.LookupJoinEnabled = val
+}
+
+func (m *sessionDataMutator) SetOptimizerMode(val sessiondata.OptimizerMode) {
+	m.data.OptimizerMode = val
+}
+
 func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
@@ -1916,6 +1953,10 @@ func (m *sessionDataMutator) SetLocation(loc *time.Location) {
 
 func (m *sessionDataMutator) SetReadOnly(val bool) {
 	*m.curTxnReadOnly = val
+}
+
+func (m *sessionDataMutator) SetStmtTimeout(timeout time.Duration) {
+	m.data.StmtTimeout = timeout
 }
 
 func (m *sessionDataMutator) StopSessionTracing() error {
@@ -1978,7 +2019,7 @@ func (s *sqlStatsCollectorImpl) PhaseTimes() *phaseTimes {
 	return &s.phaseTimes
 }
 
-// SQLStats is part of the sqlStatsCollector interface.
+// RecordStatement is part of the sqlStatsCollector interface.
 func (s *sqlStatsCollectorImpl) RecordStatement(
 	stmt Statement,
 	distSQLUsed bool,
@@ -1992,7 +2033,7 @@ func (s *sqlStatsCollectorImpl) RecordStatement(
 		parseLat, planLat, runLat, svcLat, ovhLat)
 }
 
-// RecordStatement is part of the sqlStatsCollector interface.
+// SQLStats is part of the sqlStatsCollector interface.
 func (s *sqlStatsCollectorImpl) SQLStats() *sqlStats {
 	return s.sqlStats
 }

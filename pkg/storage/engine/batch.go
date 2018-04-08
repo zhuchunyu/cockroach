@@ -114,6 +114,11 @@ func (b *RocksDBBatchBuilder) Len() int {
 	return len(b.repr)
 }
 
+// Empty returns whether the under construction repr is empty.
+func (b *RocksDBBatchBuilder) Empty() bool {
+	return len(b.repr) <= headerSize
+}
+
 // getRepr constructs the batch representation and returns it.
 func (b *RocksDBBatchBuilder) getRepr() []byte {
 	b.maybeInit()
@@ -202,7 +207,7 @@ func (b *RocksDBBatchBuilder) encodeKey(key MVCCKey, extra int) {
 	b.repr[len(b.repr)-1-extra] = byte(timestampLength)
 }
 
-func (b *RocksDBBatchBuilder) encodeKeyValue(key MVCCKey, value []byte, tag byte) {
+func (b *RocksDBBatchBuilder) encodeKeyValue(key MVCCKey, value []byte, tag BatchType) {
 	b.maybeInit()
 	b.count++
 
@@ -211,7 +216,7 @@ func (b *RocksDBBatchBuilder) encodeKeyValue(key MVCCKey, value []byte, tag byte
 
 	pos := len(b.repr)
 	b.encodeKey(key, extra)
-	b.repr[pos] = tag
+	b.repr[pos] = byte(tag)
 
 	pos = len(b.repr) - extra
 	n := putUvarint32(b.repr[pos:], l)
@@ -382,28 +387,6 @@ func rocksDBBatchVarString(repr []byte) (s []byte, orepr []byte, err error) {
 			v, len(repr))
 	}
 	return repr[:v], repr[v:], nil
-}
-
-// Decode a RocksDB batch repr key/value pair, returning both the key/value and
-// the suffix of data remaining in the batch.
-func rocksDBBatchDecodeValue(repr []byte) (key MVCCKey, value []byte, orepr []byte, err error) {
-	if len(repr) == 0 {
-		return key, nil, repr, errors.Errorf("unexpected batch EOF")
-	}
-	if BatchType(repr[0]) != BatchTypeValue {
-		return key, nil, repr, errors.Errorf("unexpected batch entry type: %d", BatchType(repr[0]))
-	}
-	repr = repr[1:]
-	rawKey, repr, err := rocksDBBatchVarString(repr)
-	if err != nil {
-		return key, nil, repr, err
-	}
-	value, repr, err = rocksDBBatchVarString(repr)
-	if err != nil {
-		return key, nil, repr, err
-	}
-	key, err = DecodeKey(rawKey)
-	return key, value, repr, err
 }
 
 // RocksDBBatchReader is used to iterate the entries in a RocksDB batch

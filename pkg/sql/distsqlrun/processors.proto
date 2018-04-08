@@ -26,6 +26,7 @@ import "roachpb/data.proto";
 import "roachpb/errors.proto";
 import "sql/sqlbase/structured.proto";
 import "sql/sqlbase/encoded_datum.proto";
+import "sql/sqlbase/join_type.proto";
 import "sql/distsqlrun/data.proto";
 import "util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
@@ -119,18 +120,30 @@ message ProcessorCoreUnion {
   optional HashJoinerSpec hashJoiner = 9;
   optional ValuesCoreSpec values = 10;
   optional BackfillerSpec backfiller = 11;
-  optional AlgebraicSetOpSpec setOp = 12;
   optional ReadCSVSpec readCSV = 13;
   optional SSTWriterSpec SSTWriter = 14;
   optional SamplerSpec Sampler = 15;
   optional SampleAggregatorSpec SampleAggregator = 16;
   optional InterleavedReaderJoinerSpec interleavedReaderJoiner = 17;
+  optional MetadataTestSenderSpec metadataTestSender = 18;
+  optional MetadataTestReceiverSpec metadataTestReceiver = 19;
+
+  reserved 6, 12;
 }
 
 // NoopCoreSpec indicates a "no-op" processor core. This is used when we just
 // need post-processing or when only a synchronizer is required (e.g. at the
 // final endpoint).
 message NoopCoreSpec {
+}
+
+message MetadataTestSenderSpec {
+  optional string id = 1 [(gogoproto.nullable) = false,
+                         (gogoproto.customname) = "ID"];
+}
+
+message MetadataTestReceiverSpec {
+  repeated string sender_ids = 1 [(gogoproto.customname) = "SenderIDs"];
 }
 
 // ValuesCoreSpec is the core of a processor that has no inputs and generates
@@ -188,9 +201,20 @@ message TableReaderSpec {
 // performs KV operations to retrieve specific rows that correspond to the
 // values in the input stream (join by lookup).
 //
-// The "internal columns" of a JoinReader (see ProcessorSpec) are all the
-// columns of the table. Internally, only the values for the columns needed by
-// the post-processing stage are be populated.
+// The "internal columns" of a JoinReader (see ProcessorSpec) are either the
+// columns of the table or the concatenation of the columns of the input stream
+// with the table columns, depending on the lookup columns specified.
+// Internally, only the values for the columns needed by the post-processing
+// stage are be populated.
+//
+// Example:
+// Input stream columns: | a | b |              Table columns: | c |
+// 
+// If performing a lookup join on a = c (lookup columns are [0, 2]):
+//        Internal columns: | a | b | c |
+// 
+// If performing an index join (lookup columns is []):
+//        Internal columns: | c |
 message JoinReaderSpec {
   optional sqlbase.TableDescriptor table = 1 [(gogoproto.nullable) = false];
 
@@ -199,8 +223,32 @@ message JoinReaderSpec {
   // TODO(radu): figure out the correct semantics when joining with an index.
   optional uint32 index_idx = 2 [(gogoproto.nullable) = false];
 
-  // TODO(radu): add field to describe the input columns and allow plumbing
-  // through values that aren't used for the lookup.
+  // Column indexes in the input stream specifying the columns which match with
+  // the index columns. These are the equality columns of the join.
+  // If empty, the start of the input stream schema is assumed to match the index
+  // columns. The joinReader will perform an index join and the "internal
+  // columns" will be the columns of the table.
+  // If populated, the `joinReader` will perform a lookup join and the "internal
+  // columns" will be the concatenation of the input stream columns followed by
+  // the table columns.
+  repeated uint32 lookup_columns = 3 [packed = true];
+
+  // "ON" expression (in addition to the equality constraints captured by the
+  // orderings). Assuming that the left stream has N columns and the right
+  // stream has M columns, in this expression variables @1 to @N refer to
+  // columns of the left stream and variables @N to @(N+M) refer to columns in
+  // the right stream.
+  // Having "ON" expression implies no merged columns.
+  optional Expression on_expr = 4 [(gogoproto.nullable) = false];
+
+  // The index map is used in lookup joins to retrieve the index rows from the
+  // internal columns.
+  // For example, say the streamToPlanColMap for the right side of a lookup
+  // join is: [-1, -1, 2, -1, 3], the internal columns would be columns 3 and
+  // 5. But when an index lookup is done, the entire right side is returned.
+  // The index map tells the processor which columns it should select. In the
+  // example the indexMap would be [2, 3].
+  repeated uint32 index_map = 5 [packed = true];
 }
 
 // SorterSpec is the specification for a "sorting aggregator". A sorting
@@ -231,30 +279,6 @@ message DistinctSpec {
   // considered, so rows A1,B1,C1,D1 and A1,B1,C1,D2 are considered equal and
   // only one of them (the first) is output.
   repeated uint32 distinct_columns = 2;
-}
-
-enum JoinType {
-  INNER = 0;
-  LEFT_OUTER = 1;
-  RIGHT_OUTER = 2;
-  FULL_OUTER = 3;
-  LEFT_SEMI = 4;
-  LEFT_ANTI = 5;
-
-  // INTERSECT_ALL is a special JoinType that is only used for INTERSECT ALL and
-  // INTERSECT operations. It only allows equality columns to be output, and
-  // does not allow ON conditions. It returns every row from the left side that
-  // has a match on the right side, but does not allow multiple rows from the
-  // left side to match the same row on the right.
-  INTERSECT_ALL = 6;
-
-  // EXCEPT_ALL is a special JoinType that is only used for EXCEPT ALL and
-  // EXCEPT operations. It only allows equality columns to be output, and
-  // does not allow ON conditions. It matches every row on the left side with
-  // at most one row on the right side, and does not allow multiple rows from
-  // the left to match the same row on the right. It returns every row from the
-  // left side that, after row matching, does not have a match on the right side.
-  EXCEPT_ALL = 7;
 }
 
 // MergeJoinerSpec is the specification for a merge join processor. The processor
@@ -288,7 +312,7 @@ message MergeJoinerSpec {
   // columns in the right stream.
   optional Expression on_expr = 5 [(gogoproto.nullable) = false];
 
-  optional JoinType type = 6 [(gogoproto.nullable) = false];
+  optional sqlbase.JoinType type = 6 [(gogoproto.nullable) = false];
 
   // NullEquality indicates that NULL = NULL should be considered true.
   // This allows OUTER JOINs to consider NULL values meaningfully. An
@@ -332,7 +356,7 @@ message HashJoinerSpec {
   // Having "ON" expression implies no merged columns.
   optional Expression on_expr = 5 [(gogoproto.nullable) = false];
 
-  optional JoinType type = 6 [(gogoproto.nullable) = false];
+  optional sqlbase.JoinType type = 6 [(gogoproto.nullable) = false];
 
   // DEPRECATED
   //
@@ -468,22 +492,6 @@ message FlowSpec {
   repeated ProcessorSpec processors = 2 [(gogoproto.nullable) = false];
 }
 
-// AlgebraicSetOpSpec is a specification for algebraic set operations currently
-// only the EXCEPT ALL set operation, but extensible to other set operations.
-// INTERSECT ALL is implemented with HashJoinerSpec, and UNION ALL with
-// a no-op processor. EXCEPT/INTERSECT/UNION use a DISTINCT processor at
-// the end. The two input streams should have the same schema. The ordering
-// of the left stream will be preserved in the output stream.
-message AlgebraicSetOpSpec {
-  enum SetOpType {
-    Except_all = 0;
-  }
-  // If the two input streams are both ordered by a common column ordering,
-  // that ordering can be used to optimize resource usage in the processor.
-  optional Ordering ordering = 1 [(gogoproto.nullable) = false];
-  optional SetOpType op_type = 2 [(gogoproto.nullable) = false];
-}
-
 // JobProgress identifies the job to report progress on. This reporting
 // happens outside this package.
 message JobProgress {
@@ -510,12 +518,14 @@ message ReadCSVSpec {
   // table_desc is the table descriptor of the CSV file.
   optional sqlbase.TableDescriptor table_desc = 3 [(gogoproto.nullable) = false];
 
-  // uri is a storageccl.ExportStorage URI pointing to the CSV files to be read.
-  repeated string uri = 5;
+  // uri is a storageccl.ExportStorage URI pointing to the CSV files to be
+  // read. The map key must be unique across the entire IMPORT job.
+  map<int32, string> uri = 7;
 
   optional JobProgress progress = 6 [(gogoproto.nullable) = false];
 
   reserved 4;
+  reserved 5;
 }
 
 // SSTWriterSpec is the specification for a processor that consumes rows, uses
@@ -708,5 +718,5 @@ message InterleavedReaderJoinerSpec {
   // columns in the right table.
   optional Expression on_expr = 4 [(gogoproto.nullable) = false];
 
-  optional JoinType type = 5 [(gogoproto.nullable) = false];
+  optional sqlbase.JoinType type = 5 [(gogoproto.nullable) = false];
 }

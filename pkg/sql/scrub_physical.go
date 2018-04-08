@@ -109,9 +109,8 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 	}
 	scan := params.p.Scan()
 	scan.run.isCheck = true
-	if err := scan.initTable(
-		ctx, params.p, o.tableDesc, indexHints, publicColumns, columnIDs,
-	); err != nil {
+	colCfg := scanColumnsConfig{wantedColumns: columnIDs, addUnwantedAsHidden: true}
+	if err := scan.initTable(ctx, params.p, o.tableDesc, indexHints, colCfg); err != nil {
 		return err
 	}
 	plan := planNode(scan)
@@ -171,7 +170,7 @@ func (o *physicalCheckOperation) Next(params runParams) (tree.Datums, error) {
 		// TODO(joey): Add the job UUID once the SCRUB command uses jobs.
 		tree.DNull, /* job_uuid */
 		row[0],     /* errorType */
-		tree.NewDString(o.tableName.Database()),
+		tree.NewDString(o.tableName.Catalog()),
 		tree.NewDString(o.tableName.Table()),
 		row[1], /* primaryKey */
 		timestamp,

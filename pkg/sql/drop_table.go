@@ -17,11 +17,9 @@ package sql
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -32,7 +30,12 @@ import (
 
 type dropTableNode struct {
 	n  *tree.DropTable
-	td []*sqlbase.TableDescriptor
+	td []toDelete
+}
+
+type toDelete struct {
+	tn   *tree.TableName
+	desc *sqlbase.TableDescriptor
 }
 
 // DropTable drops a table.
@@ -40,39 +43,31 @@ type dropTableNode struct {
 //   Notes: postgres allows only the table owner to DROP a table.
 //          mysql requires the DROP privilege on the table.
 func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, error) {
-	td := make([]*sqlbase.TableDescriptor, 0, len(n.Names))
-	for _, name := range n.Names {
-		tn, err := name.NormalizeTableName()
+	td := make([]toDelete, 0, len(n.Names))
+	for i := range n.Names {
+		name := &n.Names[i]
+		tn, err := name.Normalize()
 		if err != nil {
 			return nil, err
 		}
-		if err := tn.QualifyWithDatabase(p.SessionData().Database); err != nil {
-			return nil, err
-		}
-
-		droppedDesc, err := p.dropTableOrViewPrepare(ctx, tn)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, requireTableDesc)
 		if err != nil {
 			return nil, err
 		}
 		if droppedDesc == nil {
-			if n.IfExists {
-				continue
-			}
-			// Table does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedRelationError(tn)
+			continue
 		}
-		if !droppedDesc.IsTable() {
-			return nil, sqlbase.NewWrongObjectTypeError(tn, "table")
-		}
-		td = append(td, droppedDesc)
+
+		td = append(td, toDelete{tn, droppedDesc})
 	}
 
 	dropping := make(map[sqlbase.ID]bool)
 	for _, d := range td {
-		dropping[d.ID] = true
+		dropping[d.desc.ID] = true
 	}
 
-	for _, droppedDesc := range td {
+	for _, toDel := range td {
+		droppedDesc := toDel.desc
 		for _, idx := range droppedDesc.AllNonDropIndexes() {
 			for _, ref := range idx.ReferencedBy {
 				if !dropping[ref.Table] {
@@ -99,14 +94,15 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 	}
 
 	if len(td) == 0 {
-		return &zeroNode{}, nil
+		return newZeroNode(nil /* columns */), nil
 	}
 	return &dropTableNode{n: n, td: td}, nil
 }
 
 func (n *dropTableNode) startExec(params runParams) error {
 	ctx := params.ctx
-	for _, droppedDesc := range n.td {
+	for _, toDel := range n.td {
+		droppedDesc := toDel.desc
 		if droppedDesc == nil {
 			continue
 		}
@@ -128,7 +124,8 @@ func (n *dropTableNode) startExec(params runParams) error {
 				Statement           string
 				User                string
 				CascadeDroppedViews []string
-			}{droppedDesc.Name, n.n.String(), params.SessionData().User, droppedViews},
+			}{toDel.tn.FQString(), n.n.String(),
+				params.SessionData().User, droppedViews},
 		); err != nil {
 			return err
 		}
@@ -140,7 +137,7 @@ func (*dropTableNode) Next(runParams) (bool, error) { return false, nil }
 func (*dropTableNode) Values() tree.Datums          { return tree.Datums{} }
 func (*dropTableNode) Close(context.Context)        {}
 
-// dropTableOrViewPrepare/dropTableImpl is used to drop a single table by
+// prepareDrop/dropTableImpl is used to drop a single table by
 // name, which can result from a DROP TABLE, DROP VIEW, DROP SEQUENCE,
 // or DROP DATABASE statement. This method returns the dropped table
 // descriptor, to be used for the purpose of logging the event.  The table
@@ -152,10 +149,14 @@ func (*dropTableNode) Close(context.Context)        {}
 // the deleted bit set, meaning the lease manager will not hand out
 // new leases for it and existing leases are released).
 // If the table does not exist, this function returns a nil descriptor.
-func (p *planner) dropTableOrViewPrepare(
-	ctx context.Context, name *tree.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	tableDesc, err := getTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), name)
+func (p *planner) prepareDrop(
+	ctx context.Context, name *tree.TableName, required bool, requiredType requiredType,
+) (tableDesc *sqlbase.TableDescriptor, err error) {
+	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+	// TODO(vivek): check if the cache can be used.
+	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		tableDesc, err = ResolveExistingObject(ctx, p, name, required, requiredType)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -307,24 +308,23 @@ func (p *planner) dropTableImpl(
 		droppedViews = append(droppedViews, viewDesc.Name)
 	}
 
-	if err := p.initiateDropTable(ctx, tableDesc); err != nil {
-		return droppedViews, err
-	}
-
-	p.testingVerifyMetadata().setTestingVerifyMetadata(
-		func(systemConfig config.SystemConfig) error {
-			return verifyDropTableMetadata(systemConfig, tableDesc.ID, "table")
-		})
-	return droppedViews, nil
+	err := p.initiateDropTable(ctx, tableDesc, true /* drain name */)
+	return droppedViews, err
 }
 
-func (p *planner) initiateDropTable(ctx context.Context, tableDesc *sqlbase.TableDescriptor) error {
+// drainName when set implies that the name needs to go through the draining
+// names process. This parameter is always passed in as true except from
+// TRUNCATE which directly deletes the old name to id map and doesn't need
+// drain the old map.
+func (p *planner) initiateDropTable(
+	ctx context.Context, tableDesc *sqlbase.TableDescriptor, drainName bool,
+) error {
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return err
 	}
 
 	// If the table is not interleaved and the ClearRange feature is
-	// enabled in the cluster, use the GCDeadline mechanism to schedule
+	// enabled in the cluster, use the delayed GC mechanism to schedule
 	// usage of the more efficient ClearRange pathway. ClearRange will
 	// only work if the entire hierarchy of interleaved tables are
 	// dropped at once, as with ON DELETE CASCADE where the top-level
@@ -335,18 +335,25 @@ func (p *planner) initiateDropTable(ctx context.Context, tableDesc *sqlbase.Tabl
 	if !tableDesc.IsInterleaved() &&
 		p.ExecCfg().Settings.Version.IsActive(cluster.VersionClearRange) {
 		// Get the zone config applying to this table in order to
-		// set the GC deadline.
-		_, zoneCfg, _, err := GetZoneConfigInTxn(
+		// ensure there is a GC TTL.
+		_, _, _, err := GetZoneConfigInTxn(
 			ctx, p.txn, uint32(tableDesc.ID), &sqlbase.IndexDescriptor{}, "",
 		)
 		if err != nil {
 			return err
 		}
-		tableDesc.GCDeadline = timeutil.Now().UnixNano() +
-			int64(zoneCfg.GC.TTLSeconds)*time.Second.Nanoseconds()
+
+		tableDesc.DropTime = timeutil.Now().UnixNano()
 	}
 
 	tableDesc.State = sqlbase.TableDescriptor_DROP
+	if drainName {
+		// Queue up name for draining.
+		nameDetails := sqlbase.TableDescriptor_NameInfo{
+			ParentID: tableDesc.ParentID,
+			Name:     tableDesc.Name}
+		tableDesc.DrainingNames = append(tableDesc.DrainingNames, nameDetails)
+	}
 	if err := p.writeTableDesc(ctx, tableDesc); err != nil {
 		return err
 	}
@@ -426,22 +433,6 @@ func (p *planner) removeInterleaveBackReference(
 		return p.saveNonmutationAndNotify(ctx, t)
 	}
 	return nil
-}
-
-func verifyDropTableMetadata(
-	systemConfig config.SystemConfig, tableID sqlbase.ID, objType string,
-) error {
-	desc, err := GetTableDesc(systemConfig, tableID)
-	if err != nil {
-		return err
-	}
-	if desc == nil {
-		return errors.Errorf("%s %d missing", objType, tableID)
-	}
-	if desc.Dropped() {
-		return nil
-	}
-	return errors.Errorf("expected %s %d to be marked as deleted", objType, tableID)
 }
 
 // removeMatchingReferences removes all refs from the provided slice that

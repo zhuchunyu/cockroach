@@ -94,6 +94,7 @@ type aggregator struct {
 	rowSourceBase
 
 	accumulating bool
+	draining     bool
 	input        RowSource
 	inputTypes   []sqlbase.ColumnType
 	funcs        []*aggregateFuncHolder
@@ -113,6 +114,8 @@ type aggregator struct {
 	arena       stringarena.Arena
 	row         sqlbase.EncDatumRow
 	scratch     []byte
+
+	cancelChecker *sqlbase.CancelChecker
 }
 
 var _ Processor = &aggregator{}
@@ -201,6 +204,8 @@ func (ag *aggregator) close() {
 				aggFunc.Close(ag.ctx)
 			}
 		}
+		ag.accumulating = false
+		ag.draining = true
 	}
 	ag.internalClose()
 }
@@ -228,6 +233,7 @@ func (ag *aggregator) producerMeta(err error) *ProducerMetadata {
 func (ag *aggregator) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 	if ag.maybeStart("aggregator", "Agg") {
 		log.VEventf(ag.ctx, 2, "starting aggregation process")
+		ag.cancelChecker = sqlbase.NewCancelChecker(ag.ctx)
 		ag.accumulating = true
 	}
 
@@ -267,6 +273,20 @@ func (ag *aggregator) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		log.VEvent(ag.ctx, 1, "accumulation complete")
 
 		ag.row = make(sqlbase.EncDatumRow, len(ag.funcs))
+	}
+
+	if ag.draining {
+		for {
+			row, meta := ag.input.Next()
+			if row != nil {
+				continue
+			}
+			if meta != nil {
+				return nil, meta
+			}
+			break
+		}
+		ag.draining = false
 	}
 
 	if ag.closed || ag.consumerStatus != NeedMoreRows {
@@ -321,6 +341,9 @@ func (ag *aggregator) ConsumerClosed() {
 // accumulateRow accumulates a single row, returning an error if accumulation
 // failed for any reason.
 func (ag *aggregator) accumulateRow(row sqlbase.EncDatumRow) error {
+	if err := ag.cancelChecker.Check(); err != nil {
+		return err
+	}
 	// The encoding computed here determines which bucket the non-grouping
 	// datums are accumulated to.
 	encoded, err := ag.encode(ag.scratch, row)

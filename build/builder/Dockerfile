@@ -40,7 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     patch \
     texinfo \
-    xz-utils
+    xz-utils \
+ && apt-get clean
 
 RUN mkdir crosstool-ng \
  && curl -fsSL http://crosstool-ng.org/download/crosstool-ng/crosstool-ng-1.23.0.tar.xz | tar --strip-components=1 -C crosstool-ng -xJ \
@@ -52,21 +53,22 @@ RUN mkdir crosstool-ng \
  && cd .. \
  && rm -rf crosstool-ng
 
-COPY x86_64-unknown-linux-gnu.defconfig x86_64-unknown-linux-musl.defconfig x86_64-w64-mingw.defconfig ./
+COPY x86_64-unknown-linux-gnu.defconfig x86_64-unknown-linux-musl.defconfig x86_64-w64-mingw.defconfig aarch64-unknown-linux-gnueabi.defconfig ./
 RUN mkdir src \
- && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-gnu.defconfig  /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
- && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-musl.defconfig /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
- && mkdir build && (cd build && DEFCONFIG=../x86_64-w64-mingw.defconfig          /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-gnu.defconfig      /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-musl.defconfig     /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-w64-mingw.defconfig              /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../aarch64-unknown-linux-gnueabi.defconfig /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
  && rm -rf src
 
-# Build & install libtinfo (terminfo) for the linux targets.
+# Build & install the terminfo lib (incl. in ncurses) for the linux targets (x86 and arm).
 # (on BSD or BSD-derived like macOS it's already built-in; on windows we don't need it.)
 #
 # The patch is needed to work around a bug in Debian mawk, see
 # http://lists.gnu.org/archive/html/bug-ncurses/2015-08/msg00008.html
 COPY ncurses.patch ./
 #
-# Run the two builds.
+# Run the three builds.
 # As per the Debian rule file for ncurses, the two configure tests for
 # the type of bool and poll(2) are broken when cross-compiling, so we
 # need to feed the test results manually to configure via an environment
@@ -89,7 +91,7 @@ RUN mkdir ncurses \
        ../configure --prefix=/x-tools/x86_64-unknown-linux-musl/x86_64-unknown-linux-musl/sysroot/usr \
          --host=x86_64-unknown-linux-musl \
          $(cat /ncurses.conf) --without-shared --without-dlsym \
-    && (cd ncurses && make all && make install.tinfo)) \
+    && (cd ncurses && make all && make install)) \
  && mkdir build-x86_64-unknown-linux-gnu \
  && (cd build-x86_64-unknown-linux-gnu \
     && CC=/x-tools/x86_64-unknown-linux-gnu/bin/x86_64-unknown-linux-gnu-cc \
@@ -97,7 +99,15 @@ RUN mkdir ncurses \
        ../configure --prefix=/x-tools/x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu/sysroot/usr \
          --host=x86_64-unknown-linux-gnu \
          $(cat /ncurses.conf) \
-    && (cd ncurses && make all && make install.tinfo)) \
+    && (cd ncurses && make all && make install)) \
+ && mkdir build-aarch64-unknown-linux-gnueabi \
+ && (cd build-aarch64-unknown-linux-gnueabi \
+    && CC=/x-tools/aarch64-unknown-linux-gnueabi/bin/aarch64-unknown-linux-gnueabi-cc \
+       CXX=/x-tools/aarch64-unknown-linux-gnueabi/bin/aarch64-unknown-linux-gnueabi-c++ \
+       ../configure --prefix=/x-tools/aarch64-unknown-linux-gnueabi/aarch64-unknown-linux-gnueabi/sysroot/usr \
+         --host=aarch64-unknown-linux-gnueabi \
+         $(cat /ncurses.conf) \
+    && (cd ncurses && make all && make install)) \
  && cd .. \
  && rm -rf ncurses ncurses.conf ncurses.patch
 
@@ -126,10 +136,15 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/osxcross.git \
  && mv osxcross/target /x-tools/x86_64-apple-darwin13 \
  && rm -rf osxcross
 
-# Compiling Go from source requires a Go toolchain to bootstrap.
+# Compile Go from source so that CC defaults to clang instead of gcc. This
+# requires a Go toolchain to bootstrap.
+#
+# NB: care needs to be taken when updating this version because earlier
+# releases of Go will no longer be run in CI once it is changed. Consider
+# bumping the minimum allowed version of Go in /build/go-version-chech.sh.
 RUN apt-get install -y --no-install-recommends golang \
- && curl -fsSL https://storage.googleapis.com/golang/go1.9.3.src.tar.gz -o golang.tar.gz \
- && echo '4e3d0ad6e91e02efa77d54e86c8b9e34fbe1cbc2935b6d38784dca93331c47ae  golang.tar.gz' | sha256sum -c - \
+ && curl -fsSL https://storage.googleapis.com/golang/go1.10.src.tar.gz -o golang.tar.gz \
+ && echo 'f3de49289405fda5fd1483a8fe6bd2fa5469e005fd567df64485c4fa000c7f24 golang.tar.gz' | sha256sum -c - \
  && tar -C /usr/local -xzf golang.tar.gz \
  && rm golang.tar.gz \
  && cd /usr/local/go/src \
@@ -164,6 +179,7 @@ RUN apt-get install -y --no-install-recommends \
     google-cloud-sdk \
     nodejs \
     openjdk-8-jre \
+    openssh-client \
     yarn
 
 # Without CCACHE_CPP2=1, ccache can generate spurious warnings. See the manpage

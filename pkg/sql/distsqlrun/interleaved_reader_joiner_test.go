@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // min and max are inclusive bounds on the root table's ID.
@@ -138,7 +139,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 				Spans:    []TableReaderSpan{{Span: cd1.PrimaryIndexSpan()}},
 			},
 		},
-		Type: JoinType_INNER,
+		Type: sqlbase.InnerJoin,
 	}
 
 	copySpec := func(spec InterleavedReaderJoinerSpec) InterleavedReaderJoinerSpec {
@@ -324,7 +325,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 		{
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := pdCd3Spec
-				spec.Type = JoinType_FULL_OUTER
+				spec.Type = sqlbase.FullOuterJoin
 				return spec
 			}(),
 			post: PostProcessSpec{
@@ -337,7 +338,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := copySpec(pdCd3Spec)
 				spec.Tables[0], spec.Tables[1] = spec.Tables[1], spec.Tables[0]
-				spec.Type = JoinType_FULL_OUTER
+				spec.Type = sqlbase.FullOuterJoin
 				return spec
 			}(),
 			post: PostProcessSpec{
@@ -350,7 +351,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 		{
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := pdCd3Spec
-				spec.Type = JoinType_LEFT_OUTER
+				spec.Type = sqlbase.LeftOuterJoin
 				return spec
 			}(),
 			post: PostProcessSpec{
@@ -362,7 +363,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := copySpec(pdCd3Spec)
 				spec.Tables[0], spec.Tables[1] = spec.Tables[1], spec.Tables[0]
-				spec.Type = JoinType_LEFT_OUTER
+				spec.Type = sqlbase.LeftOuterJoin
 				return spec
 			}(),
 			expected: `[[-1 -101 '-101' NULL NULL] [-1 -1 '-1' NULL NULL] [0 0 '0' NULL NULL] [1 1 '1' 1 1] [3 3 '3' 3 3] [3 103 '103' 3 3] [5 5 '5' 5 5] [31 31 '31' NULL NULL] [31 131 '131' NULL NULL] [32 32 '32' NULL NULL]]`,
@@ -372,7 +373,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 		{
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := pdCd3Spec
-				spec.Type = JoinType_RIGHT_OUTER
+				spec.Type = sqlbase.RightOuterJoin
 				return spec
 			}(),
 			expected: `[[NULL NULL -1 -101 '-101'] [NULL NULL -1 -1 '-1'] [NULL NULL 0 0 '0'] [1 1 1 1 '1'] [3 3 3 3 '3'] [3 3 3 103 '103'] [5 5 5 5 '5'] [NULL NULL 31 31 '31'] [NULL NULL 31 131 '131'] [NULL NULL 32 32 '32']]`,
@@ -381,7 +382,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 			spec: func() InterleavedReaderJoinerSpec {
 				spec := copySpec(pdCd3Spec)
 				spec.Tables[0], spec.Tables[1] = spec.Tables[1], spec.Tables[0]
-				spec.Type = JoinType_RIGHT_OUTER
+				spec.Type = sqlbase.RightOuterJoin
 				return spec
 			}(),
 			post: PostProcessSpec{
@@ -393,14 +394,15 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			evalCtx := tree.MakeTestingEvalContext()
+			evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
 			defer evalCtx.Stop(context.Background())
 			flowCtx := FlowCtx{
 				Ctx:      context.Background(),
 				EvalCtx:  evalCtx,
 				Settings: s.ClusterSettings(),
-				txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
-				nodeID:   s.NodeID(),
+				// Run in a RootTxn so that there's no txn metadata produced.
+				txn:    client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+				nodeID: s.NodeID(),
 			}
 
 			out := &RowBuffer{}
@@ -481,7 +483,7 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 						Spans:    []TableReaderSpan{{Span: cd.PrimaryIndexSpan()}},
 					},
 				},
-				Type: JoinType_INNER,
+				Type: sqlbase.InnerJoin,
 			},
 			expected: "unmatched column orderings",
 		},
@@ -495,7 +497,7 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 						Spans:    []TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
 					},
 				},
-				Type: JoinType_INNER,
+				Type: sqlbase.InnerJoin,
 			},
 			expected: "interleavedReaderJoiner only reads from two tables in an interleaved hierarchy",
 		},
@@ -514,7 +516,7 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 						Spans:    []TableReaderSpan{{Span: gcd.PrimaryIndexSpan()}},
 					},
 				},
-				Type: JoinType_INNER,
+				Type: sqlbase.InnerJoin,
 			},
 			expected: "interleavedReaderJoiner only supports joins on the entire interleaved prefix",
 		},
@@ -522,13 +524,14 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			evalCtx := tree.MakeTestingEvalContext()
+			evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
 			defer evalCtx.Stop(context.Background())
 			flowCtx := FlowCtx{
 				EvalCtx:  evalCtx,
 				Settings: s.ClusterSettings(),
-				txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
-				nodeID:   s.NodeID(),
+				// Run in a RootTxn so that there's no txn metadata produced.
+				txn:    client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+				nodeID: s.NodeID(),
 			}
 
 			out := &RowBuffer{}
@@ -541,5 +544,98 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 				t.Errorf("expected error: %s, actual: %s", tc.expected, actual)
 			}
 		})
+	}
+}
+
+func TestInterleavedReaderJoinerTrailingMetadata(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	sqlutils.CreateTable(t, sqlDB, "parent",
+		"id INT PRIMARY KEY",
+		0, // numRows
+		func(row int) []tree.Datum { return nil },
+	)
+
+	sqlutils.CreateTableInterleaved(t, sqlDB, "child",
+		"pid INT, id INT, PRIMARY KEY (pid, id)",
+		"parent (pid)",
+		0,
+		func(row int) []tree.Datum { return nil },
+	)
+
+	pd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "parent")
+	cd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child")
+
+	evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
+	defer evalCtx.Stop(context.Background())
+
+	// Run the flow in a snowball trace so that we can test for tracing info.
+	tracer := tracing.NewTracer()
+	ctx, sp, err := tracing.StartSnowballTrace(context.Background(), tracer, "test flow ctx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Finish()
+
+	flowCtx := FlowCtx{
+		Ctx:      ctx,
+		EvalCtx:  evalCtx,
+		Settings: s.ClusterSettings(),
+		// Run in a LeafTxn so that txn metadata is produced.
+		txn:    client.NewTxn(s.DB(), s.NodeID(), client.LeafTxn),
+		nodeID: s.NodeID(),
+	}
+
+	innerJoinSpec := InterleavedReaderJoinerSpec{
+		Tables: []InterleavedReaderJoinerSpec_Table{
+			{
+				Desc:     *pd,
+				Ordering: Ordering{Columns: []Ordering_Column{{ColIdx: 0, Direction: Ordering_Column_ASC}}},
+				Spans:    []TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+			},
+			{
+				Desc:     *cd,
+				Ordering: Ordering{Columns: []Ordering_Column{{ColIdx: 0, Direction: Ordering_Column_ASC}}},
+				Spans:    []TableReaderSpan{{Span: cd.PrimaryIndexSpan()}},
+			},
+		},
+		Type: sqlbase.InnerJoin,
+	}
+
+	out := &RowBuffer{}
+	irj, err := newInterleavedReaderJoiner(&flowCtx, &innerJoinSpec, &PostProcessSpec{}, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	irj.Run(nil)
+	if !out.ProducerClosed {
+		t.Fatalf("output RowReceiver not closed")
+	}
+
+	// Check for trailing metadata.
+	var traceSeen, txnMetaSeen bool
+	for {
+		row, meta := out.Next()
+		if row != nil {
+			t.Fatalf("row was pushed unexpectedly: %s", row.String(oneIntCol))
+		}
+		if meta == nil {
+			break
+		}
+		if meta.TraceData != nil {
+			traceSeen = true
+		}
+		if meta.TxnMeta != nil {
+			txnMetaSeen = true
+		}
+	}
+	if !traceSeen {
+		t.Fatal("missing tracing trailing metadata")
+	}
+	if !txnMetaSeen {
+		t.Fatal("missing txn trailing metadata")
 	}
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 var (
@@ -76,7 +77,7 @@ var (
 		Help: "Number of times this node has incremented its liveness epoch"}
 	metaHeartbeatLatency = metric.Metadata{
 		Name: "liveness.heartbeatlatency",
-		Help: "Node liveness heartbeat latency"}
+		Help: "Node liveness heartbeat latency in nanoseconds"}
 )
 
 // IsLive returns whether the node is considered live at the given time with the
@@ -88,6 +89,37 @@ func (l *Liveness) IsLive(now hlc.Timestamp, maxOffset time.Duration) bool {
 	}
 	expiration := hlc.Timestamp(l.Expiration).Add(-maxOffset.Nanoseconds(), 0)
 	return now.Less(expiration)
+}
+
+// IsDead returns whether the node is considered dead at the given time with the
+// given threshold.
+func (l *Liveness) IsDead(now hlc.Timestamp, threshold time.Duration) bool {
+	deadAsOf := hlc.Timestamp(l.Expiration).GoTime().Add(threshold)
+	return !now.GoTime().Before(deadAsOf)
+}
+
+// LivenessStatus returns a NodeLivenessStatus enumeration value for this liveness
+// based on the provided timestamp, threshold, and clock max offset.
+func (l *Liveness) LivenessStatus(
+	now time.Time, threshold, maxOffset time.Duration,
+) NodeLivenessStatus {
+	nowHlc := hlc.Timestamp{WallTime: now.UnixNano()}
+	if l.IsDead(nowHlc, threshold) {
+		if l.Decommissioning {
+			return NodeLivenessStatus_DECOMMISSIONED
+		}
+		return NodeLivenessStatus_DEAD
+	}
+	if l.Decommissioning {
+		return NodeLivenessStatus_DECOMMISSIONING
+	}
+	if l.Draining {
+		return NodeLivenessStatus_UNAVAILABLE
+	}
+	if l.IsLive(nowHlc, maxOffset) {
+		return NodeLivenessStatus_LIVE
+	}
+	return NodeLivenessStatus_UNAVAILABLE
 }
 
 // LivenessMetrics holds metrics for use with node liveness activity.
@@ -112,7 +144,7 @@ type HeartbeatCallback func(context.Context)
 // liveness. Nodes periodically "heartbeat" the range holding the node
 // liveness system table to indicate that they're available. The
 // resulting liveness information is used to ignore unresponsive nodes
-// while making range quiescense decisions, as well as for efficient,
+// while making range quiescence decisions, as well as for efficient,
 // node liveness epoch-based range leases.
 type NodeLiveness struct {
 	ambientCtx        log.AmbientContext
@@ -225,11 +257,37 @@ func (nl *NodeLiveness) SetDecommissioning(
 			<-sem
 		}()
 
-		oldLiveness, err := nl.GetLiveness(nodeID) // need new liveness in each iteration
-		if err != nil {
+		// We need the current liveness in each iteration.
+		//
+		// We ignore any liveness record in Gossip because we may have to fall back
+		// to the KV store anyway. The scenario in which this is needed is:
+		// - kill node 2 and stop node 1
+		// - wait for node 2's liveness record's Gossip entry to expire on all surviving nodes
+		// - restart node 1; it'll never see node 2 in `GetLiveness` unless the whole
+		//   node liveness span gets regossiped (unlikely if it wasn't the lease holder
+		//   for that span)
+		// - can't decommission node 2 from node 1 without KV fallback.
+		//
+		// See #20863.
+		//
+		// NB: this also de-flakes TestNodeLivenessDecommissionAbsent; running
+		// decommissioning commands in a tight loop on different nodes sometimes
+		// results in unintentional no-ops (due to the Gossip lag); this could be
+		// observed by users in principle, too.
+		var oldLiveness Liveness
+		if err := nl.db.GetProto(ctx, keys.NodeLivenessKey(nodeID), &oldLiveness); err != nil {
 			return false, errors.Wrap(err, "unable to get liveness")
 		}
-		return nl.setDecommissioningInternal(ctx, nodeID, oldLiveness, decommission)
+		if (oldLiveness == Liveness{}) {
+			return false, ErrNoLivenessRecord
+		}
+		// We may have discovered a Liveness not yet received via Gossip. Offer it
+		// to make sure that when we actually try to update the liveness, the
+		// previous view is correct. This, too, is required to de-flake
+		// TestNodeLivenessDecommissionAbsent.
+		nl.maybeUpdate(oldLiveness)
+
+		return nl.setDecommissioningInternal(ctx, nodeID, &oldLiveness, decommission)
 	}
 
 	for {
@@ -310,15 +368,30 @@ func (nl *NodeLiveness) GetLivenessThreshold() time.Duration {
 	return nl.livenessThreshold
 }
 
-// IsLive returns whether or not the specified node is considered live
-// based on the last receipt of a liveness update via gossip. It is an
-// error if the specified node is not in the local liveness table.
+// IsLive returns whether or not the specified node is considered live based on
+// whether or not its liveness has expired regardless of the liveness status. It
+// is an error if the specified node is not in the local liveness table.
 func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
 	liveness, err := nl.GetLiveness(nodeID)
 	if err != nil {
 		return false, err
 	}
 	return liveness.IsLive(nl.clock.Now(), nl.clock.MaxOffset()), nil
+}
+
+// IsHealthy returns whether or not the specified node IsLive and is in a LIVE
+// state, i.e. not draining, decommissioning, or otherwise unhealthy.
+func (nl *NodeLiveness) IsHealthy(nodeID roachpb.NodeID) (bool, error) {
+	liveness, err := nl.GetLiveness(nodeID)
+	if err != nil {
+		return false, err
+	}
+	ls := liveness.LivenessStatus(
+		nl.clock.Now().GoTime(),
+		nl.GetLivenessThreshold(),
+		nl.clock.MaxOffset(),
+	)
+	return ls == NodeLivenessStatus_LIVE, nil
 }
 
 // StartHeartbeat starts a periodic heartbeat to refresh this node's
@@ -347,7 +420,7 @@ func (nl *NodeLiveness) StartHeartbeat(
 					// Give the context a timeout approximately as long as the time we
 					// have left before our liveness entry expires.
 					ctx, cancel := context.WithTimeout(context.Background(), nl.livenessThreshold-nl.heartbeatInterval)
-					ctx, sp := ambient.AnnotateCtxWithSpan(ctx, "heartbeat")
+					ctx, sp := ambient.AnnotateCtxWithSpan(ctx, "liveness heartbeat loop")
 					defer cancel()
 					defer sp.Finish()
 
@@ -419,6 +492,8 @@ func (nl *NodeLiveness) Heartbeat(ctx context.Context, liveness *Liveness) error
 func (nl *NodeLiveness) heartbeatInternal(
 	ctx context.Context, liveness *Liveness, incrementEpoch bool,
 ) error {
+	ctx, finish := tracing.EnsureChildSpan(ctx, nl.ambientCtx.Tracer, "liveness heartbeat")
+	defer finish()
 	defer func(start time.Time) {
 		dur := timeutil.Now().Sub(start)
 		nl.metrics.HeartbeatLatency.RecordValue(dur.Nanoseconds())
@@ -461,6 +536,13 @@ func (nl *NodeLiveness) heartbeatInternal(
 		}
 		newLiveness.Expiration = hlc.LegacyTimestamp(
 			nl.clock.Now().Add((nl.livenessThreshold + maxOffset).Nanoseconds(), 0))
+		// This guards against the system clock moving backwards. As long
+		// as the cockroach process is running, checks inside hlc.Clock
+		// will ensure that the clock never moves backwards, but these
+		// checks don't work across process restarts.
+		if liveness != nil && newLiveness.Expiration.Less(liveness.Expiration) {
+			return errors.Errorf("proposed liveness update expires earlier than previous record")
+		}
 	}
 	if err := nl.updateLiveness(ctx, &newLiveness, liveness, func(actual Liveness) error {
 		// Update liveness to actual value on mismatch.

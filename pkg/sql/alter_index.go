@@ -72,8 +72,8 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			)
 			err = deleteRemovedPartitionZoneConfigs(
 				params.ctx, params.p.txn,
-				n.tableDesc, &n.tableDesc.PrimaryIndex,
-				&n.tableDesc.PrimaryIndex.Partitioning, &partitioning,
+				n.tableDesc, n.indexDesc,
+				&n.indexDesc.Partitioning, &partitioning,
 				params.extendedEvalCtx.ExecCfg,
 			)
 			if err != nil {
@@ -122,7 +122,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			User       string
 			MutationID uint32
 		}{
-			n.tableDesc.Name, n.indexDesc.Name, n.n.String(),
+			n.n.Index.Table.TableName().FQString(), n.indexDesc.Name, n.n.String(),
 			params.SessionData().User, uint32(mutationID),
 		},
 	); err != nil {

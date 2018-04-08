@@ -78,6 +78,9 @@ export default function Debug() {
             note="#/reports/network?locality=[regex]"
           />
         </DebugTableRow>
+        <DebugTableRow title="Settings">
+          <DebugTableLink name="Cluster Settings" url="#/reports/settings" />
+        </DebugTableRow>
         <DebugTableRow title="Security">
           <DebugTableLink name="Certificates on this node" url="#/reports/certificates/local" />
           <DebugTableLink
@@ -118,13 +121,18 @@ export default function Debug() {
           <DebugTableLink name="Active Tasks" url="/debug/stopper" />
         </DebugTableRow>
         <DebugTableRow title="pprof">
-          <DebugTableLink name="Heap" url="/debug/pprof/heap?debug=1" />
-          <DebugTableLink name="Profile" url="/debug/pprof/profile?debug=1" />
-          <DebugTableLink name="Block" url="/debug/pprof/block?debug=1" />
-          <DebugTableLink name="Trace" url="/debug/pprof/trace?debug=1" />
-          <DebugTableLink name="Thread Create" url="/debug/pprof/threadcreate?debug=1" />
-          <DebugTableLink name="Goroutines" url="/debug/pprof/goroutine?debug=1" />
-          <DebugTableLink name="All Goroutines" url="/debug/pprof/goroutine?debug=2" />
+          <DebugTableLink name="Heap (UI)" url="/debug/pprof/ui/heap/" />
+          <DebugTableLink name="Heap (raw)" url="/debug/pprof/heap?debug=1" />
+          <DebugTableLink name="Profile (UI)" url="/debug/pprof/ui/profile/" />
+          <DebugTableLink name="Profile (raw)" url="/debug/pprof/profile?debug=1" />
+          <DebugTableLink name="Block (UI)" url="/debug/pprof/ui/block/" />
+          <DebugTableLink name="Block (raw)" url="/debug/pprof/block?debug=1" />
+          <DebugTableLink name="Thread Create (UI)" url="/debug/pprof/ui/threadcreate/" />
+          <DebugTableLink name="Thread Create (raw)" url="/debug/pprof/threadcreate?debug=1" />
+          <DebugTableLink name="Goroutines (UI)" url="/debug/pprof/ui/goroutine/" />
+          <DebugTableLink name="Goroutines (raw)" url="/debug/pprof/goroutine?debug=1" />
+          <DebugTableLink name="All Goroutines (raw)" url="/debug/pprof/goroutine?debug=2" />
+          <DebugTableLink name="Trace (raw)" url="/debug/pprof/trace?debug=1" />
         </DebugTableRow>
       </DebugTable>
       <DebugTable heading="Raw Status Endpoints (JSON)">
@@ -211,6 +219,20 @@ export default function Debug() {
             name="Simulated Allocator Runs on a Specific Range"
             url="/_status/allocator/range/1"
             note="/_status/allocator/range/[range_id]"
+          />
+        </DebugTableRow>
+      </DebugTable>
+      <DebugTable heading="UI Debugging">
+        <DebugTableRow title="Redux State">
+          <DebugTableLink
+            name="Export the Redux State of the UI"
+            url="#/debug/redux"
+          />
+        </DebugTableRow>
+        <DebugTableRow title="Custom Time-Series Chart">
+          <DebugTableLink
+            name="Customizable chart of time series metrics"
+            url="#/debug/chart"
           />
         </DebugTableRow>
       </DebugTable>

@@ -41,6 +41,8 @@ func TestTrace(t *testing.T) {
 	// These are always appended, even without the test specifying it.
 	alwaysOptionalSpans := []string{
 		"[async] storage.pendingLeaseRequest: requesting lease",
+		"[async] storage.Store: gossip on capacity change",
+		"request range lease",
 		"range lookup",
 	}
 
@@ -80,7 +82,9 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"sql txn implicit",
+				"session recording",
+				"sql txn",
+				"dist sender",
 				"/cockroach.roachpb.Internal/Batch",
 			},
 		},
@@ -115,9 +119,11 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"sql txn implicit",
+				"session recording",
+				"sql txn",
 				"flow",
 				"table reader",
+				"dist sender",
 				"/cockroach.roachpb.Internal/Batch",
 			},
 			// Depending on whether the data is local or not, we may not see these
@@ -138,9 +144,11 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"sql txn implicit",
+				"session recording",
+				"sql txn",
 				"starting plan",
 				"consuming rows",
+				"dist sender",
 				"/cockroach.roachpb.Internal/Batch",
 			},
 		},
@@ -159,8 +167,8 @@ func TestTrace(t *testing.T) {
 						"WHERE message LIKE '%1 DelRng%' ORDER BY op")
 			},
 			expSpans: []string{
+				"dist sender",
 				"kv.DistSender: sending partial batch",
-				"starting plan",
 				"/cockroach.roachpb.Internal/Batch",
 			},
 		},

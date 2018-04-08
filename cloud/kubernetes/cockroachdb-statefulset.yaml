@@ -92,7 +92,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: cockroachdb
-        image: cockroachdb/cockroach:v1.1.4
+        image: cockroachdb/cockroach:v2.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 26257
@@ -102,6 +102,9 @@ spec:
         volumeMounts:
         - name: datadir
           mountPath: /cockroach/cockroach-data
+        env:
+        - name: COCKROACH_CHANNEL
+          value: kubernetes-insecure
         command:
           - "/bin/bash"
           - "-ecx"

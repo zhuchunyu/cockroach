@@ -43,9 +43,22 @@ define RuleSet {
 }
 
 define Define {
-    Tags   Tags
-    Name   String
-    Fields DefineFields
+    Comments Comments
+    Tags     Tags
+    Name     String
+    Fields   DefineFields
+}
+
+# type CommentsExpr []CommentExpr
+[Slice]
+define Comments {
+    Element Comment
+}
+
+# type CommentExpr string
+[Value]
+define Comment {
+    Value string
 }
 
 # type TagsExpr []TagExpr
@@ -72,10 +85,11 @@ define DefineField {
 }
 
 define Rule {
-    Name    String
-    Tags    Tags
-    Match   Match
-    Replace Expr
+    Comments Comments
+    Name     String
+    Tags     Tags
+    Match    Match
+    Replace  Expr
 }
 
 define Bind {
@@ -88,30 +102,25 @@ define Ref {
 }
 
 define Match {
-    Names OpNames
+    Names Names
     Args  List
 }
 
-# type OpNamesExpr []OpNameExpr
+# type NamesExpr []NameExpr
 [Slice]
-define OpNames {
-    Element OpName
+define Names {
+    Element Name
 }
 
-# type OpNameExpr string
+# type NameExpr string
 [Value]
-define OpName {
+define Name {
     Value string
 }
 
 define MatchAnd {
     Left  Expr
     Right Expr
-}
-
-define MatchInvoke {
-    FuncName String
-    Args     List
 }
 
 define MatchNot {
@@ -121,13 +130,28 @@ define MatchNot {
 define MatchAny {
 }
 
-define MatchList {
+define MatchListAny {
     MatchItem Expr
 }
 
+define MatchListFirst {
+    MatchItem Expr
+}
+
+define MatchListLast {
+    MatchItem Expr
+}
+
+define MatchListSingle {
+    MatchItem Expr
+}
+
+define MatchListEmpty {
+}
+
 define Construct {
-    OpName Expr
-    Args   List
+    Name Expr
+    Args List
 }
 
 define ConstructList {
@@ -144,4 +168,14 @@ define List {
 [Value]
 define String {
     Value string
+}
+
+#
+# The below operators are never created by the parser, but are created by the
+# compiler, in order to make further processing of the tree easier.
+#
+
+define CustomFunc {
+    Name Name
+    Args List
 }

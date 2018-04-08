@@ -19,8 +19,6 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -31,7 +29,7 @@ import (
 // joinNode is a planNode whose rows are the result of an inner or
 // left/right outer join.
 type joinNode struct {
-	joinType joinType
+	joinType sqlbase.JoinType
 
 	// The data sources.
 	left  planDataSource
@@ -57,89 +55,77 @@ type joinNode struct {
 	run joinRun
 }
 
-type joinType int
-
-const (
-	joinTypeInner joinType = iota
-	joinTypeLeftOuter
-	joinTypeRightOuter
-	joinTypeFullOuter
-)
-
-// makeJoin constructs a planDataSource for a JOIN.
-// The source might be a joinNode, or it could be a renderNode on top of a
-// joinNode (in the case of outer natural joins).
-func (p *planner) makeJoin(
+// makeJoinPredicate builds a joinPredicate from a join condition. Also returns
+// any USING or NATURAL JOIN columns (these need to be merged into one column
+// after the join).
+func (p *planner) makeJoinPredicate(
 	ctx context.Context,
-	astJoinType string,
-	left planDataSource,
-	right planDataSource,
+	left *sqlbase.DataSourceInfo,
+	right *sqlbase.DataSourceInfo,
+	joinType sqlbase.JoinType,
 	cond tree.JoinCond,
-) (planDataSource, error) {
-	var typ joinType
-	switch astJoinType {
-	case "JOIN", "INNER JOIN", "CROSS JOIN":
-		typ = joinTypeInner
-	case "LEFT JOIN":
-		typ = joinTypeLeftOuter
-	case "RIGHT JOIN":
-		typ = joinTypeRightOuter
-	case "FULL JOIN":
-		typ = joinTypeFullOuter
-	default:
-		return planDataSource{}, errors.Errorf("unsupported JOIN type %T", astJoinType)
-	}
+) (*joinPredicate, []usingColumn, error) {
+	switch cond.(type) {
+	case tree.NaturalJoinCond, *tree.UsingJoinCond:
+		var usingColNames tree.NameList
 
-	leftInfo, rightInfo := left.info, right.info
-
-	// Check that the same table name is not used on both sides.
-	for _, alias := range rightInfo.sourceAliases {
-		if _, ok := leftInfo.sourceAliases.srcIdx(alias.name); ok {
-			t := alias.name.Table()
-			if t == "" {
-				// Allow joins of sources that define columns with no
-				// associated table name. At worst, the USING/NATURAL
-				// detection code or expression analysis for ON will detect an
-				// ambiguity later.
-				continue
-			}
-			return planDataSource{}, fmt.Errorf(
-				"cannot join columns from the same source name %q (missing AS clause)", t)
+		switch t := cond.(type) {
+		case tree.NaturalJoinCond:
+			usingColNames = commonColumns(left, right)
+		case *tree.UsingJoinCond:
+			usingColNames = t.Cols
 		}
-	}
 
-	var (
-		info          *dataSourceInfo
-		pred          *joinPredicate
-		err           error
-		mergedColumns tree.NameList
-	)
+		usingColumns, err := makeUsingColumns(
+			left.SourceColumns, right.SourceColumns, usingColNames,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		pred, err := makePredicate(joinType, left, right, usingColumns)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pred, usingColumns, nil
 
-	if cond == nil {
-		pred, info, err = makeCrossPredicate(typ, leftInfo, rightInfo)
-	} else {
+	case nil, *tree.OnJoinCond:
+		pred, err := makePredicate(joinType, left, right, nil /* usingColumns */)
+		if err != nil {
+			return nil, nil, err
+		}
 		switch t := cond.(type) {
 		case *tree.OnJoinCond:
-			pred, info, err = p.makeOnPredicate(ctx, typ, leftInfo, rightInfo, t.Expr)
-		case tree.NaturalJoinCond:
-			cols := commonColumns(leftInfo, rightInfo)
-			mergedColumns = cols
-			pred, info, err = makeUsingPredicate(typ, leftInfo, rightInfo, mergedColumns)
-		case *tree.UsingJoinCond:
-			mergedColumns = t.Cols
-			pred, info, err = makeUsingPredicate(typ, leftInfo, rightInfo, mergedColumns)
+			// Determine the on condition expression. Note that the predicate can't
+			// already have onCond set (we haven't passed any usingColumns).
+			pred.onCond, err = p.analyzeExpr(
+				ctx,
+				t.Expr,
+				sqlbase.MultiSourceInfo{pred.info},
+				pred.iVarHelper,
+				types.Bool,
+				true, /* requireType */
+				"ON",
+			)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
-	}
-	if err != nil {
-		return planDataSource{}, err
-	}
+		return pred, nil /* usingColumns */, nil
 
+	default:
+		panic(fmt.Sprintf("unsupported join condition %#v", cond))
+	}
+}
+
+func (p *planner) makeJoinNode(
+	left planDataSource, right planDataSource, pred *joinPredicate,
+) *joinNode {
 	n := &joinNode{
 		left:     left,
 		right:    right,
-		joinType: typ,
+		joinType: pred.joinType,
 		pred:     pred,
-		columns:  info.sourceColumns,
+		columns:  pred.info.SourceColumns,
 	}
 
 	n.run.buffer = &RowBuffer{
@@ -157,10 +143,43 @@ func (p *planner) makeJoin(
 			0,
 		),
 	}
+	return n
+}
 
-	joinDataSource := planDataSource{info: info, plan: n}
+// makeJoin constructs a planDataSource for a JOIN.
+// The source might be a joinNode, or it could be a renderNode on top of a
+// joinNode (in the case of outer natural joins).
+func (p *planner) makeJoin(
+	ctx context.Context,
+	joinType sqlbase.JoinType,
+	left planDataSource,
+	right planDataSource,
+	cond tree.JoinCond,
+) (planDataSource, error) {
+	// Check that the same table name is not used on both sides.
+	for _, alias := range right.info.SourceAliases {
+		if _, ok := left.info.SourceAliases.SrcIdx(alias.Name); ok {
+			t := alias.Name.Table()
+			if t == "" {
+				// Allow joins of sources that define columns with no
+				// associated table name. At worst, the USING/NATURAL
+				// detection code or expression analysis for ON will detect an
+				// ambiguity later.
+				continue
+			}
+			return planDataSource{}, fmt.Errorf(
+				"cannot join columns from the same source name %q (missing AS clause)", t)
+		}
+	}
 
-	if mergedColumns == nil {
+	pred, usingColumns, err := p.makeJoinPredicate(ctx, left.info, right.info, joinType, cond)
+	if err != nil {
+		return planDataSource{}, err
+	}
+	n := p.makeJoinNode(left, right, pred)
+	joinDataSource := planDataSource{info: pred.info, plan: n}
+
+	if len(usingColumns) == 0 {
 		// No merged columns, we are done.
 		return joinDataSource, nil
 	}
@@ -221,13 +240,13 @@ func (p *planner) makeJoin(
 
 	r := &renderNode{
 		source:     joinDataSource,
-		sourceInfo: multiSourceInfo{info},
+		sourceInfo: sqlbase.MultiSourceInfo{pred.info},
 	}
-	r.ivarHelper = tree.MakeIndexedVarHelper(r, len(info.sourceColumns))
-	numLeft := len(leftInfo.sourceColumns)
-	numRight := len(rightInfo.sourceColumns)
-	rInfo := &dataSourceInfo{
-		sourceAliases: make(sourceAliases, 0, len(info.sourceAliases)),
+	r.ivarHelper = tree.MakeIndexedVarHelper(r, len(pred.info.SourceColumns))
+	numLeft := len(left.info.SourceColumns)
+	numRight := len(right.info.SourceColumns)
+	rInfo := &sqlbase.DataSourceInfo{
+		SourceAliases: make(sqlbase.SourceAliases, 0, len(pred.info.SourceAliases)),
 	}
 
 	var leftHidden, rightHidden util.FastIntSet
@@ -240,19 +259,19 @@ func (p *planner) makeJoin(
 	for i := range remapped {
 		remapped[i] = -1
 	}
-	for i := range mergedColumns {
-		leftCol := n.pred.leftEqualityIndices[i]
-		rightCol := n.pred.rightEqualityIndices[i]
+	for i := range usingColumns {
+		leftCol := usingColumns[i].leftIdx
+		rightCol := usingColumns[i].rightIdx
 		leftHidden.Add(leftCol)
 		rightHidden.Add(rightCol)
 		var expr tree.TypedExpr
-		if n.joinType == joinTypeInner || n.joinType == joinTypeLeftOuter {
+		if n.joinType == sqlbase.InnerJoin || n.joinType == sqlbase.LeftOuterJoin {
 			// The merged column is the same with the corresponding column from the
 			// left side.
 			expr = r.ivarHelper.IndexedVar(leftCol)
 			remapped[leftCol] = i
-		} else if n.joinType == joinTypeRightOuter &&
-			!sqlbase.DatumTypeHasCompositeKeyEncoding(leftInfo.sourceColumns[leftCol].Typ) {
+		} else if n.joinType == sqlbase.RightOuterJoin &&
+			!sqlbase.DatumTypeHasCompositeKeyEncoding(left.info.SourceColumns[leftCol].Typ) {
 			// The merged column is the same with the corresponding column from the
 			// right side.
 			expr = r.ivarHelper.IndexedVar(numLeft + rightCol)
@@ -266,16 +285,21 @@ func (p *planner) makeJoin(
 				},
 			}
 			var err error
-			p.semaCtx.IVarHelper = &r.ivarHelper
+			p.semaCtx.IVarContainer = r.ivarHelper.Container()
 			expr, err = c.TypeCheck(&p.semaCtx, types.Any)
-			p.semaCtx.IVarHelper = nil
+			p.semaCtx.IVarContainer = nil
 			if err != nil {
 				return planDataSource{}, err
 			}
 		}
-		r.addRenderColumn(expr, symbolicExprStr(expr), leftInfo.sourceColumns[leftCol])
+		// Issue #23609: the type of the left side might be NULL; so use the type of
+		// the IFNULL expression instead of the type of the left source column.
+		r.addRenderColumn(expr, symbolicExprStr(expr), sqlbase.ResultColumn{
+			Name: left.info.SourceColumns[leftCol].Name,
+			Typ:  expr.ResolvedType(),
+		})
 	}
-	for i, c := range leftInfo.sourceColumns {
+	for i, c := range left.info.SourceColumns {
 		if remapped[i] != -1 {
 			// Column already included.
 			continue
@@ -287,7 +311,7 @@ func (p *planner) makeJoin(
 		}
 		r.addRenderColumn(expr, symbolicExprStr(expr), c)
 	}
-	for i, c := range rightInfo.sourceColumns {
+	for i, c := range right.info.SourceColumns {
 		if remapped[numLeft+i] != -1 {
 			// Column already included.
 			continue
@@ -299,40 +323,43 @@ func (p *planner) makeJoin(
 		}
 		r.addRenderColumn(expr, symbolicExprStr(expr), c)
 	}
-	rInfo.sourceColumns = r.columns
+	rInfo.SourceColumns = r.columns
 
 	// Copy the aliases, remapping the columns as necessary. We extract any
 	// anonymous aliases for special handling.
-	anonymousAlias := sourceAlias{name: anonymousTable}
-	for _, a := range info.sourceAliases {
+	anonymousAlias := sqlbase.SourceAlias{Name: sqlbase.AnonymousTable}
+	for _, a := range pred.info.SourceAliases {
 		var colSet util.FastIntSet
-		for col, ok := a.columnSet.Next(0); ok; col, ok = a.columnSet.Next(col + 1) {
+		for col, ok := a.ColumnSet.Next(0); ok; col, ok = a.ColumnSet.Next(col + 1) {
 			colSet.Add(remapped[col])
 		}
-		if a.name == anonymousTable {
-			anonymousAlias.columnSet = colSet
+		if a.Name == sqlbase.AnonymousTable {
+			anonymousAlias.ColumnSet = colSet
 			continue
 		}
-		rInfo.sourceAliases = append(rInfo.sourceAliases, sourceAlias{name: a.name, columnSet: colSet})
+		rInfo.SourceAliases = append(
+			rInfo.SourceAliases,
+			sqlbase.SourceAlias{Name: a.Name, ColumnSet: colSet},
+		)
 	}
 
-	for i := range mergedColumns {
-		anonymousAlias.columnSet.Add(i)
+	for i := range usingColumns {
+		anonymousAlias.ColumnSet.Add(i)
 	}
 
 	// Remove any anonymous aliases that refer to hidden equality columns (i.e.
 	// those that weren't equivalent to the merged column).
 	for i, col := range n.pred.leftEqualityIndices {
 		if target := remapped[col]; target != i {
-			anonymousAlias.columnSet.Remove(target)
+			anonymousAlias.ColumnSet.Remove(target)
 		}
 	}
 	for i, col := range n.pred.rightEqualityIndices {
 		if target := remapped[numLeft+col]; target != i {
-			anonymousAlias.columnSet.Remove(remapped[numLeft+col])
+			anonymousAlias.ColumnSet.Remove(remapped[numLeft+col])
 		}
 	}
-	rInfo.sourceAliases = append(rInfo.sourceAliases, anonymousAlias)
+	rInfo.SourceAliases = append(rInfo.SourceAliases, anonymousAlias)
 	return planDataSource{info: rInfo, plan: r}, nil
 }
 
@@ -372,13 +399,13 @@ func (n *joinNode) startExec(params runParams) error {
 
 	// If needed, pre-allocate left and right rows of NULL tuples for when the
 	// join predicate fails to match.
-	if n.joinType == joinTypeLeftOuter || n.joinType == joinTypeFullOuter {
+	if n.joinType == sqlbase.LeftOuterJoin || n.joinType == sqlbase.FullOuterJoin {
 		n.run.emptyRight = make(tree.Datums, len(planColumns(n.right.plan)))
 		for i := range n.run.emptyRight {
 			n.run.emptyRight[i] = tree.DNull
 		}
 	}
-	if n.joinType == joinTypeRightOuter || n.joinType == joinTypeFullOuter {
+	if n.joinType == sqlbase.RightOuterJoin || n.joinType == sqlbase.FullOuterJoin {
 		n.run.emptyLeft = make(tree.Datums, len(planColumns(n.left.plan)))
 		for i := range n.run.emptyLeft {
 			n.run.emptyLeft[i] = tree.DNull
@@ -412,7 +439,7 @@ func (n *joinNode) hashJoinStart(params runParams) error {
 
 		scratch = encoding[:0]
 	}
-	if n.joinType == joinTypeFullOuter || n.joinType == joinTypeRightOuter {
+	if n.joinType == sqlbase.FullOuterJoin || n.joinType == sqlbase.RightOuterJoin {
 		return n.run.buckets.InitSeen(ctx, &n.run.bucketsMemAcc)
 	}
 	return nil
@@ -431,8 +458,8 @@ func (n *joinNode) Next(params runParams) (res bool, err error) {
 		return false, nil
 	}
 
-	wantUnmatchedLeft := n.joinType == joinTypeLeftOuter || n.joinType == joinTypeFullOuter
-	wantUnmatchedRight := n.joinType == joinTypeRightOuter || n.joinType == joinTypeFullOuter
+	wantUnmatchedLeft := n.joinType == sqlbase.LeftOuterJoin || n.joinType == sqlbase.FullOuterJoin
+	wantUnmatchedRight := n.joinType == sqlbase.RightOuterJoin || n.joinType == sqlbase.FullOuterJoin
 
 	if len(n.run.buckets.Buckets()) == 0 {
 		if !wantUnmatchedLeft {
@@ -701,13 +728,13 @@ func (b *buckets) Fetch(encoding []byte) (*bucket, bool) {
 
 // commonColumns returns the names of columns common on the
 // right and left sides, for use by NATURAL JOIN.
-func commonColumns(left, right *dataSourceInfo) tree.NameList {
+func commonColumns(left, right *sqlbase.DataSourceInfo) tree.NameList {
 	var res tree.NameList
-	for _, cLeft := range left.sourceColumns {
+	for _, cLeft := range left.SourceColumns {
 		if cLeft.Hidden {
 			continue
 		}
-		for _, cRight := range right.sourceColumns {
+		for _, cRight := range right.SourceColumns {
 			if cRight.Hidden {
 				continue
 			}
@@ -756,7 +783,7 @@ func (n *joinNode) joinOrdering() physicalProps {
 	}
 
 	// TODO(arjun): Support order propagation for other JOIN types.
-	if n.joinType != joinTypeInner {
+	if n.joinType != sqlbase.InnerJoin {
 		return info
 	}
 

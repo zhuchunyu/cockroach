@@ -37,7 +37,7 @@ import (
 const debugRowFetch = false
 
 type kvFetcher interface {
-	nextKV(ctx context.Context) (bool, roachpb.KeyValue, error)
+	nextBatch(ctx context.Context) (bool, []roachpb.KeyValue, error)
 	getRangesInfo() []roachpb.RangeInfo
 }
 
@@ -67,11 +67,16 @@ type tableInfo struct {
 	// in the value part.
 	neededValueColsByIdx util.FastIntSet
 
+	// The number of needed columns from the value part of the row. Once we've
+	// seen this number of value columns for a particular row, we can stop
+	// decoding values in that row.
+	neededValueCols int
+
 	// Map used to get the index for columns in cols.
 	colIdxMap map[ColumnID]int
 
 	// One value per column that is part of the key; each value is a column
-	// index (into cols).
+	// index (into cols); -1 if we don't need the value for that column.
 	indexColIdx []int
 
 	// -- Fields updated during a scan --
@@ -160,11 +165,6 @@ type RowFetcher struct {
 	// table has no interleave children.
 	mustDecodeIndexKey bool
 
-	// The number of needed columns from the value part of the row. Once we've
-	// seen this number of value columns for a particular row, we can stop
-	// decoding values in that row.
-	neededValueCols int
-
 	knownPrefixLength int
 
 	// returnRangeInfo, if set, causes the underlying kvFetcher to return
@@ -196,6 +196,8 @@ type RowFetcher struct {
 	kv                roachpb.KeyValue
 	keyRemainingBytes []byte
 	kvEnd             bool
+
+	kvs []roachpb.KeyValue
 
 	// isCheck indicates whether or not we are running checks for k/v
 	// correctness. It is set only during SCRUB commands.
@@ -288,11 +290,18 @@ func (rf *RowFetcher) Init(
 		neededIndexCols := 0
 		table.indexColIdx = make([]int, len(indexColumnIDs))
 		for i, id := range indexColumnIDs {
-			colIdx := table.colIdxMap[id]
-			table.indexColIdx[i] = colIdx
-			if table.neededCols.Contains(int(id)) {
-				neededIndexCols++
-				table.neededValueColsByIdx.Remove(colIdx)
+			colIdx, ok := table.colIdxMap[id]
+			if ok {
+				table.indexColIdx[i] = colIdx
+				if table.neededCols.Contains(int(id)) {
+					neededIndexCols++
+					table.neededValueColsByIdx.Remove(colIdx)
+				}
+			} else {
+				table.indexColIdx[i] = -1
+				if table.neededCols.Contains(int(id)) {
+					panic(fmt.Sprintf("needed column %d not in colIdxMap", id))
+				}
 			}
 		}
 
@@ -310,7 +319,7 @@ func (rf *RowFetcher) Init(
 		// The number of columns we need to read from the value part of the key.
 		// It's the total number of needed columns minus the ones we read from the
 		// index key, except for composite columns.
-		rf.neededValueCols = table.neededCols.Len() - neededIndexCols + len(table.index.CompositeColumnIDs)
+		table.neededValueCols = table.neededCols.Len() - neededIndexCols + len(table.index.CompositeColumnIDs)
 
 		if table.isSecondaryIndex {
 			for i := range table.cols {
@@ -402,9 +411,44 @@ func (rf *RowFetcher) StartScan(
 func (rf *RowFetcher) StartScanFrom(ctx context.Context, f kvFetcher) error {
 	rf.indexKey = nil
 	rf.kvFetcher = f
+	rf.kvs = nil
 	// Retrieve the first key.
 	_, err := rf.NextKey(ctx)
 	return err
+}
+
+func (rf *RowFetcher) nextKV(ctx context.Context) (ok bool, kv roachpb.KeyValue, err error) {
+	if len(rf.kvs) != 0 {
+		kv = rf.kvs[0]
+		rf.kvs = rf.kvs[1:]
+		return true, kv, nil
+	}
+	ok, rf.kvs, err = rf.kvFetcher.nextBatch(ctx)
+	if err != nil {
+		return ok, kv, err
+	}
+	if !ok {
+		return false, kv, nil
+	}
+	return rf.nextKV(ctx)
+}
+
+// IndexKeyString returns the currently searching index key up to `numCols`.
+// For example, if there is an index on 2 columns and the current index key
+// is '/Table/81/1/12/13/1', IndexKeyString(1) will return 'Table/81/1/12'.
+func (rf *RowFetcher) IndexKeyString(numCols int) string {
+	if rf.kv.Key == nil {
+		return ""
+	}
+	splitKey := strings.Split(rf.kv.Key.String(), "/")
+	// Take example index key from above, will be split into:
+	// ["", "Table", "81", "1", "12", "13", "1"], first 4 are always returned
+	// plus any additional columns requested.
+	targetSlashes := 4 + numCols
+	if targetSlashes > len(splitKey) {
+		return strings.Join(splitKey, "/")
+	}
+	return strings.Join(splitKey[:targetSlashes], "/")
 }
 
 // NextKey retrieves the next key/value and sets kv/kvEnd. Returns whether a row
@@ -413,7 +457,7 @@ func (rf *RowFetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 	var ok bool
 
 	for {
-		ok, rf.kv, err = rf.kvFetcher.nextKV(ctx)
+		ok, rf.kv, err = rf.nextKV(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -597,7 +641,9 @@ func (rf *RowFetcher) processKV(
 
 		// Fill in the column values that are part of the index key.
 		for i := range table.keyVals {
-			table.row[table.indexColIdx[i]] = table.keyVals[i]
+			if idx := table.indexColIdx[i]; idx != -1 {
+				table.row[idx] = table.keyVals[i]
+			}
 		}
 
 		rf.valueColsFound = 0
@@ -776,7 +822,7 @@ func (rf *RowFetcher) processValueBytes(
 	var lastColID ColumnID
 	var typeOffset, dataOffset int
 	var typ encoding.Type
-	for len(valueBytes) > 0 && rf.valueColsFound < rf.neededValueCols {
+	for len(valueBytes) > 0 && rf.valueColsFound < table.neededValueCols {
 		typeOffset, dataOffset, colIDDiff, typ, err = encoding.DecodeValueTag(valueBytes)
 		if err != nil {
 			return "", "", err
@@ -1044,10 +1090,10 @@ func (rf *RowFetcher) checkSecondaryIndexDatumEncodings(ctx context.Context) err
 			return scrub.WrapError(scrub.IndexKeyDecodingError, errors.Errorf(
 				"secondary index key failed to round-trip encode. expected %#v, got: %#v",
 				rf.rowReadyTable.lastKV.Key, indexEntry.Key))
-		} else if !bytes.Equal(indexEntry.Value.RawBytes[4:], table.lastKV.Value.RawBytes[4:]) {
+		} else if !indexEntry.Value.EqualData(table.lastKV.Value) {
 			return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
 				"secondary index value failed to round-trip encode. expected %#v, got: %#v",
-				rf.rowReadyTable.lastKV.Value.RawBytes[4:], indexEntry.Value.RawBytes[4:]))
+				rf.rowReadyTable.lastKV.Value, indexEntry.Value))
 		}
 	}
 	return nil
@@ -1090,15 +1136,19 @@ func (rf *RowFetcher) finalizeRow() error {
 	table := rf.rowReadyTable
 	// Fill in any missing values with NULLs
 	for i := range table.cols {
-		if rf.valueColsFound == rf.neededValueCols {
+		if rf.valueColsFound == table.neededValueCols {
 			// Found all cols - done!
 			return nil
 		}
 		if table.neededCols.Contains(int(table.cols[i].ID)) && table.row[i].IsUnset() {
 			if !table.cols[i].Nullable {
 				var indexColValues []string
-				for i := range table.indexColIdx {
-					indexColValues = append(indexColValues, table.row[i].String(&table.cols[i].Type))
+				for _, idx := range table.indexColIdx {
+					if idx != -1 {
+						indexColValues = append(indexColValues, table.row[idx].String(&table.cols[idx].Type))
+					} else {
+						indexColValues = append(indexColValues, "?")
+					}
 				}
 				if rf.isCheck {
 					return scrub.WrapError(scrub.UnexpectedNullValueError, errors.Errorf(

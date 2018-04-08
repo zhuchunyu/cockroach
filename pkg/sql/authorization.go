@@ -22,7 +22,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
+
+type membershipCache struct {
+	syncutil.Mutex
+	tableVersion sqlbase.DescriptorVersion
+	// userCache is a mapping from username to userRoleMembership.
+	userCache map[string]userRoleMembership
+}
+
+var roleMembersCache membershipCache
+
+// userRoleMembership is a mapping of "rolename" -> "with admin option".
+type userRoleMembership map[string]bool
 
 // AuthorizationAccessor for checking authorization (e.g. desc privileges).
 type AuthorizationAccessor interface {
@@ -61,6 +74,13 @@ func CheckPrivilegeForUser(
 func (p *planner) CheckPrivilege(
 	ctx context.Context, descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
 ) error {
+	// Test whether the object is being audited, and if so, record an
+	// audit event. We place this check here to increase the likelihood
+	// it will not be forgotten if features are added that access
+	// descriptors (since every use of descriptors presumably need a
+	// permission check).
+	p.maybeAudit(descriptor, privilege)
+
 	user := p.SessionData().User
 	privs := descriptor.GetPrivileges()
 
@@ -143,17 +163,72 @@ func (p *planner) RequireSuperUser(ctx context.Context, action string) error {
 // MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct and indirect) and
 // returns a map of "role" -> "isAdmin".
 // The "isAdmin" flag applies to both direct and indirect members.
-// TODO(mberhault): this is too expensive: we need some type of caching with change notification.
 func (p *planner) MemberOfWithAdminOption(
+	ctx context.Context, member string,
+) (map[string]bool, error) {
+	// Lookup table version.
+	tableDesc, _, err := p.PhysicalSchemaAccessor().GetObjectDesc(&roleMembersTableName,
+		p.ObjectLookupFlags(ctx, true /*required*/))
+	if err != nil {
+		return nil, err
+	}
+	tableVersion := tableDesc.Version
+
+	// We loop in case the table version changes while we're looking up memberships.
+	for {
+		// Check version and maybe clear cache while holding the mutex.
+		// We release the lock here instead of using defer as we need to keep
+		// going and re-lock if adding the looked-up entry.
+		roleMembersCache.Lock()
+		if roleMembersCache.tableVersion != tableVersion {
+			// Update version and drop the map.
+			roleMembersCache.tableVersion = tableDesc.Version
+			roleMembersCache.userCache = make(map[string]userRoleMembership)
+		}
+
+		userMapping, ok := roleMembersCache.userCache[member]
+		roleMembersCache.Unlock()
+
+		if ok {
+			// Found: return.
+			return userMapping, nil
+		}
+
+		// Lookup memberships outside the lock.
+		memberships, err := p.resolveMemberOfWithAdminOption(ctx, member)
+		if err != nil {
+			return nil, err
+		}
+
+		// Update membership.
+		roleMembersCache.Lock()
+		if roleMembersCache.tableVersion != tableVersion {
+			// Table version has changed while we were looking, unlock and start over.
+			tableVersion = roleMembersCache.tableVersion
+			roleMembersCache.Unlock()
+			continue
+		}
+
+		// Table version remains the same: update map, unlock, return.
+		roleMembersCache.userCache[member] = memberships
+		roleMembersCache.Unlock()
+
+		return memberships, nil
+	}
+}
+
+// resolveMemberOfWithAdminOption performs the actual recursive role membership lookup.
+// TODO(mberhault): this is the naive way and performs a full lookup for each user,
+// we could save detailed memberships (as opposed to fully expanded) and reuse them
+// across users. We may then want to lookup more than just this user.
+func (p *planner) resolveMemberOfWithAdminOption(
 	ctx context.Context, member string,
 ) (map[string]bool, error) {
 	ret := map[string]bool{}
 
 	// Keep track of members we looked up.
 	visited := map[string]struct{}{}
-
 	toVisit := []string{member}
-
 	lookupRolesStmt := `SELECT "role", "isAdmin" FROM system.role_members WHERE "member" = $1`
 
 	internalExecutor := InternalExecutor{ExecCfg: p.ExecCfg()}
@@ -167,10 +242,9 @@ func (p *planner) MemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		rows, _ /* cols */, err := internalExecutor.QueryRowsInTransaction(
+		rows, _ /* cols */, err := internalExecutor.QueryRows(
 			ctx,
 			"expand-roles",
-			p.Txn(),
 			lookupRolesStmt,
 			m,
 		)

@@ -54,13 +54,21 @@ type showFingerprintsNode struct {
 func (p *planner) ShowFingerprints(
 	ctx context.Context, n *tree.ShowFingerprints,
 ) (planNode, error) {
-	tn, err := n.Table.NormalizeWithDatabaseName(p.SessionData().Database)
+	tn, err := n.Table.Normalize()
 	if err != nil {
 		return nil, err
 	}
 
-	tableDesc, err := MustGetTableDesc(
-		ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
+	var tableDesc *TableDescriptor
+	// We avoid the cache so that we can observe the fingerprints without
+	// taking a lease, like other SHOW commands. We also use
+	// allowAdding=true so we can look at the fingerprints of a table
+	// added in the same transaction.
+	//
+	// TODO(vivek): check if the cache can be used.
+	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +153,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	  FROM [%d AS t]@{FORCE_INDEX=[%d],NO_INDEX_JOIN}
 	`, strings.Join(cols, `,`), n.tableDesc.ID, index.ID)
 
-	fingerprintCols, err := params.p.QueryRow(params.ctx, sql)
+	fingerprintCols, err := params.p.queryRow(params.ctx, sql)
 	if err != nil {
 		return false, err
 	}

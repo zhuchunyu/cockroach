@@ -75,15 +75,15 @@ render         0      render    ·         ·                         ("$1::INT"
 query TITTTTT
 EXPLAIN (METADATA) SHOW TRACE FOR SELECT 1
 ----
-sort                                         0  sort            ·      ·             ("timestamp", age, message, tag, loc, operation, span)                                 +"timestamp"
- │                                           0  ·               order  +"timestamp"  ·                                                                                      ·
- └── window                                  1  window          ·      ·             ("timestamp", age, message, tag, loc, operation, span)                                 ·
-      └── render                             2  render          ·      ·             ("timestamp", """timestamp""", message, tag, loc, operation, span)                     "timestamp"="""timestamp"""
-           └── window                        3  window          ·      ·             ("timestamp", message, tag, loc, operation, span)                                      ·
-                └── render                   4  render          ·      ·             ("timestamp", message, tag, loc, operation, span, txn_idx, span_idx, message_idx)      ·
-                     └── show trace for      5  show trace for  ·      ·             (txn_idx, span_idx, message_idx, "timestamp", duration, operation, loc, tag, message)  ·
-                          └── render         6  render          ·      ·             ("1")                                                                                  "1"=CONST
-                               └── emptyrow  7  emptyrow        ·      ·             ()                                                                                     ·
+sort                                         0  sort            ·      ·             ("timestamp", age, message, tag, loc, operation, span)                        +"timestamp"
+ │                                           0  ·               order  +"timestamp"  ·                                                                             ·
+ └── window                                  1  window          ·      ·             ("timestamp", age, message, tag, loc, operation, span)                        ·
+      └── render                             2  render          ·      ·             ("timestamp", """timestamp""", message, tag, loc, operation, span)            "timestamp"="""timestamp"""
+           └── window                        3  window          ·      ·             ("timestamp", message, tag, loc, operation, span)                             ·
+                └── render                   4  render          ·      ·             ("timestamp", message, tag, loc, operation, span, message_idx)                ·
+                     └── show trace for      5  show trace for  ·      ·             (span_idx, message_idx, "timestamp", duration, operation, loc, tag, message)  ·
+                          └── render         6  render          ·      ·             ("1")                                                                         "1"=CONST
+                               └── emptyrow  7  emptyrow        ·      ·             ()                                                                            ·
 
 # Ensure that all relevant statement types can be explained
 query TTT
@@ -151,21 +151,23 @@ drop table  ·  ·
 query TTT
 EXPLAIN SHOW DATABASES
 ----
-sort              ·      ·
- │                order  +"Database"
- └── render       ·      ·
-      └── values  ·      ·
-·                 size   4 columns, 6 rows
+distinct               ·          ·
+ │                     order key  Database
+ └── sort              ·          ·
+      │                order      +"Database"
+      └── render       ·          ·
+           └── values  ·          ·
+·                      size       4 columns, 12 rows
 
 query TTT
 EXPLAIN SHOW TABLES
 ----
 sort                   ·      ·
- │                     order  +"Table"
+ │                     order  +table_schema,+"Table"
  └── render            ·      ·
       └── filter       ·      ·
            └── values  ·      ·
-·                      size   5 columns, 89 rows
+·                      size   6 columns, 81 rows
 
 query TTT
 EXPLAIN SHOW DATABASE
@@ -173,7 +175,7 @@ EXPLAIN SHOW DATABASE
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  2 columns, 24 rows
+·                 size  2 columns, 27 rows
 
 query TTT
 EXPLAIN SHOW TIME ZONE
@@ -181,7 +183,7 @@ EXPLAIN SHOW TIME ZONE
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  2 columns, 24 rows
+·                 size  2 columns, 27 rows
 
 query TTT
 EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION
@@ -189,7 +191,7 @@ EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  2 columns, 24 rows
+·                 size  2 columns, 27 rows
 
 query TTT
 EXPLAIN SHOW TRANSACTION ISOLATION LEVEL
@@ -197,7 +199,7 @@ EXPLAIN SHOW TRANSACTION ISOLATION LEVEL
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  2 columns, 24 rows
+·                 size  2 columns, 27 rows
 
 query TTT
 EXPLAIN SHOW TRANSACTION PRIORITY
@@ -205,34 +207,40 @@ EXPLAIN SHOW TRANSACTION PRIORITY
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  2 columns, 24 rows
+·                 size  2 columns, 27 rows
 
 query TTT
 EXPLAIN SHOW COLUMNS FROM foo
 ----
-sort                                       ·         ·
- │                                         order     +ordinal_position
- └── render                                ·         ·
-      └── group                            ·         ·
-           │                               group by  @1-@5
-           └── render                      ·         ·
-                └── join                   ·         ·
-                     │                     type      left outer
-                     │                     equality  (column_name) = (column_name)
-                     ├── render            ·         ·
-                     │    └── filter       ·         ·
-                     │         └── values  ·         ·
-                     │                     size      16 columns, 767 rows
-                     └── render            ·         ·
-                          └── filter       ·         ·
-                               └── values  ·         ·
-·                                          size      13 columns, 37 rows
+sort                                       ·            ·
+ │                                         order        +ordinal_position
+ └── render                                ·            ·
+      └── group                            ·            ·
+           │                               aggregate 0  column_name
+           │                               aggregate 1  data_type
+           │                               aggregate 2  is_nullable
+           │                               aggregate 3  column_default
+           │                               aggregate 4  ordinal_position
+           │                               aggregate 5  array_agg(index_name)
+           │                               group by     @1-@5
+           └── render                      ·            ·
+                └── join                   ·            ·
+                     │                     type         left outer
+                     │                     equality     (column_name) = (column_name)
+                     ├── render            ·            ·
+                     │    └── filter       ·            ·
+                     │         └── values  ·            ·
+                     │                     size         17 columns, 741 rows
+                     └── render            ·            ·
+                          └── filter       ·            ·
+                               └── values  ·            ·
+·                                          size         13 columns, 3 rows
 
 query TTT
 EXPLAIN SHOW GRANTS ON foo
 ----
 sort                   ·      ·
- │                     order  +"Database",+"Table",+"User",+"Privileges"
+ │                     order  +"Database",+"Schema",+"Table",+"User"
  └── render            ·      ·
       └── filter       ·      ·
            └── values  ·      ·
@@ -245,7 +253,7 @@ EXPLAIN SHOW INDEX FROM foo
 render            ·     ·
  └── filter       ·     ·
       └── values  ·     ·
-·                 size  13 columns, 37 rows
+·                 size  13 columns, 3 rows
 
 query TTT
 EXPLAIN SHOW CONSTRAINTS FROM foo

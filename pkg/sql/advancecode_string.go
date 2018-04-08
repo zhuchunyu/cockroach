@@ -2,15 +2,15 @@
 
 package sql
 
-import "fmt"
+import "strconv"
 
-const _advanceCode_name = "advanceUnknownstayInPlaceadvanceOneskipQueryStrrewind"
+const _advanceCode_name = "advanceUnknownstayInPlaceadvanceOneskipBatchrewind"
 
-var _advanceCode_index = [...]uint8{0, 14, 25, 35, 47, 53}
+var _advanceCode_index = [...]uint8{0, 14, 25, 35, 44, 50}
 
 func (i advanceCode) String() string {
 	if i < 0 || i >= advanceCode(len(_advanceCode_index)-1) {
-		return fmt.Sprintf("advanceCode(%d)", i)
+		return "advanceCode(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
 	return _advanceCode_name[_advanceCode_index[i]:_advanceCode_index[i+1]]
 }

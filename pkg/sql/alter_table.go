@@ -17,16 +17,19 @@ package sql
 import (
 	"bytes"
 	"context"
+	gojson "encoding/json"
 	"fmt"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 type alterTableNode struct {
@@ -39,20 +42,22 @@ type alterTableNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode, error) {
-	tn, err := n.Table.NormalizeWithDatabaseName(p.SessionData().Database)
+	tn, err := n.Table.Normalize()
 	if err != nil {
 		return nil, err
 	}
 
-	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
+	var tableDesc *TableDescriptor
+	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+	// TODO(vivek): check if the cache can be used.
+	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		tableDesc, err = ResolveExistingObject(ctx, p, tn, !n.IfExists, requireTableDesc)
+	})
 	if err != nil {
 		return nil, err
 	}
 	if tableDesc == nil {
-		if n.IfExists {
-			return &zeroNode{}, nil
-		}
-		return nil, sqlbase.NewUndefinedRelationError(tn)
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
@@ -68,6 +73,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 	descriptorChanged := false
 	origNumMutations := len(n.tableDesc.Mutations)
 	var droppedViews []string
+	tn := n.n.Table.TableName()
 
 	for _, cmd := range n.n.Cmds {
 		switch t := cmd.(type) {
@@ -81,6 +87,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Unimplemented(
 					"alter add fk", "adding a REFERENCES constraint via ALTER not supported")
 			}
+			if d.Computed.Computed {
+				return pgerror.Unimplemented(
+					"alter add computed", "adding a computed column via ALTER not supported")
+			}
 			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx, params.EvalContext())
 			if err != nil {
 				return err
@@ -88,7 +98,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// If the new column has a DEFAULT expression that uses a sequence, add references between
 			// its descriptor and this column descriptor.
 			if d.HasDefaultExpr() {
-				changedSeqDescs, err := maybeAddSequenceDependencies(n.tableDesc, col, expr, params.EvalContext())
+				var changedSeqDescs []*TableDescriptor
+				// DDL statements use uncached descriptors, and can view newly added things.
+				// TODO(vivek): check if the cache can be used.
+				params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+					changedSeqDescs, err = maybeAddSequenceDependencies(params.p, n.tableDesc, col, expr, params.EvalContext())
+				})
 				if err != nil {
 					return err
 				}
@@ -178,8 +193,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 
 			case *tree.CheckConstraintTableDef:
-				ck, err := makeCheckConstraint(
-					*n.tableDesc, d, inuseNames, &params.p.semaCtx, params.EvalContext())
+				tableName, err := n.n.Table.Normalize()
+				if err != nil {
+					return err
+				}
+				ck, err := makeCheckConstraint(params.ctx,
+					*n.tableDesc, d, inuseNames, &params.p.semaCtx, params.EvalContext(), *tableName)
 				if err != nil {
 					return err
 				}
@@ -188,13 +207,29 @@ func (n *alterTableNode) startExec(params runParams) error {
 				descriptorChanged = true
 
 			case *tree.ForeignKeyConstraintTableDef:
-				if _, err := d.Table.NormalizeWithDatabaseName(
-					params.SessionData().Database,
-				); err != nil {
+				if _, err := d.Table.Normalize(); err != nil {
 					return err
 				}
+				for _, colName := range d.FromCols {
+					col, _, err := n.tableDesc.FindColumnByName(colName)
+					if err != nil {
+						return err
+					}
+					if err := col.CheckCanBeFKRef(); err != nil {
+						return err
+					}
+				}
 				affected := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
-				err := params.p.resolveFK(params.ctx, n.tableDesc, d, affected, sqlbase.ConstraintValidity_Unvalidated)
+
+				// If there are any FKs, we will need to update the table descriptor of the
+				// depended-on table (to register this table against its DependedOnBy field).
+				// This descriptor must be looked up uncached, and we'll allow FK dependencies
+				// on tables that were just added. See the comment at the start of
+				// the global-scope resolveFK().
+				// TODO(vivek): check if the cache can be used.
+				params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+					err = params.p.resolveFK(params.ctx, n.tableDesc, d, affected, sqlbase.ConstraintValidity_Unvalidated)
+				})
 				if err != nil {
 					return err
 				}
@@ -323,7 +358,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if containsThisColumn {
 					if containsOnlyThisColumn || t.DropBehavior == tree.DropCascade {
 						if err := params.p.dropIndexByName(
-							params.ctx, tree.UnrestrictedName(idx.Name), n.tableDesc, false,
+							params.ctx, tn, tree.UnrestrictedName(idx.Name), n.tableDesc, false,
 							t.DropBehavior, ignoreIdxConstraint,
 							tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames),
 						); err != nil {
@@ -336,23 +371,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			// Drop check constraints which reference the column.
-			// For every check on the table, walk the check expr
-			// and ensure any check which references the column
-			// is removed from the table descriptor.
 			validChecks := n.tableDesc.Checks[:0]
-
 			for _, check := range n.tableDesc.Checks {
-				expr, err := parser.ParseExpr(check.Expr)
-				if err != nil {
+				if used, err := check.UsesColumn(n.tableDesc, col.ID); err != nil {
 					return err
-				}
-
-				exprDoesReferenceColumn, err := exprContainsColumnName(expr, col)
-				if err != nil {
-					return err
-				}
-
-				if !exprDoesReferenceColumn {
+				} else if !used {
 					validChecks = append(validChecks, check)
 				}
 			}
@@ -513,6 +536,19 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			n.tableDesc.PrimaryIndex.Partitioning = partitioning
+
+		case *tree.AlterTableSetAudit:
+			var err error
+			descriptorChanged, err = params.p.setAuditMode(params.ctx, n.tableDesc, t.Mode)
+			if err != nil {
+				return err
+			}
+
+		case *tree.AlterTableInjectStats:
+			if err := params.p.injectTableStats(params.ctx, n.tableDesc, t.Stats); err != nil {
+				return err
+			}
+
 		default:
 			return fmt.Errorf("unsupported alter command: %T", cmd)
 		}
@@ -564,7 +600,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 			User                string
 			MutationID          uint32
 			CascadeDroppedViews []string
-		}{n.tableDesc.Name, n.n.String(), params.SessionData().User, uint32(mutationID), droppedViews},
+		}{n.n.Table.TableName().FQString(), n.n.String(),
+			params.SessionData().User, uint32(mutationID), droppedViews},
 	); err != nil {
 		return err
 	}
@@ -572,6 +609,23 @@ func (n *alterTableNode) startExec(params runParams) error {
 	params.p.notifySchemaChange(n.tableDesc, mutationID)
 
 	return nil
+}
+
+func (p *planner) setAuditMode(
+	ctx context.Context, desc *sqlbase.TableDescriptor, auditMode tree.AuditMode,
+) (bool, error) {
+	// An auditing config change is itself auditable!
+	// We record the event even if the permission check below fails:
+	// auditing wants to know who tried to change the settings.
+	p.curPlan.auditEvents = append(p.curPlan.auditEvents,
+		auditEvent{desc: desc, writing: true})
+
+	// We require root for now. Later maybe use a different permission?
+	if err := p.RequireSuperUser(ctx, "change auditing settings on a table"); err != nil {
+		return false, err
+	}
+
+	return desc.SetAuditMode(auditMode)
 }
 
 func (n *alterTableNode) Next(runParams) (bool, error) { return false, nil }
@@ -606,8 +660,15 @@ func applyColumnMutation(
 			}
 			s := tree.Serialize(t.Default)
 			col.DefaultExpr = &s
+
 			// Add references to the sequence descriptors this column is now using.
-			changedSeqDescs, err := maybeAddSequenceDependencies(tableDesc, col, expr, params.EvalContext())
+
+			// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+			// TODO(vivek): check if the cache can be used.
+			var changedSeqDescs []*TableDescriptor
+			params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+				changedSeqDescs, err = maybeAddSequenceDependencies(params.p, tableDesc, col, expr, params.EvalContext())
+			})
 			if err != nil {
 				return err
 			}
@@ -638,44 +699,100 @@ func labeledRowValues(cols []sqlbase.ColumnDescriptor, values tree.Datums) strin
 	return s.String()
 }
 
-// exprContainsColumnNames determines whether the given column occurs in the
-// given expression.
-// It achieves this using a lexical comparison without considering scoping.
-// WARNING: this logic only works for 'simple' expressions.
-// If/when CHECK expressions are extended to also support subqueries,
-// this logic will need to be amended.
-func exprContainsColumnName(expr tree.Expr, col sqlbase.ColumnDescriptor) (bool, error) {
-	exprContainsColumnName := false
-
-	preFn := func(expr tree.Expr) (err error, recurse bool, newExpr tree.Expr) {
-		vBase, ok := expr.(tree.VarName)
-		if !ok {
-			// Not a VarName, don't do anything to this node.
-			return nil, true, expr
-		}
-
-		v, err := vBase.NormalizeVarName()
-		if err != nil {
-			return err, false, nil
-		}
-
-		c, ok := v.(*tree.ColumnItem)
-		if !ok {
-			return nil, true, expr
-		}
-
-		if string(c.ColumnName) == col.Name {
-			// This is a CHECK constraint which contains the column to be dropped
-			exprContainsColumnName = true
-		}
-		// Convert to a dummy node of the correct type.
-		return nil, false, &dummyColumnItem{col.Type.ToDatumType()}
-	}
-
-	_, err := tree.SimpleVisit(expr, preFn)
+// injectTableStats implements the INJECT STATISTICS command, which deletes any
+// existing statistics on the table and replaces them with the statistics in the
+// given json object (in the same format as the result of SHOW STATISTICS USING
+// JSON). This is useful for reproducing planning issues without importing the
+// data.
+func (p *planner) injectTableStats(
+	ctx context.Context, desc *sqlbase.TableDescriptor, statsExpr tree.Expr,
+) error {
+	typedExpr, err := tree.TypeCheckAndRequire(
+		statsExpr, &p.semaCtx, types.JSON, "INJECT STATISTICS",
+	)
 	if err != nil {
-		return false, err
+		return err
+	}
+	val, err := typedExpr.Eval(p.EvalContext())
+	if err != nil {
+		return err
+	}
+	if val == tree.DNull {
+		return fmt.Errorf("statistics cannot be NULL")
+	}
+	jsonStr := val.(*tree.DJSON).JSON.String()
+	var stats []stats.JSONStatistic
+	if err := gojson.Unmarshal([]byte(jsonStr), &stats); err != nil {
+		return err
 	}
 
-	return exprContainsColumnName, nil
+	// We will be doing multiple p.exec() calls; turn off auto-commit.
+	if p.autoCommit {
+		defer func() { p.autoCommit = true }()
+		p.autoCommit = false
+	}
+
+	// First, delete all statistics for the table.
+	_, err = p.exec(ctx, `DELETE FROM system.table_statistics WHERE "tableID" = $1`, desc.ID)
+	if err != nil {
+		return err
+	}
+
+	// Insert each statistic.
+	for i := range stats {
+		s := &stats[i]
+		h, err := s.GetHistogram(p.EvalContext())
+		if err != nil {
+			return err
+		}
+		// histogram will be passed to the INSERT statement; we want it to be a
+		// nil interface{} if we don't generate a histogram.
+		var histogram interface{}
+		if h != nil {
+			histogram, err = protoutil.Marshal(h)
+			if err != nil {
+				return err
+			}
+		}
+
+		columnIDs := tree.NewDArray(types.Int)
+		for _, colName := range s.Columns {
+			colDesc, _, err := desc.FindColumnByName(tree.Name(colName))
+			if err != nil {
+				return err
+			}
+			if err := columnIDs.Append(tree.NewDInt(tree.DInt(colDesc.ID))); err != nil {
+				return err
+			}
+		}
+		var name interface{}
+		if s.Name != "" {
+			name = s.Name
+		}
+		_, err = p.exec(
+			ctx,
+			`INSERT INTO system.table_statistics (
+					"tableID",
+					"name",
+					"columnIDs",
+					"createdAt",
+					"rowCount",
+					"distinctCount",
+					"nullCount",
+					histogram
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			desc.ID,
+			name,
+			columnIDs,
+			s.CreatedAt,
+			s.RowCount,
+			s.DistinctCount,
+			s.NullCount,
+			histogram,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

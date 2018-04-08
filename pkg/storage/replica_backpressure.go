@@ -20,6 +20,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -60,6 +61,14 @@ var backpressurableReqMethods = util.MakeFastIntSet(
 	int(roachpb.ClearRange),
 )
 
+// backpressurableSpans contains spans of keys where write backpressuring
+// is permitted. Writes to any keys outside of these spans will never be
+// backpressured.
+var backpressurableSpans = []roachpb.Span{
+	{Key: keys.TimeseriesPrefix, EndKey: keys.TimeseriesKeyMax},
+	{Key: keys.TableDataMin, EndKey: keys.TableDataMax},
+}
+
 // canBackpressureBatch returns whether the provided BatchRequest is eligible
 // for backpressure.
 func canBackpressureBatch(ba roachpb.BatchRequest) bool {
@@ -68,11 +77,22 @@ func canBackpressureBatch(ba roachpb.BatchRequest) bool {
 		return false
 	}
 
-	// Only backpressure batches consisting exclusively
-	// of "backpressurable" methods.
+	// Only backpressure batches consisting exclusively of "backpressurable"
+	// methods that are all within "backpressurable" key spans.
 	for _, union := range ba.Requests {
-		method := union.GetInner().Method()
-		if !backpressurableReqMethods.Contains(int(method)) {
+		req := union.GetInner()
+		if !backpressurableReqMethods.Contains(int(req.Method())) {
+			return false
+		}
+
+		inSpan := false
+		for _, s := range backpressurableSpans {
+			if s.Contains(req.Header()) {
+				inSpan = true
+				break
+			}
+		}
+		if !inSpan {
 			return false
 		}
 	}
@@ -112,7 +132,7 @@ func (r *Replica) maybeBackpressureWriteBatch(ctx context.Context, ba roachpb.Ba
 			defer r.store.metrics.BackpressuredOnSplitRequests.Dec(1)
 
 			if backpressureLogLimiter.ShouldLog() {
-				log.Warningf(ctx, "applying backpressure to limit range growth")
+				log.Warningf(ctx, "applying backpressure to limit range growth on batch %s", ba)
 			}
 		}
 

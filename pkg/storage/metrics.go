@@ -134,13 +134,23 @@ var (
 		Help: "Count of intent keys"}
 	metaIntentAge = metric.Metadata{
 		Name: "intentage",
-		Help: "Cumulative age of intents"}
+		Help: "Cumulative age of intents in seconds"}
 	metaGcBytesAge = metric.Metadata{
 		Name: "gcbytesage",
-		Help: "Cumulative age of non-live data"}
+		Help: "Cumulative age of non-live data in seconds"}
 	metaLastUpdateNanos = metric.Metadata{
 		Name: "lastupdatenanos",
-		Help: "Time at which ages were last updated"}
+		Help: "Time in nanoseconds since Unix epoch at which bytes/keys/intents metrics were last updated"}
+
+	// Disk usage diagram (CR=Cockroach):
+	//                            ---------------------------------
+	// Entire hard drive:         | non-CR data | CR data | empty |
+	//                            ---------------------------------
+	// Metrics:
+	//                "capacity": |===============================|
+	//                    "used":               |=========|
+	//               "available":                         |=======|
+	// "usable" (computed in UI):               |=================|
 	metaCapacity = metric.Metadata{
 		Name: "capacity",
 		Help: "Total storage capacity"}
@@ -150,6 +160,7 @@ var (
 	metaUsed = metric.Metadata{
 		Name: "capacity.used",
 		Help: "Used storage capacity"}
+
 	metaReserved = metric.Metadata{
 		Name: "capacity.reserved",
 		Help: "Capacity reserved for snapshots"}
@@ -186,7 +197,7 @@ var (
 		Help: "Number of times the bloom filter helped avoid iterator creation"}
 	metaRdbMemtableTotalSize = metric.Metadata{
 		Name: "rocksdb.memtable.total-size",
-		Help: "Current size of memtable"}
+		Help: "Current size of memtable in bytes"}
 	metaRdbFlushes = metric.Metadata{
 		Name: "rocksdb.flushes",
 		Help: "Number of table flushes"}
@@ -241,10 +252,10 @@ var (
 		Help: "Count of Raft commands applied"}
 	metaRaftLogCommitLatency = metric.Metadata{
 		Name: "raft.process.logcommit.latency",
-		Help: "Latency histogram for committing Raft log entries"}
+		Help: "Latency histogram in nanoseconds for committing Raft log entries"}
 	metaRaftCommandCommitLatency = metric.Metadata{
 		Name: "raft.process.commandcommit.latency",
-		Help: "Latency histogram for committing Raft commands"}
+		Help: "Latency histogram in nanoseconds for committing Raft commands"}
 
 	// Raft message metrics.
 	metaRaftRcvdProp = metric.Metadata{
@@ -414,7 +425,7 @@ var (
 		Help: "Number of associated distinct transactions"}
 	metaGCTransactionSpanScanned = metric.Metadata{
 		Name: "queue.gc.info.transactionspanscanned",
-		Help: "Number of entries in the transaction span scanned from the engine"}
+		Help: "Number of entries in transaction spans scanned from the engine"}
 	metaGCTransactionSpanGCAborted = metric.Metadata{
 		Name: "queue.gc.info.transactionspangcaborted",
 		Help: "Number of GC'able entries corresponding to aborted txns"}
@@ -466,6 +477,10 @@ var (
 	metaAddSSTableApplications = metric.Metadata{
 		Name: "addsstable.applications",
 		Help: "Number of SSTable ingestions applied (i.e. applied by Replicas)"}
+	metaAddSSTableApplicationCopies = metric.Metadata{
+		Name: "addsstable.copies",
+		Help: "number of SSTable ingestions that required copying files during application",
+	}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -473,8 +488,8 @@ type StoreMetrics struct {
 	registry *metric.Registry
 
 	// Replica metrics.
-	ReplicaCount                  *metric.Counter // Does not include reserved replicas.
-	ReservedReplicaCount          *metric.Counter
+	ReplicaCount                  *metric.Gauge // Does not include reserved replicas.
+	ReservedReplicaCount          *metric.Gauge
 	RaftLeaderCount               *metric.Gauge
 	RaftLeaderNotLeaseHolderCount *metric.Gauge
 	LeaseHolderCount              *metric.Gauge
@@ -521,7 +536,7 @@ type StoreMetrics struct {
 	Capacity        *metric.Gauge
 	Available       *metric.Gauge
 	Used            *metric.Gauge
-	Reserved        *metric.Counter
+	Reserved        *metric.Gauge
 	SysBytes        *metric.Gauge
 	SysCount        *metric.Gauge
 
@@ -651,9 +666,10 @@ type StoreMetrics struct {
 	BackpressuredOnSplitRequests *metric.Gauge
 
 	// AddSSTable stats: how many AddSSTable commands were proposed and how many
-	// were applied?
-	AddSSTableProposals    *metric.Counter
-	AddSSTableApplications *metric.Counter
+	// were applied? How many applications required writing a copy?
+	AddSSTableProposals         *metric.Counter
+	AddSSTableApplications      *metric.Counter
+	AddSSTableApplicationCopies *metric.Counter
 
 	// Stats for efficient merges.
 	mu struct {
@@ -668,8 +684,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		registry: storeRegistry,
 
 		// Replica metrics.
-		ReplicaCount:                  metric.NewCounter(metaReplicaCount),
-		ReservedReplicaCount:          metric.NewCounter(metaReservedReplicaCount),
+		ReplicaCount:                  metric.NewGauge(metaReplicaCount),
+		ReservedReplicaCount:          metric.NewGauge(metaReservedReplicaCount),
 		RaftLeaderCount:               metric.NewGauge(metaRaftLeaderCount),
 		RaftLeaderNotLeaseHolderCount: metric.NewGauge(metaRaftLeaderNotLeaseHolderCount),
 		LeaseHolderCount:              metric.NewGauge(metaLeaseHolderCount),
@@ -714,7 +730,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		Capacity:        metric.NewGauge(metaCapacity),
 		Available:       metric.NewGauge(metaAvailable),
 		Used:            metric.NewGauge(metaUsed),
-		Reserved:        metric.NewCounter(metaReserved),
+		Reserved:        metric.NewGauge(metaReserved),
 		SysBytes:        metric.NewGauge(metaSysBytes),
 		SysCount:        metric.NewGauge(metaSysCount),
 
@@ -837,8 +853,9 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		BackpressuredOnSplitRequests: metric.NewGauge(metaBackpressuredOnSplitRequests),
 
 		// AddSSTable proposal + applications counters.
-		AddSSTableProposals:    metric.NewCounter(metaAddSSTableProposals),
-		AddSSTableApplications: metric.NewCounter(metaAddSSTableApplications),
+		AddSSTableProposals:         metric.NewCounter(metaAddSSTableProposals),
+		AddSSTableApplications:      metric.NewCounter(metaAddSSTableApplications),
+		AddSSTableApplicationCopies: metric.NewCounter(metaAddSSTableApplicationCopies),
 	}
 
 	sm.raftRcvdMessages[raftpb.MsgProp] = sm.RaftRcvdMsgProp

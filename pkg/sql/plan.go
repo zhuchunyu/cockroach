@@ -19,6 +19,10 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -193,18 +197,48 @@ var _ planNode = &sortNode{}
 var _ planNode = &splitNode{}
 var _ planNode = &unionNode{}
 var _ planNode = &updateNode{}
+var _ planNode = &upsertNode{}
 var _ planNode = &valueGenerator{}
 var _ planNode = &valuesNode{}
 var _ planNode = &windowNode{}
 var _ planNode = &CreateUserNode{}
 var _ planNode = &DropUserNode{}
 
+var _ planNodeFastPath = &CreateUserNode{}
+var _ planNodeFastPath = &DropUserNode{}
 var _ planNodeFastPath = &alterUserSetPasswordNode{}
 var _ planNodeFastPath = &createTableNode{}
-var _ planNodeFastPath = &CreateUserNode{}
 var _ planNodeFastPath = &deleteNode{}
-var _ planNodeFastPath = &DropUserNode{}
 var _ planNodeFastPath = &setZoneConfigNode{}
+var _ planNodeFastPath = &upsertNode{}
+
+// planNodeRequireSpool serves as marker for nodes whose parent must
+// ensure that the node is fully run to completion (and the results
+// spooled) during the start phase. This is currently implemented by
+// all mutation statements except for upsert.
+type planNodeRequireSpool interface {
+	requireSpool()
+}
+
+var _ planNodeRequireSpool = &insertNode{}
+var _ planNodeRequireSpool = &deleteNode{}
+var _ planNodeRequireSpool = &updateNode{}
+
+// planNodeSpool serves as marker for nodes that can perform all their
+// execution during the start phase. This is different from the "fast
+// path" interface because a node that performs all its execution
+// during the start phase might still have some result rows and thus
+// not implement the fast path.
+//
+// This interface exists for the following optimization: nodes
+// that require spooling but are the children of a spooled node
+// do not require the introduction of an explicit spool.
+type planNodeSpooled interface {
+	spooled()
+}
+
+var _ planNodeSpooled = &upsertNode{}
+var _ planNodeSpooled = &spoolNode{}
 
 // planTop is the struct that collects the properties
 // of an entire plan.
@@ -213,6 +247,9 @@ var _ planNodeFastPath = &setZoneConfigNode{}
 // TODO(jordan): investigate whether/how per-plan state like
 // placeholder data can be concentrated in a single struct.
 type planTop struct {
+	// AST is the syntax tree for the current statement.
+	AST tree.Statement
+
 	// plan is the top-level node of the logical plan.
 	plan planNode
 
@@ -237,6 +274,10 @@ type planTop struct {
 
 	// plannedExecute is true if this planner has planned an EXECUTE statement.
 	plannedExecute bool
+
+	// auditEvents becomes non-nil if any of the descriptors used by
+	// current statement is causing an auditing event. See exec_log.go.
+	auditEvents []auditEvent
 }
 
 // makePlan implements the Planner interface. It populates the
@@ -249,7 +290,7 @@ type planTop struct {
 // p.curPlan.Close().
 func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 	// Reinitialize.
-	p.curPlan = planTop{}
+	p.curPlan = planTop{AST: stmt.AST}
 
 	var err error
 	p.curPlan.plan, err = p.newPlan(ctx, stmt.AST, nil /*desiredTypes*/)
@@ -298,6 +339,31 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 			planToString(ctx, p.curPlan.plan, p.curPlan.subqueryPlans))
 	}
 
+	return nil
+}
+
+// makeOptimizerPlan is an alternative to makePlan which uses the (experimental)
+// optimizer.
+func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
+	// execEngine is both an exec.Factory and an opt.Catalog. cleanup is not
+	// required on the engine, since planner is cleaned up elsewhere.
+	eng := newExecEngine(p, nil)
+	defer eng.Close()
+
+	o := xform.NewOptimizer(p.EvalContext())
+	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), eng.Catalog(), o.Factory(), stmt.AST)
+	root, props, err := bld.Build()
+	if err != nil {
+		return err
+	}
+
+	ev := o.Optimize(root, props)
+
+	node, err := execbuilder.New(eng, ev).Build()
+	if err != nil {
+		return err
+	}
+	p.curPlan.plan = node.(planNode)
 	return nil
 }
 
@@ -360,6 +426,22 @@ func (p *planTop) columns() sqlbase.ResultColumns {
 	return planColumns(p.plan)
 }
 
+func (p *planTop) collectSpans(params runParams) (readSpans, writeSpans roachpb.Spans, err error) {
+	readSpans, writeSpans, err = collectSpans(params, p.plan)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i := range params.p.curPlan.subqueryPlans {
+		reads, writes, err := collectSpans(params, params.p.curPlan.subqueryPlans[i].plan)
+		if err != nil {
+			return nil, nil, err
+		}
+		readSpans = append(readSpans, reads...)
+		writeSpans = append(writeSpans, writes...)
+	}
+	return readSpans, writeSpans, nil
+}
+
 // startPlan starts the given plan and all its sub-query nodes.
 func startPlan(params runParams, plan planNode) error {
 	// Now start execution.
@@ -395,6 +477,13 @@ type autoCommitNode interface {
 	// interface).
 	enableAutoCommit()
 }
+
+var _ autoCommitNode = &createTableNode{}
+var _ autoCommitNode = &delayedNode{}
+var _ autoCommitNode = &deleteNode{}
+var _ autoCommitNode = &insertNode{}
+var _ autoCommitNode = &updateNode{}
+var _ autoCommitNode = &upsertNode{}
 
 // startExec calls startExec() on each planNode that supports
 // execStartable using a depth-first, post-order traversal.
@@ -463,6 +552,8 @@ func (p *planner) delegateQuery(
 	initialCheck func(ctx context.Context) error,
 	desiredTypes []types.T,
 ) (planNode, error) {
+	// log.VEventf(ctx, 2, "delegated query: %q", sql)
+
 	// Prepare the sub-plan.
 	stmt, err := parser.ParseOne(sql)
 	if err != nil {
@@ -547,6 +638,8 @@ func (p *planner) newPlan(
 		return p.AlterUserSetPassword(ctx, n)
 	case *tree.CancelQuery:
 		return p.CancelQuery(ctx, n)
+	case *tree.CancelSession:
+		return p.CancelSession(ctx, n)
 	case *tree.CancelJob:
 		return p.CancelJob(ctx, n)
 	case *tree.Scrub:
@@ -652,6 +745,8 @@ func (p *planner) newPlan(
 		return p.ShowQueries(ctx, n)
 	case *tree.ShowJobs:
 		return p.ShowJobs(ctx, n)
+	case *tree.ShowRoleGrants:
+		return p.ShowRoleGrants(ctx, n)
 	case *tree.ShowRoles:
 		return p.ShowRoles(ctx, n)
 	case *tree.ShowSessions:
@@ -662,6 +757,8 @@ func (p *planner) newPlan(
 		return p.ShowSyntax(ctx, n)
 	case *tree.ShowTables:
 		return p.ShowTables(ctx, n)
+	case *tree.ShowSchemas:
+		return p.ShowSchemas(ctx, n)
 	case *tree.ShowTrace:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowTransactionStatus:
@@ -699,7 +796,7 @@ func (p *planner) newPlan(
 // The resulting plan is stored in p.curPlan.
 func (p *planner) prepare(ctx context.Context, stmt tree.Statement) error {
 	// Reinitialize.
-	p.curPlan = planTop{}
+	p.curPlan = planTop{AST: stmt}
 
 	// Prepare the plan.
 	plan, err := p.doPrepare(ctx, stmt)
@@ -724,10 +821,14 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.AlterUserSetPassword(ctx, n)
 	case *tree.CancelQuery:
 		return p.CancelQuery(ctx, n)
+	case *tree.CancelSession:
+		return p.CancelSession(ctx, n)
 	case *tree.CancelJob:
 		return p.CancelJob(ctx, n)
 	case *tree.CreateUser:
 		return p.CreateUser(ctx, n)
+	case *tree.CreateTable:
+		return p.CreateTable(ctx, n)
 	case *tree.Delete:
 		return p.Delete(ctx, n, nil)
 	case *tree.DropUser:
@@ -773,12 +874,16 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.ShowQueries(ctx, n)
 	case *tree.ShowJobs:
 		return p.ShowJobs(ctx, n)
+	case *tree.ShowRoleGrants:
+		return p.ShowRoleGrants(ctx, n)
 	case *tree.ShowRoles:
 		return p.ShowRoles(ctx, n)
 	case *tree.ShowSessions:
 		return p.ShowSessions(ctx, n)
 	case *tree.ShowTables:
 		return p.ShowTables(ctx, n)
+	case *tree.ShowSchemas:
+		return p.ShowSchemas(ctx, n)
 	case *tree.ShowTrace:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowUsers:

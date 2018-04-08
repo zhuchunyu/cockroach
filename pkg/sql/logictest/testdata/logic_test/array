@@ -61,6 +61,11 @@ SELECT NULL::INT[]
 ----
 NULL
 
+query BB
+SELECT NULL::INT[] IS DISTINCT FROM NULL, ARRAY[1,2,3] IS DISTINCT FROM NULL
+----
+false true
+
 # #19821
 
 query T
@@ -143,9 +148,13 @@ SELECT ARRAY[1,2,3]::UUID[]
 query error invalid cast: inet[] -> INT[]
 SELECT ARRAY['8.8.8.8'::INET, '8.8.4.4'::INET]::INT[]
 
-# this _should_ be valid, but isn't, yet
-query error invalid cast: int[] -> TEXT[]
+query T
 SELECT ARRAY[1,2,3]::TEXT[]
+----
+{"1","2","3"}
+
+statement error invalid cast: int\[\] -> INT2VECTOR
+SELECT ARRAY[1,2,3]::INT2VECTOR
 
 # array subscript access
 
@@ -275,7 +284,7 @@ c
 query T
 SELECT current_schemas(true)[1]
 ----
-test
+pg_catalog
 
 # From a CASE sub-expression.
 query I
@@ -1016,3 +1025,71 @@ query T
 SELECT ARRAY_POSITIONS(NULL::STRING[], 'A')
 ----
 NULL
+
+query T
+SELECT STRING_TO_ARRAY('axbxc', 'x')
+----
+{"a","b","c"}
+
+query T
+SELECT STRING_TO_ARRAY('~a~~b~c', '~')
+----
+{"","a","","b","c"}
+
+query T
+SELECT STRING_TO_ARRAY('~foo~~bar~baz', '~', 'bar')
+----
+{"","foo","",NULL,"baz"}
+
+query T
+SELECT STRING_TO_ARRAY('xx~^~yy~^~zz', '~^~', 'yy')
+----
+{"xx",NULL,"zz"}
+
+query T
+SELECT STRING_TO_ARRAY('foo', '')
+----
+{"foo"}
+
+query T
+SELECT STRING_TO_ARRAY('', '')
+----
+{}
+
+query T
+SELECT STRING_TO_ARRAY('', 'foo')
+----
+{}
+
+query T
+SELECT STRING_TO_ARRAY('a', NULL)
+----
+{"a"}
+
+query T
+SELECT STRING_TO_ARRAY(NULL, 'a')
+----
+NULL
+
+query T
+SELECT STRING_TO_ARRAY(NULL, 'a', 'b')
+----
+NULL
+
+query T
+SELECT STRING_TO_ARRAY('a', 'foo', NULL)
+----
+{"a"}
+
+query T
+SELECT STRING_TO_ARRAY('foofoofoofoo', 'foo', 'foo')
+----
+{"","","","",""}
+
+# Regression test for #23429.
+
+statement ok
+CREATE TABLE x (a STRING[], b INT[])
+
+statement ok
+UPDATE x SET a = ARRAY[], b = ARRAY[]

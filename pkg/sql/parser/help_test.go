@@ -73,6 +73,11 @@ func TestContextualHelp(t *testing.T) {
 		{`CANCEL ??`, `CANCEL`},
 		{`CANCEL JOB ??`, `CANCEL JOB`},
 		{`CANCEL QUERY ??`, `CANCEL QUERY`},
+		{`CANCEL QUERY IF ??`, `CANCEL QUERY`},
+		{`CANCEL QUERY IF EXISTS ??`, `CANCEL QUERY`},
+		{`CANCEL SESSION ??`, `CANCEL SESSION`},
+		{`CANCEL SESSION IF ??`, `CANCEL SESSION`},
+		{`CANCEL SESSION IF EXISTS ??`, `CANCEL SESSION`},
 
 		{`CREATE UNIQUE ??`, `CREATE`},
 		{`CREATE UNIQUE INDEX ??`, `CREATE INDEX`},
@@ -255,12 +260,19 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW GRANTS ON foo FOR ??`, `SHOW GRANTS`},
 		{`SHOW GRANTS ON foo FOR bar ??`, `SHOW GRANTS`},
 
+		{`SHOW GRANTS ON ROLE ??`, `SHOW GRANTS`},
+		{`SHOW GRANTS ON ROLE foo FOR ??`, `SHOW GRANTS`},
+		{`SHOW GRANTS ON ROLE foo FOR bar ??`, `SHOW GRANTS`},
+
 		{`SHOW KEYS ??`, `SHOW INDEXES`},
 		{`SHOW INDEX ??`, `SHOW INDEXES`},
 		{`SHOW INDEXES FROM ??`, `SHOW INDEXES`},
 		{`SHOW INDEXES FROM blah ??`, `SHOW INDEXES`},
 
 		{`SHOW ROLES ??`, `SHOW ROLES`},
+
+		{`SHOW SCHEMAS FROM ??`, `SHOW SCHEMAS`},
+		{`SHOW SCHEMAS FROM blah ??`, `SHOW SCHEMAS`},
 
 		{`SHOW TABLES FROM ??`, `SHOW TABLES`},
 		{`SHOW TABLES FROM blah ??`, `SHOW TABLES`},
@@ -309,6 +321,8 @@ func TestContextualHelp(t *testing.T) {
 
 		{`SET CLUSTER ??`, `SET CLUSTER SETTING`},
 		{`SET CLUSTER SETTING blah = 42 ??`, `SET CLUSTER SETTING`},
+
+		{`USE ??`, `USE`},
 
 		{`RESET blah ??`, `RESET`},
 		{`RESET SESSION ??`, `RESET`},

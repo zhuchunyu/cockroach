@@ -2,11 +2,19 @@
 
 set -euo pipefail
 
+cd "$(dirname "${0}")/.."
+source build/shlib.sh
+
 export CLOUDSDK_CORE_PROJECT=${CLOUDSDK_CORE_PROJECT-${GCEWORKER_PROJECT-cockroach-workers}}
 export CLOUDSDK_COMPUTE_ZONE=${GCEWORKER_ZONE-${CLOUDSDK_COMPUTE_ZONE-us-east1-b}}
 NAME=${GCEWORKER_NAME-gceworker-$(id -un)}
 
-case ${1-} in
+cmd=${1-}
+if [[ "${cmd}" ]]; then
+  shift
+fi
+
+case "${cmd}" in
     create)
     gcloud compute instances \
            create "${NAME}" \
@@ -21,9 +29,9 @@ case ${1-} in
            --scopes "default,cloud-platform"
 
     # Retry while vm and sshd to start up.
-    "$(dirname "${0}")/travis_retry.sh" gcloud compute ssh "${NAME}" --command=true
+    retry gcloud compute ssh "${NAME}" --command=true
 
-    gcloud compute copy-files "$(dirname "${0}")/../build/bootstrap" "${NAME}:bootstrap"
+    gcloud compute copy-files "build/bootstrap" "${NAME}:bootstrap"
     gcloud compute ssh "${NAME}" --ssh-flag="-A" --command="./bootstrap/bootstrap-debian.sh"
 
     # Install automatic shutdown after ten minutes of operation without a
@@ -41,11 +49,47 @@ case ${1-} in
     gcloud compute instances delete "${NAME}"
     ;;
     ssh)
-    shift
-    gcloud compute ssh "${NAME}" --ssh-flag="-A" "$@"
+    retry gcloud compute ssh "${NAME}" --ssh-flag="-A" "$@"
+    ;;
+    ip)
+    gcloud compute instances describe --format="value(networkInterfaces[0].accessConfigs[0].natIP)" "${NAME}"
+    ;;
+    sync)
+    if ! hash unison 2>/dev/null; then
+      echo 'unison not found (on macOS, run `brew install unison`)' >&2
+      exit 1
+    fi
+    if ! hash unison-fsmonitor 2>/dev/null; then
+      echo 'unison-fsmonitor not installed (on macOS, run `brew install eugenmayer/dockersync/unox`)'
+      exit 1
+    fi
+    if (( $# == 0 )); then
+      host=.  # Sync the Cockroach repo by default.
+      worker=go/src/github.com/cockroachdb/cockroach
+    elif (( $# == 2 )); then
+      host=$1
+      worker=$2
+    else
+      echo "usage: $0 mount [HOST-PATH WORKER-PATH]" >&2
+      exit 1
+    fi
+    read -p "Warning: sync will overwrite files on the GCE worker with your local copy. Continue? (Y/n) "
+    if [[ "$REPLY" && "$REPLY" != [Yy] ]]; then
+      exit 1
+    fi
+    tmpfile=$(mktemp)
+    trap 'rm -f ${tmpfile}' EXIT
+    gcloud compute config-ssh --ssh-config-file "$tmpfile" > /dev/null
+    unison "$host" "ssh://${NAME}.${CLOUDSDK_COMPUTE_ZONE}.${CLOUDSDK_CORE_PROJECT}/$worker" \
+      -sshargs "-F ${tmpfile}" -auto -prefer "$host" -repeat watch \
+      -ignore 'Path bin*' \
+      -ignore 'Path build/builder_home' \
+      -ignore 'Path pkg/sql/parser/gen' \
+      -ignore 'Path cockroach-data' \
+      -ignore 'Name zcgo_flags*.go'
     ;;
     *)
-    echo "$0: unknown command: ${1-}, use one of create, start, stop, delete, or ssh"
+    echo "$0: unknown command: ${cmd}, use one of create, start, stop, delete, ssh, or sync"
     exit 1
     ;;
 esac

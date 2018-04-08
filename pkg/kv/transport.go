@@ -42,7 +42,6 @@ type SendOptions struct {
 
 type batchClient struct {
 	remoteAddr string
-	conn       *rpc.Connection
 	args       roachpb.BatchRequest
 	healthy    bool
 	pending    bool
@@ -118,15 +117,14 @@ func grpcTransportFactoryImpl(
 ) (Transport, error) {
 	clients := make([]batchClient, 0, len(replicas))
 	for _, replica := range replicas {
-		conn := rpcContext.GRPCDial(replica.NodeDesc.Address.String())
 		argsCopy := args
 		argsCopy.Replica = replica.ReplicaDescriptor
 		remoteAddr := replica.NodeDesc.Address.String()
+		healthy := rpcContext.ConnHealth(remoteAddr) == nil
 		clients = append(clients, batchClient{
 			remoteAddr: remoteAddr,
-			conn:       conn,
 			args:       argsCopy,
-			healthy:    rpcContext.ConnHealth(remoteAddr) == nil,
+			healthy:    healthy,
 		})
 	}
 
@@ -236,7 +234,7 @@ func (gt *grpcTransport) send(
 			log.VEvent(ctx, 2, "sending request to local server")
 
 			// Create a new context from the existing one with the "local request" field set.
-			// This tells the handler that this is an in-procress request, bypassing ctx.Peer checks.
+			// This tells the handler that this is an in-process request, bypassing ctx.Peer checks.
 			localCtx := grpcutil.NewLocalRequestContext(ctx)
 
 			gt.opts.metrics.LocalSentCount.Inc(1)
@@ -244,7 +242,7 @@ func (gt *grpcTransport) send(
 		}
 
 		log.VEventf(ctx, 2, "sending request to %s", client.remoteAddr)
-		conn, err := client.conn.Connect(ctx)
+		conn, err := gt.rpcContext.GRPCDial(client.remoteAddr).Connect(ctx)
 		if err != nil {
 			return nil, err
 		}

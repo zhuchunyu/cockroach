@@ -17,11 +17,17 @@ SHOW DATABASES
 ----
 Database
 a
+system
+test
+
+query T colnames
+SHOW SCHEMAS FROM a
+----
+Schema
 crdb_internal
 information_schema
 pg_catalog
-system
-test
+public
 
 statement ok
 CREATE DATABASE b TEMPLATE=template0
@@ -79,9 +85,6 @@ b4
 b5
 b6
 c
-crdb_internal
-information_schema
-pg_catalog
 system
 test
 
@@ -104,7 +107,7 @@ DROP DATABASE b RESTRICT
 statement ok
 DROP DATABASE b CASCADE
 
-statement error database "b" does not exist
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement error database "b" does not exist
@@ -129,16 +132,13 @@ SHOW DATABASES
 Database
 a
 c
-crdb_internal
-information_schema
-pg_catalog
 system
 test
 
 statement ok
 CREATE DATABASE b
 
-statement error relation "b.a" does not exist
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement ok

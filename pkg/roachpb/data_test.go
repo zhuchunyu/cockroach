@@ -210,6 +210,71 @@ func TestIsPrev(t *testing.T) {
 	}
 }
 
+func TestValueDataEquals(t *testing.T) {
+	strVal := func(s string) *Value {
+		var v Value
+		v.SetString(s)
+		return &v
+	}
+
+	a := strVal("val1")
+
+	b := strVal("val1")
+	b.InitChecksum([]byte("key1"))
+
+	c := strVal("val1")
+	c.InitChecksum([]byte("key2"))
+
+	// Different values.
+	d := strVal("val2")
+
+	e := strVal("val2")
+	e.InitChecksum([]byte("key1"))
+
+	// Different tags.
+	f := strVal("val1")
+	f.setTag(ValueType_INT)
+
+	g := strVal("val1")
+	g.setTag(ValueType_INT)
+	g.InitChecksum([]byte("key1"))
+
+	for i, tc := range []struct {
+		v1, v2 *Value
+		eq     bool
+	}{
+		{v1: a, v2: b, eq: true},
+		{v1: a, v2: c, eq: true},
+		{v1: a, v2: d, eq: false},
+		{v1: a, v2: e, eq: false},
+		{v1: a, v2: f, eq: false},
+		{v1: a, v2: g, eq: false},
+		{v1: b, v2: c, eq: true},
+		{v1: b, v2: d, eq: false},
+		{v1: b, v2: e, eq: false},
+		{v1: b, v2: f, eq: false},
+		{v1: b, v2: g, eq: false},
+		{v1: c, v2: d, eq: false},
+		{v1: c, v2: e, eq: false},
+		{v1: c, v2: f, eq: false},
+		{v1: c, v2: g, eq: false},
+		{v1: d, v2: e, eq: true},
+		{v1: d, v2: f, eq: false},
+		{v1: d, v2: g, eq: false},
+		{v1: e, v2: f, eq: false},
+		{v1: e, v2: g, eq: false},
+		{v1: f, v2: g, eq: true},
+	} {
+		if tc.eq != tc.v1.EqualData(*tc.v2) {
+			t.Errorf("%d: wanted eq=%t", i, tc.eq)
+		}
+		// Test symmetry.
+		if tc.eq != tc.v2.EqualData(*tc.v1) {
+			t.Errorf("%d: wanted eq=%t", i, tc.eq)
+		}
+	}
+}
+
 func TestValueChecksumEmpty(t *testing.T) {
 	k := []byte("key")
 	v := Value{}
@@ -419,17 +484,19 @@ var nonZeroTxn = Transaction{
 		Sequence:   123,
 		BatchIndex: 1,
 	},
-	Name:               "name",
-	Status:             COMMITTED,
-	LastHeartbeat:      makeTS(1, 2),
-	OrigTimestamp:      makeTS(30, 31),
-	MaxTimestamp:       makeTS(40, 41),
-	ObservedTimestamps: []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
-	Writing:            true,
-	WriteTooOld:        true,
-	RetryOnPush:        true,
-	Intents:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
-	EpochZeroTimestamp: makeTS(1, 1),
+	Name:                     "name",
+	Status:                   COMMITTED,
+	LastHeartbeat:            makeTS(1, 2),
+	OrigTimestamp:            makeTS(30, 31),
+	RefreshedTimestamp:       makeTS(20, 22),
+	MaxTimestamp:             makeTS(40, 41),
+	ObservedTimestamps:       []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
+	Writing:                  true,
+	WriteTooOld:              true,
+	RetryOnPush:              true,
+	Intents:                  []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	EpochZeroTimestamp:       makeTS(1, 1),
+	OrigTimestampWasObserved: true,
 }
 
 func TestTransactionUpdate(t *testing.T) {

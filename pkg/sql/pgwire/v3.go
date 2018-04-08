@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"math"
 	"net"
 	"strconv"
 	"time"
@@ -48,22 +47,6 @@ const (
 	authOK                int32 = 0
 	authCleartextPassword int32 = 3
 )
-
-// connResultsBufferSizeBytes refers to the size of the result set which we
-// buffer into memory prior to flushing to the client.
-const connResultsBufferSizeBytes = 16 << 10
-
-// preparedStatementMeta is pgwire-specific metadata which is attached to each
-// sql.PreparedStatement on a v3Conn's sql.Session.
-type preparedStatementMeta struct {
-	inTypes []oid.Oid
-}
-
-// preparedPortalMeta is pgwire-specific metadata which is attached to each
-// sql.PreparedPortal on a v3Conn's sql.Session.
-type preparedPortalMeta struct {
-	outFormats []pgwirebase.FormatCode
-}
 
 // readTimeoutConn overloads net.Conn.Read by periodically calling
 // checkExitConds() and aborting the read if an error is returned.
@@ -140,6 +123,10 @@ type v3Conn struct {
 	sqlMemoryPool *mon.BytesMonitor
 
 	streamingState streamingState
+
+	// curStmtErr is the error encountered during the execution of the current SQL
+	// statement.
+	curStmtErr error
 }
 
 type streamingState struct {
@@ -281,7 +268,7 @@ func (c *v3Conn) handleAuthentication(ctx context.Context, insecure bool) error 
 	// Check that the requested user exists and retrieve the hashed
 	// password in case password authentication is needed.
 	exists, hashedPassword, err := sql.GetUserHashedPassword(
-		ctx, c.executor, c.metrics.internalMemMetrics, c.sessionArgs.User,
+		ctx, c.executor.Cfg(), c.metrics.internalMemMetrics, c.sessionArgs.User,
 	)
 	if err != nil {
 		return c.sendError(err)
@@ -327,8 +314,9 @@ func (c *v3Conn) handleAuthentication(ctx context.Context, insecure bool) error 
 }
 
 func (c *v3Conn) setupSession(ctx context.Context, reserved mon.BoundAccount) error {
+	c.sessionArgs.RemoteAddr = c.conn.RemoteAddr()
 	c.session = sql.NewSession(
-		ctx, c.sessionArgs, c.executor, c.conn.RemoteAddr(), &c.metrics.SQLMemMetrics, c,
+		ctx, c.sessionArgs, c.executor, &c.metrics.SQLMemMetrics, c,
 	)
 	c.session.StartMonitor(c.sqlMemoryPool, reserved)
 	return nil
@@ -345,10 +333,12 @@ func (c *v3Conn) serve(ctx context.Context, draining func() bool, reserved mon.B
 		c.writeBuf.writeTerminatedString(key)
 		c.writeBuf.writeTerminatedString(value)
 		if err := c.writeBuf.finishMsg(c.wr); err != nil {
+			reserved.Close(ctx)
 			return err
 		}
 	}
 	if err := c.wr.Flush(); err != nil {
+		reserved.Close(ctx)
 		return err
 	}
 
@@ -536,13 +526,6 @@ func (c *v3Conn) handleSimpleQuery(buf *pgwirebase.ReadBuffer) error {
 	return c.done()
 }
 
-// maxPreparedStatementArgs is the maximum number of arguments a prepared
-// statement can have when prepared via the Postgres wire protocol. This is not
-// documented by Postgres, but is a consequence of the fact that a 16-bit
-// integer in the wire format is used to indicate the number of values to bind
-// during prepared statement execution.
-const maxPreparedStatementArgs = math.MaxUint16
-
 func (c *v3Conn) handleParse(buf *pgwirebase.ReadBuffer) error {
 	name, err := buf.GetString()
 	if err != nil {
@@ -593,9 +576,10 @@ func (c *v3Conn) handleParse(buf *pgwirebase.ReadBuffer) error {
 	}
 	// Convert the inferred SQL types back to an array of pgwire Oids.
 	inTypes := make([]oid.Oid, 0, len(stmt.TypeHints))
-	if len(stmt.TypeHints) > maxPreparedStatementArgs {
+	if len(stmt.TypeHints) > pgwirebase.MaxPreparedStatementArgs {
 		return c.sendError(pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
-			"more than %d arguments to prepared statement: %d", maxPreparedStatementArgs, len(stmt.TypeHints)))
+			"more than %d arguments to prepared statement: %d",
+			pgwirebase.MaxPreparedStatementArgs, len(stmt.TypeHints)))
 	}
 	for k, t := range stmt.TypeHints {
 		i, err := strconv.Atoi(k)
@@ -627,7 +611,7 @@ func (c *v3Conn) handleParse(buf *pgwirebase.ReadBuffer) error {
 		}
 	}
 	// Attach pgwire-specific metadata to the PreparedStatement.
-	stmt.ProtocolMeta = preparedStatementMeta{inTypes: inTypes}
+	stmt.InTypes = inTypes
 	c.writeBuf.initMsg(pgwirebase.ServerMsgParseComplete)
 	return c.writeBuf.finishMsg(c.wr)
 }
@@ -654,10 +638,9 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *pgwirebase.ReadBuffer)
 			return c.sendError(pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError, "unknown prepared statement %q", name))
 		}
 
-		stmtMeta := stmt.ProtocolMeta.(preparedStatementMeta)
 		c.writeBuf.initMsg(pgwirebase.ServerMsgParameterDescription)
-		c.writeBuf.putInt16(int16(len(stmtMeta.inTypes)))
-		for _, t := range stmtMeta.inTypes {
+		c.writeBuf.putInt16(int16(len(stmt.InTypes)))
+		for _, t := range stmt.InTypes {
 			c.writeBuf.putInt32(int32(t))
 		}
 		if err := c.writeBuf.finishMsg(c.wr); err != nil {
@@ -674,12 +657,10 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *pgwirebase.ReadBuffer)
 			return c.sendError(pgerror.NewErrorf(pgerror.CodeInvalidCursorNameError, "unknown portal %q", name))
 		}
 
-		portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
-
 		if stmtHasNoData(portal.Stmt.Statement) {
 			return c.sendNoData(c.wr)
 		}
-		return c.sendRowDescription(ctx, portal.Stmt.Columns, portalMeta.outFormats, c.wr)
+		return c.sendRowDescription(ctx, portal.Stmt.Columns, portal.OutFormats, c.wr)
 	default:
 		return errors.Errorf("unknown describe type: %s", typ)
 	}
@@ -726,8 +707,7 @@ func (c *v3Conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) err
 		return c.sendError(pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError, "unknown prepared statement %q", statementName))
 	}
 
-	stmtMeta := stmt.ProtocolMeta.(preparedStatementMeta)
-	numQArgs := uint16(len(stmtMeta.inTypes))
+	numQArgs := uint16(len(stmt.InTypes))
 	qArgFormatCodes := make([]pgwirebase.FormatCode, numQArgs)
 	// From the docs on number of argument format codes to bind:
 	// This can be zero to indicate that there are no arguments or that the
@@ -772,7 +752,7 @@ func (c *v3Conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) err
 		return c.sendError(pgerror.NewErrorf(pgerror.CodeProtocolViolationError, "expected %d arguments, got %d", numQArgs, numValues))
 	}
 	qargs := tree.QueryArguments{}
-	for i, t := range stmtMeta.inTypes {
+	for i, t := range stmt.InTypes {
 		plen, err := buf.GetUint32()
 		if err != nil {
 			return err
@@ -787,7 +767,7 @@ func (c *v3Conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) err
 		if err != nil {
 			return err
 		}
-		d, err := decodeOidDatum(t, qArgFormatCodes[i], b)
+		d, err := pgwirebase.DecodeOidDatum(t, qArgFormatCodes[i], b)
 		if err != nil {
 			return c.sendError(errors.Wrapf(err, "error in argument for $%d", i+1))
 		}
@@ -842,8 +822,7 @@ func (c *v3Conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) err
 		log.Infof(ctx, "portal: %q for %q, args %q, formats %q", portalName, stmt.Statement, qargs, columnFormatCodes)
 	}
 
-	// Attach pgwire-specific metadata to the PreparedPortal.
-	portal.ProtocolMeta = preparedPortalMeta{outFormats: columnFormatCodes}
+	portal.OutFormats = columnFormatCodes
 	c.writeBuf.initMsg(pgwirebase.ServerMsgBindComplete)
 	return c.writeBuf.finishMsg(c.wr)
 }
@@ -864,7 +843,6 @@ func (c *v3Conn) handleExecute(buf *pgwirebase.ReadBuffer) error {
 	}
 
 	stmt := portal.Stmt
-	portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
 	pinfo := &tree.PlaceholderInfo{
 		TypeHints: stmt.TypeHints,
 		Types:     stmt.Types,
@@ -872,7 +850,7 @@ func (c *v3Conn) handleExecute(buf *pgwirebase.ReadBuffer) error {
 	}
 
 	tracing.AnnotateTrace()
-	c.streamingState.reset(portalMeta.outFormats, false /* sendDescription */, int(limit))
+	c.streamingState.reset(portal.OutFormats, false /* sendDescription */, int(limit))
 	c.session.ResultsWriter = c
 	err = c.executor.ExecutePreparedStatement(c.session, stmt, pinfo)
 	if err != nil {
@@ -1030,7 +1008,18 @@ func (c *v3Conn) SetEmptyQuery() {
 
 // SetEmptyQuery implements the ResultsGroup interface.
 func (c *v3Conn) NewStatementResult() sql.StatementResult {
+	c.curStmtErr = nil
 	return c
+}
+
+// SetError is part of the sql.StatementResult interface.
+func (c *v3Conn) SetError(err error) {
+	c.curStmtErr = err
+}
+
+// Err is part of the sql.StatementResult interface.
+func (c *v3Conn) Err() error {
+	return c.curStmtErr
 }
 
 // ResultsSentToClient implements the ResultsGroup interface.
@@ -1273,7 +1262,7 @@ func (c *v3Conn) flush(forceSend bool) error {
 		return nil
 	}
 
-	if forceSend || state.buf.Len() > connResultsBufferSizeBytes {
+	if forceSend || state.buf.Len() > c.executor.Cfg().ConnResultsBufferBytes {
 		state.hasSentResults = true
 		state.txnStartIdx = 0
 		if _, err := state.buf.WriteTo(c.wr); err != nil {
@@ -1290,11 +1279,6 @@ func (c *v3Conn) flush(forceSend bool) error {
 // Rd is part of the pgwirebase.Conn interface.
 func (c *v3Conn) Rd() pgwirebase.BufferedReader {
 	return &pgwireReader{conn: c}
-}
-
-// SendError is part of te pgwirebase.Conn interface.
-func (c *v3Conn) SendError(err error) error {
-	return c.sendError(err)
 }
 
 // SendCommandComplete is part of the pgwirebase.Conn interface.

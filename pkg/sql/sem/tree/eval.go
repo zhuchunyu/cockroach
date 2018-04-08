@@ -175,19 +175,27 @@ var UnaryOps = map[UnaryOperator]unaryOpOverload{
 				return NewDInt(^MustBeDInt(d)), nil
 			},
 		},
+		UnaryOp{
+			Typ:        types.INet,
+			ReturnType: types.INet,
+			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(d).IPAddr
+				return NewDIPAddr(DIPAddr{ipAddr.Complement()}), nil
+			},
+		},
 	},
 }
 
 // BinOp is a binary operator.
 type BinOp struct {
-	LeftType   types.T
-	RightType  types.T
-	ReturnType types.T
-	fn         func(*EvalContext, Datum, Datum) (Datum, error)
+	LeftType     types.T
+	RightType    types.T
+	ReturnType   types.T
+	NullableArgs bool
+	fn           func(*EvalContext, Datum, Datum) (Datum, error)
 
-	types        TypeList
-	retType      ReturnTyper
-	nullableArgs bool
+	types   TypeList
+	retType ReturnTyper
 }
 
 func (op BinOp) params() TypeList {
@@ -251,7 +259,7 @@ func initArrayElementConcatenation() {
 			LeftType:     types.TArray{Typ: typ},
 			RightType:    typ,
 			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
+			NullableArgs: true,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return AppendToMaybeNullArray(typ, left, right)
 			},
@@ -261,7 +269,7 @@ func initArrayElementConcatenation() {
 			LeftType:     typ,
 			RightType:    types.TArray{Typ: typ},
 			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
+			NullableArgs: true,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return PrependToMaybeNullArray(typ, left, right)
 			},
@@ -299,7 +307,7 @@ func initArrayToArrayConcatenation() {
 			LeftType:     types.TArray{Typ: typ},
 			RightType:    types.TArray{Typ: typ},
 			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
+			NullableArgs: true,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return ConcatArrays(typ, left, right)
 			},
@@ -376,6 +384,17 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDInt(MustBeDInt(left) & MustBeDInt(right)), nil
 			},
 		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.And(&other)
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
+			},
+		},
 	},
 
 	Bitor: {
@@ -385,6 +404,17 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Int,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) | MustBeDInt(right)), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.Or(&other)
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
@@ -576,6 +606,28 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return MakeDTimestampTZ(t, time.Microsecond), nil
 			},
 		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.Int,
+			ReturnType: types.INet,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				i := MustBeDInt(right)
+				newIPAddr, err := ipAddr.Add(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
+			},
+		},
+		BinOp{
+			LeftType:   types.Int,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				i := MustBeDInt(left)
+				ipAddr := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.Add(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
+			},
+		},
 	},
 
 	Minus: {
@@ -762,7 +814,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			RightType:  types.String,
 			ReturnType: types.JSON,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				j, err := left.(*DJSON).JSON.RemoveKey(string(MustBeDString(right)))
+				j, _, err := left.(*DJSON).JSON.RemoveKey(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
 				}
@@ -774,11 +826,34 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			RightType:  types.Int,
 			ReturnType: types.JSON,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				j, err := left.(*DJSON).JSON.RemoveIndex(int(MustBeDInt(right)))
+				j, _, err := left.(*DJSON).JSON.RemoveIndex(int(MustBeDInt(right)))
 				if err != nil {
 					return nil, err
 				}
 				return &DJSON{j}, nil
+			},
+		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Int,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				diff, err := ipAddr.SubIPAddr(&other)
+				return NewDInt(DInt(diff)), err
+			},
+		},
+		BinOp{
+			// Note: postgres ver 10 does NOT have Int - INet. Throws ERROR: 42883.
+			LeftType:   types.INet,
+			RightType:  types.Int,
+			ReturnType: types.INet,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				i := MustBeDInt(right)
+				newIPAddr, err := ipAddr.Sub(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
@@ -825,8 +900,9 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		// The following two overloads are needed becauase DInt/DInt = DDecimal. Due to this
-		// operation, normalization may sometimes create a DInt * DDecimal operation.
+		// The following two overloads are needed because DInt/DInt = DDecimal. Due
+		// to this operation, normalization may sometimes create a DInt * DDecimal
+		// operation.
 		BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
@@ -925,7 +1001,10 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				div := ctx.getTmpDec().SetCoefficient(int64(rInt)).SetExponent(0)
 				dd := &DDecimal{}
 				dd.SetCoefficient(int64(MustBeDInt(left)))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
@@ -945,7 +1024,10 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				_, err := DecimalCtx.Quo(&dd.Decimal, l, r)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, l, r)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
@@ -958,7 +1040,10 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
 				dd.SetCoefficient(int64(r))
-				_, err := DecimalCtx.Quo(&dd.Decimal, l, &dd.Decimal)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, l, &dd.Decimal)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
@@ -971,7 +1056,10 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
 				dd.SetCoefficient(int64(l))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, r)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, r)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
@@ -1172,6 +1260,16 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDInt(MustBeDInt(left) << uint(MustBeDInt(right))), nil
 			},
 		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Bool,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				return MakeDBool(DBool(ipAddr.ContainedBy(&other))), nil
+			},
+		},
 	},
 
 	RShift: {
@@ -1181,6 +1279,16 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Int,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) >> uint(MustBeDInt(right))), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Bool,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				return MakeDBool(DBool(ipAddr.Contains(&other))), nil
 			},
 		},
 	},
@@ -1243,7 +1351,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchVal: {
+	JSONFetchVal: {
 		BinOp{
 			LeftType:   types.JSON,
 			RightType:  types.String,
@@ -1276,7 +1384,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchValPath: {
+	JSONFetchValPath: {
 		BinOp{
 			LeftType:   types.JSON,
 			RightType:  types.TArray{Typ: types.String},
@@ -1287,7 +1395,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchText: {
+	JSONFetchText: {
 		BinOp{
 			LeftType:   types.JSON,
 			RightType:  types.String,
@@ -1334,7 +1442,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchTextPath: {
+	JSONFetchTextPath: {
 		BinOp{
 			LeftType:   types.JSON,
 			RightType:  types.TArray{Typ: types.String},
@@ -1380,10 +1488,15 @@ type CmpOp struct {
 	LeftType  types.T
 	RightType types.T
 
+	// If NullableArgs is false, the operator returns NULL
+	// whenever either argument is NULL.
+	NullableArgs bool
+
 	// Datum return type is a union between *DBool and dNull.
 	fn func(*EvalContext, Datum, Datum) (Datum, error)
 
-	types TypeList
+	types       TypeList
+	isPreferred bool
 }
 
 func (op CmpOp) params() TypeList {
@@ -1400,8 +1513,8 @@ func (op CmpOp) returnType() ReturnTyper {
 	return cmpOpReturnType
 }
 
-func (CmpOp) preferred() bool {
-	return false
+func (op CmpOp) preferred() bool {
+	return op.isPreferred
 }
 
 func init() {
@@ -1411,6 +1524,13 @@ func init() {
 			LeftType:  types.TArray{Typ: t},
 			RightType: types.TArray{Typ: t},
 			fn:        cmpOpScalarEQFn,
+		})
+
+		CmpOps[IsNotDistinctFrom] = append(CmpOps[IsNotDistinctFrom], CmpOp{
+			LeftType:     types.TArray{Typ: t},
+			RightType:    types.TArray{Typ: t},
+			fn:           cmpOpScalarIsFn,
+			NullableArgs: true,
 		})
 	}
 }
@@ -1439,23 +1559,27 @@ func (o cmpOpOverload) lookupImpl(left, right types.T) (CmpOp, bool) {
 }
 
 func makeCmpOpOverload(
-	fn func(ctx *EvalContext, left, right Datum) (Datum, error), a, b types.T,
+	fn func(ctx *EvalContext, left, right Datum) (Datum, error), a, b types.T, nullableArgs bool,
 ) CmpOp {
 	return CmpOp{
-		LeftType:  a,
-		RightType: b,
-		fn:        fn,
+		LeftType:     a,
+		RightType:    b,
+		fn:           fn,
+		NullableArgs: nullableArgs,
 	}
 }
 
 func makeEqFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarEQFn, a, b)
+	return makeCmpOpOverload(cmpOpScalarEQFn, a, b, false /* NullableArgs */)
 }
 func makeLtFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarLTFn, a, b)
+	return makeCmpOpOverload(cmpOpScalarLTFn, a, b, false /* NullableArgs */)
 }
 func makeLeFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarLEFn, a, b)
+	return makeCmpOpOverload(cmpOpScalarLEFn, a, b, false /* NullableArgs */)
+}
+func makeIsFn(a, b types.T) CmpOp {
+	return makeCmpOpOverload(cmpOpScalarIsFn, a, b, true /* NullableArgs */)
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
@@ -1587,6 +1711,60 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
+	IsNotDistinctFrom: {
+		CmpOp{
+			LeftType:     types.Unknown,
+			RightType:    types.Unknown,
+			fn:           cmpOpScalarIsFn,
+			NullableArgs: true,
+			// Avoids ambiguous comparison error for NULL IS NOT DISTINCT FROM NULL>
+			isPreferred: true,
+		},
+		// Single-type comparisons.
+		makeIsFn(types.Bool, types.Bool),
+		makeIsFn(types.Bytes, types.Bytes),
+		makeIsFn(types.Date, types.Date),
+		makeIsFn(types.Decimal, types.Decimal),
+		makeIsFn(types.FamCollatedString, types.FamCollatedString),
+		makeIsFn(types.Float, types.Float),
+		makeIsFn(types.INet, types.INet),
+		makeIsFn(types.Int, types.Int),
+		makeIsFn(types.Interval, types.Interval),
+		makeIsFn(types.JSON, types.JSON),
+		makeIsFn(types.Oid, types.Oid),
+		makeIsFn(types.String, types.String),
+		makeIsFn(types.Time, types.Time),
+		makeIsFn(types.Timestamp, types.Timestamp),
+		makeIsFn(types.TimestampTZ, types.TimestampTZ),
+		makeIsFn(types.UUID, types.UUID),
+
+		// Mixed-type comparisons.
+		makeIsFn(types.Date, types.Timestamp),
+		makeIsFn(types.Date, types.TimestampTZ),
+		makeIsFn(types.Decimal, types.Float),
+		makeIsFn(types.Decimal, types.Int),
+		makeIsFn(types.Float, types.Decimal),
+		makeIsFn(types.Float, types.Int),
+		makeIsFn(types.Int, types.Decimal),
+		makeIsFn(types.Int, types.Float),
+		makeIsFn(types.Timestamp, types.Date),
+		makeIsFn(types.Timestamp, types.TimestampTZ),
+		makeIsFn(types.TimestampTZ, types.Date),
+		makeIsFn(types.TimestampTZ, types.Timestamp),
+
+		// Tuple comparison.
+		CmpOp{
+			LeftType:  types.FamTuple,
+			RightType: types.FamTuple,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				if left == DNull || right == DNull {
+					return MakeDBool(left == DNull && right == DNull), nil
+				}
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), IsNotDistinctFrom), nil
+			},
+		},
+	},
+
 	In: {
 		makeEvalTupleIn(types.Bool),
 		makeEvalTupleIn(types.Bytes),
@@ -1660,7 +1838,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
-	Existence: {
+	JSONExists: {
 		CmpOp{
 			LeftType:  types.JSON,
 			RightType: types.String,
@@ -1677,7 +1855,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
-	SomeExistence: {
+	JSONSomeExists: {
 		CmpOp{
 			LeftType:  types.JSON,
 			RightType: types.TArray{Typ: types.String},
@@ -1697,7 +1875,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
-	AllExistence: {
+	JSONAllExists: {
 		CmpOp{
 			LeftType:  types.JSON,
 			RightType: types.TArray{Typ: types.String},
@@ -1746,9 +1924,25 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 	},
 }
 
+// This map contains the inverses for operators in the CmpOps map that have
+// inverses.
+var cmpOpsInverse map[ComparisonOperator]ComparisonOperator
+
+func init() {
+	cmpOpsInverse = make(map[ComparisonOperator]ComparisonOperator)
+	for cmpOpIdx := range comparisonOpName {
+		cmpOp := ComparisonOperator(cmpOpIdx)
+		newOp, _, _, _, _ := foldComparisonExpr(cmpOp, DNull, DNull)
+		if newOp != cmpOp {
+			cmpOpsInverse[newOp] = cmpOp
+			cmpOpsInverse[cmpOp] = newOp
+		}
+	}
+}
+
 func boolFromCmp(cmp int, op ComparisonOperator) *DBool {
 	switch op {
-	case EQ:
+	case EQ, IsNotDistinctFrom:
 		return MakeDBool(cmp == 0)
 	case LT:
 		return MakeDBool(cmp < 0)
@@ -1764,8 +1958,14 @@ func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op ComparisonOperator) D
 	// be handled differently during SQL comparison evaluation than they should when
 	// ordering Datum values.
 	if left == DNull || right == DNull {
-		// If either Datum is NULL, the result of the comparison is NULL.
-		return DNull
+		switch op {
+		case IsNotDistinctFrom:
+			return MakeDBool((left == DNull) == (right == DNull))
+
+		default:
+			// If either Datum is NULL, the result of the comparison is NULL.
+			return DNull
+		}
 	}
 	cmp := left.Compare(ctx, right)
 	return boolFromCmp(cmp, op)
@@ -1780,6 +1980,9 @@ func cmpOpScalarLTFn(ctx *EvalContext, left, right Datum) (Datum, error) {
 func cmpOpScalarLEFn(ctx *EvalContext, left, right Datum) (Datum, error) {
 	return cmpOpScalarFn(ctx, left, right, LE), nil
 }
+func cmpOpScalarIsFn(ctx *EvalContext, left, right Datum) (Datum, error) {
+	return cmpOpScalarFn(ctx, left, right, IsNotDistinctFrom), nil
+}
 
 func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op ComparisonOperator) Datum {
 	cmp := 0
@@ -1789,26 +1992,34 @@ func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op ComparisonOperator) D
 		// Like with cmpOpScalarFn, check for values that need to be handled
 		// differently than when ordering Datums.
 		if leftElem == DNull || rightElem == DNull {
-			if op == EQ {
+			switch op {
+			case EQ:
 				// If either Datum is NULL and the op is EQ, we continue the
 				// comparison and the result is only NULL if the other (non-NULL)
 				// elements are equal. This is because NULL is thought of as "unknown",
 				// so a NULL equality comparison does not prevent the equality from
 				// being proven false, but does prevent it from being proven true.
 				sawNull = true
-				continue
-			} else {
-				// If either Datum is NULL and the op is not EQ, we short-circuit
-				// the evaluation and the result of the comparison is NULL. This is
-				// because NULL is thought of as "unknown" and tuple inequality is
-				// defined lexicographically, so once a NULL comparison is seen,
-				// the result of the entire tuple comparison is unknown.
+
+			case IsNotDistinctFrom:
+				// For IS NOT DISTINCT FROM, NULLs are "equal".
+				if leftElem != DNull || rightElem != DNull {
+					return DBoolFalse
+				}
+
+			default:
+				// If either Datum is NULL and the op is not EQ or IS NOT DISTINCT FROM,
+				// we short-circuit the evaluation and the result of the comparison is
+				// NULL. This is because NULL is thought of as "unknown" and tuple
+				// inequality is defined lexicographically, so once a NULL comparison is
+				// seen, the result of the entire tuple comparison is unknown.
 				return DNull
 			}
-		}
-		cmp = leftElem.Compare(ctx, rightElem)
-		if cmp != 0 {
-			break
+		} else {
+			cmp = leftElem.Compare(ctx, rightElem)
+			if cmp != 0 {
+				break
+			}
 		}
 	}
 	b := boolFromCmp(cmp, op)
@@ -1826,42 +2037,57 @@ func makeEvalTupleIn(typ types.T) CmpOp {
 		LeftType:  typ,
 		RightType: types.FamTuple,
 		fn: func(ctx *EvalContext, arg, values Datum) (Datum, error) {
-			if arg == DNull {
+			vtuple := values.(*DTuple)
+			// If the tuple was sorted during normalization, we can perform an
+			// efficient binary search to find if the arg is in the tuple (as
+			// long as the arg doesn't contain any NULLs).
+			if len(vtuple.D) == 0 {
+				// If the rhs tuple is empty, the result is always false (even if arg is
+				// or contains NULL).
 				return DBoolFalse, nil
 			}
-
-			// If the tuple was sorted during normalization, we can perform
-			// an efficient binary search to find if the arg is in the tuple.
-			vtuple := values.(*DTuple)
-			if vtuple.Sorted {
-				_, found := vtuple.SearchSorted(ctx, arg)
-				if !found && len(vtuple.D) > 0 && vtuple.D[0] == DNull {
-					// If the tuple contained any null elements and no matches are found,
-					// the result of IN will be null. The null element will at the front
-					// if the tuple is sorted because null is less than any non-null value.
-					return DNull, nil
-				}
-				return MakeDBool(DBool(found)), nil
+			if arg == DNull {
+				return DNull, nil
+			}
+			argTuple, argIsTuple := arg.(*DTuple)
+			if vtuple.Sorted() && !(argIsTuple && argTuple.ContainsNull()) {
+				// The right-hand tuple is already sorted and contains no NULLs, and the
+				// left side is not NULL (e.g. `NULL IN (1, 2)`) or a tuple that
+				// contains NULL (e.g. `(1, NULL) IN ((1, 2), (3, 4))`).
+				//
+				// We can use binary search to make a determination in this case. This
+				// is the common case when tuples don't contain NULLs.
+				_, result := vtuple.SearchSorted(ctx, arg)
+				return MakeDBool(DBool(result)), nil
 			}
 
-			// If the tuple was not sorted, which happens in cases where it
-			// is not constant across rows, then we must fall back to iterating
-			// through the entire tuple.
 			sawNull := false
-			for _, val := range vtuple.D {
-				if val == DNull {
-					sawNull = true
-				} else if val.Compare(ctx, arg) == 0 {
-					return DBoolTrue, nil
+			if !argIsTuple {
+				// The left-hand side is not a tuple, e.g. `1 IN (1, 2)`.
+				for _, val := range vtuple.D {
+					if val == DNull {
+						sawNull = true
+					} else if val.Compare(ctx, arg) == 0 {
+						return DBoolTrue, nil
+					}
+				}
+			} else {
+				// The left-hand side is a tuple, e.g. `(1, 2) IN ((1, 2), (3, 4))`.
+				for _, val := range vtuple.D {
+					// Use the EQ function which properly handles NULLs.
+					if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), EQ); res == DNull {
+						sawNull = true
+					} else if res == DBoolTrue {
+						return DBoolTrue, nil
+					}
 				}
 			}
 			if sawNull {
-				// If the tuple contains any null elements and no matches are found, the
-				// result of IN will be null.
 				return DNull, nil
 			}
 			return DBoolFalse, nil
 		},
+		NullableArgs: true,
 	}
 }
 
@@ -1962,26 +2188,39 @@ func (e *MultipleResultsError) Error() string {
 	return fmt.Sprintf("%s: unexpected multiple results", e.SQL)
 }
 
+// EvalDatabase consists of functions that reference the session database
+// and is to be used from EvalContext.
+type EvalDatabase interface {
+	// ParseQualifiedTableName parses a SQL string of the form
+	// `[ database_name . ] [ schema_name . ] table_name`.
+	ParseQualifiedTableName(ctx context.Context, sql string) (*TableName, error)
+
+	// ResolveTableName expands the given table name and
+	// makes it point to a valid object.
+	// If the database name is not given, it uses the search path to find it, and
+	// sets it on the returned TableName.
+	// It returns an error if the table doesn't exist.
+	ResolveTableName(ctx context.Context, tn *TableName) error
+}
+
 // EvalPlanner is a limited planner that can be used from EvalContext.
 type EvalPlanner interface {
+	EvalDatabase
 	// QueryRow executes a SQL query string where exactly 1 result row is
 	// expected and returns that row.
 	QueryRow(ctx context.Context, sql string, args ...interface{}) (Datums, error)
 
-	// QualifyWithDatabase resolves a possibly unqualified table name into a
-	// normalized table name that is qualified by database.
-	QualifyWithDatabase(ctx context.Context, t *NormalizableTableName) (*TableName, error)
-
-	// ParseQualifiedTableName parses a SQL string of the form
-	// `[ database_name . ] table_name [ @ index_name ]`.
-	// If the database name is not given, it uses the search path to find it, and
-	// sets it on the returned TableName.
-	// It returns an error if the table doesn't exist.
-	ParseQualifiedTableName(ctx context.Context, sql string) (*TableName, error)
-
 	// ParseType parses a column type.
 	ParseType(sql string) (coltypes.CastTargetType, error)
 
+	// EvalSubquery returns the Datum for the given subquery node.
+	EvalSubquery(expr *Subquery) (Datum, error)
+}
+
+// SequenceOperators is used for various sql related functions that can
+// be used from EvalContext.
+type SequenceOperators interface {
+	EvalDatabase
 	// IncrementSequence increments the given sequence and returns the result.
 	// It returns an error if the given name is not a sequence.
 	// The caller must ensure that seqName is fully qualified already.
@@ -1996,9 +2235,6 @@ type EvalPlanner interface {
 	// `newVal` is returned. Otherwise, the next call to nextval will return
 	// `newVal + seqOpts.Increment`.
 	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
-
-	// EvalSubquery returns the Datum for the given subquery node.
-	EvalSubquery(expr *Subquery) (Datum, error)
 }
 
 // CtxProvider is anything that can return a Context.
@@ -2076,9 +2312,6 @@ type EvalContext struct {
 	// of a transaction. Used for now(), current_timestamp(),
 	// transaction_timestamp() and the like.
 	TxnTimestamp time.Time
-	// The cluster timestamp. Needs to be stable for the lifetime of the
-	// transaction. Used for cluster_logical_timestamp().
-	ClusterTimestamp hlc.Timestamp
 
 	// Placeholders relates placeholder names to their type and, later, value.
 	// This pointer should always be set to the location of the PlaceholderInfo
@@ -2087,7 +2320,12 @@ type EvalContext struct {
 	// underlying datum, if available.
 	Placeholders *PlaceholderInfo
 
-	IVarHelper *IndexedVarHelper
+	// IVarContainer is used to evaluate IndexedVars.
+	IVarContainer IndexedVarContainer
+	// iVarContainerStack is used when we swap out IVarContainers in order to
+	// evaluate an intermediate expression. This keeps track of those which we
+	// need to restore once we finish evaluating it.
+	iVarContainerStack []IndexedVarContainer
 
 	// CtxProvider holds the context in which the expression is evaluated. This
 	// will point to the session, which is itself a provider of contexts.
@@ -2099,6 +2337,8 @@ type EvalContext struct {
 	CtxProvider CtxProvider
 
 	Planner EvalPlanner
+
+	Sequence SequenceOperators
 
 	// Ths transaction in which the statement is executing.
 	Txn *client.Txn
@@ -2128,9 +2368,11 @@ type EvalContext struct {
 }
 
 // MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
-func MakeTestingEvalContext() EvalContext {
+func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 	ctx := EvalContext{
+		Txn:         &client.Txn{},
 		SessionData: &sessiondata.SessionData{},
+		Settings:    st,
 	}
 	monitor := mon.MakeMonitor(
 		"test-monitor",
@@ -2139,6 +2381,7 @@ func MakeTestingEvalContext() EvalContext {
 		nil,           /* maxHist */
 		-1,            /* increment */
 		math.MaxInt64, /* noteworthy */
+		st,
 	)
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = &monitor
@@ -2146,16 +2389,31 @@ func MakeTestingEvalContext() EvalContext {
 	acc := monitor.MakeBoundAccount()
 	ctx.ActiveMemAcc = &acc
 	now := timeutil.Now()
+	ctx.Txn.Proto().OrigTimestamp = hlc.Timestamp{WallTime: now.Unix()}
 	ctx.SetTxnTimestamp(now)
 	ctx.SetStmtTimestamp(now)
-	ctx.SetClusterTimestamp(hlc.Timestamp{WallTime: now.Unix()})
 	return ctx
+}
+
+// PushIVarContainer replaces the current IVarContainer with a different one -
+// pushing the current one onto a stack to be replaced later once
+// PopIVarContainer is called.
+func (ctx *EvalContext) PushIVarContainer(c IndexedVarContainer) {
+	ctx.iVarContainerStack = append(ctx.iVarContainerStack, ctx.IVarContainer)
+	ctx.IVarContainer = c
+}
+
+// PopIVarContainer discards the current IVarContainer on the EvalContext,
+// replacing it with an older one.
+func (ctx *EvalContext) PopIVarContainer() {
+	ctx.IVarContainer = ctx.iVarContainerStack[len(ctx.iVarContainerStack)-1]
+	ctx.iVarContainerStack = ctx.iVarContainerStack[:len(ctx.iVarContainerStack)-1]
 }
 
 // NewTestingEvalContext is a convenience version of MakeTestingEvalContext
 // that returns a pointer.
-func NewTestingEvalContext() *EvalContext {
-	ctx := MakeTestingEvalContext()
+func NewTestingEvalContext(st *cluster.Settings) *EvalContext {
+	ctx := MakeTestingEvalContext(st)
 	return &ctx
 }
 
@@ -2178,22 +2436,11 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 // GetClusterTimestamp retrieves the current cluster timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetClusterTimestamp() *DDecimal {
-	// TODO(knz): a zero timestamp should never be read, even during
-	// Prepare. This will need to be addressed.
-	if !ctx.PrepareOnly && ctx.ClusterTimestamp == (hlc.Timestamp{}) {
-		panic("zero cluster timestamp in EvalContext")
+	ts := ctx.Txn.CommitTimestamp()
+	if ts == (hlc.Timestamp{}) {
+		panic("zero cluster timestamp in txn")
 	}
-
-	return TimestampToDecimal(ctx.ClusterTimestamp)
-}
-
-// GetClusterTimestampRaw exposes the ClusterTimestamp field. Also see
-// GetClusterTimestamp().
-func (ctx *EvalContext) GetClusterTimestampRaw() hlc.Timestamp {
-	if !ctx.PrepareOnly && ctx.ClusterTimestamp == (hlc.Timestamp{}) {
-		panic("zero cluster timestamp in EvalContext")
-	}
-	return ctx.ClusterTimestamp
+	return TimestampToDecimal(ts)
 }
 
 // HasPlaceholders returns true if this EvalContext's placeholders have been
@@ -2243,15 +2490,6 @@ func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimesta
 	return MakeDTimestamp(ctx.TxnTimestamp, precision)
 }
 
-// GetTxnTimestampRaw exposes the txnTimestamp field. Also see GetTxnTimestamp()
-// and GetTxnTimestampNoZone().
-func (ctx *EvalContext) GetTxnTimestampRaw() time.Time {
-	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
-	}
-	return ctx.TxnTimestamp
-}
-
 // SetTxnTimestamp sets the corresponding timestamp in the EvalContext.
 func (ctx *EvalContext) SetTxnTimestamp(ts time.Time) {
 	ctx.TxnTimestamp = ts
@@ -2260,11 +2498,6 @@ func (ctx *EvalContext) SetTxnTimestamp(ts time.Time) {
 // SetStmtTimestamp sets the corresponding timestamp in the EvalContext.
 func (ctx *EvalContext) SetStmtTimestamp(ts time.Time) {
 	ctx.StmtTimestamp = ts
-}
-
-// SetClusterTimestamp sets the corresponding timestamp in the EvalContext.
-func (ctx *EvalContext) SetClusterTimestamp(ts hlc.Timestamp) {
-	ctx.ClusterTimestamp = ts
 }
 
 // GetLocation returns the session timezone.
@@ -2318,14 +2551,14 @@ func (expr *BinaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 	if err != nil {
 		return nil, err
 	}
-	if left == DNull && !expr.fn.nullableArgs {
+	if left == DNull && !expr.fn.NullableArgs {
 		return DNull, nil
 	}
 	right, err := expr.Right.(TypedExpr).Eval(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if right == DNull && !expr.fn.nullableArgs {
+	if right == DNull && !expr.fn.NullableArgs {
 		return DNull, nil
 	}
 	res, err := expr.fn.fn(ctx, left, right)
@@ -2472,10 +2705,12 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, d)
-	return performCast(ctx, d, expr.Type)
+	return PerformCast(ctx, d, expr.Type)
 }
 
-func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, error) {
+// PerformCast performs a cast from the provided Datum to the specified
+// CastTargetType.
+func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, error) {
 	switch typ := t.(type) {
 	case *coltypes.TBool:
 		switch v := d.(type) {
@@ -2550,7 +2785,9 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DOid:
 			res = &v.DInt
 		}
-		return res, nil
+		if res != nil {
+			return res, nil
+		}
 
 	case *coltypes.TFloat:
 		switch v := d.(type) {
@@ -2583,7 +2820,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return NewDFloat(DFloat(float64(*v))), nil
 		case *DInterval:
 			micros := v.Nanos / 1000
-			return NewDFloat(DFloat(float64(micros) / 1e-6)), nil
+			return NewDFloat(DFloat(float64(micros) / 1e6)), nil
 		}
 
 	case *coltypes.TDecimal:
@@ -2667,6 +2904,8 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			s = buf.String()
 		case *DOid:
 			s = t.name
+		case *DJSON:
+			s = t.JSON.String()
 		}
 		switch c := t.(type) {
 		case *coltypes.TString:
@@ -2683,8 +2922,6 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return NewDCollatedString(s, c.Locale, &ctx.collationEnv), nil
 		case *coltypes.TName:
 			return NewDName(s), nil
-		default:
-			panic(fmt.Sprintf("missing case for cast to string: %T", c))
 		}
 
 	case *coltypes.TBytes:
@@ -2817,9 +3054,18 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DString:
 			return ParseDArrayFromString(ctx, string(*v), typ.ParamType)
 		case *DArray:
-			if (*v).ParamTyp == coltypes.CastTargetToDatumType((*typ).ParamType) {
-				return d, nil
+			paramType := coltypes.CastTargetToDatumType(typ.ParamType)
+			dcast := NewDArray(paramType)
+			for _, e := range v.Array {
+				ecast, err := PerformCast(ctx, e, typ.ParamType)
+				if err != nil {
+					return nil, err
+				}
+				if err = dcast.Append(ecast); err != nil {
+					return nil, err
+				}
 			}
+			return dcast, nil
 		}
 	case *coltypes.TOid:
 		switch v := d.(type) {
@@ -2874,9 +3120,17 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
 				// Resolve function name.
 				substrs := strings.Split(s, ".")
-				name := UnresolvedName{}
-				for i := range substrs {
-					name = append(name, (*Name)(&substrs[i]))
+				if len(substrs) > 3 {
+					// A fully qualified function name in pg's dialect can contain
+					// at most 3 parts: db.schema.funname.
+					// For example mydb.pg_catalog.max().
+					// Anything longer is always invalid.
+					return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+						"invalid function name: %s", s)
+				}
+				name := UnresolvedName{NumParts: len(substrs)}
+				for i := 0; i < len(substrs); i++ {
+					name.Parts[i] = substrs[len(substrs)-1-i]
 				}
 				funcDef, err := name.ResolveFunction(ctx.SessionData.SearchPath)
 				if err != nil {
@@ -2900,13 +3154,16 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 				if err != nil {
 					return nil, err
 				}
+				if err := ctx.Planner.ResolveTableName(ctx.Ctx(), tn); err != nil {
+					return nil, err
+				}
 				// Determining the table's OID requires joining against the databases
 				// table because we only have the database name, not its OID, which is
 				// what is stored in pg_class. This extra join means we can't use
 				// queryOid like everyone else.
 				return queryOidWithJoin(ctx, typ, NewDString(tn.Table()),
 					"JOIN pg_catalog.pg_namespace ON relnamespace = pg_namespace.oid",
-					fmt.Sprintf("AND nspname = '%s'", tn.Database()))
+					fmt.Sprintf("AND nspname = '%s'", tn.Schema()))
 			default:
 				return queryOid(ctx, typ, NewDString(s))
 			}
@@ -2949,9 +3206,12 @@ func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 	// Index into the DArray, using 1-indexing.
 	arr := MustBeDArray(d)
 
-	// INT2VECTOR uses 0-indexing.
-	if w, ok := d.(*DOidWrapper); ok && w.Oid == oid.T_int2vector {
-		subscriptIdx++
+	// VECTOR types use 0-indexing.
+	if w, ok := d.(*DOidWrapper); ok {
+		switch w.Oid {
+		case oid.T_oidvector, oid.T_int2vector:
+			subscriptIdx++
+		}
 	}
 	if subscriptIdx < 1 || subscriptIdx > arr.Len() {
 		return DNull, nil
@@ -2963,7 +3223,7 @@ func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 func (expr *CollateExpr) Eval(ctx *EvalContext) (Datum, error) {
 	d, err := expr.Expr.(TypedExpr).Eval(ctx)
 	if err != nil {
-		return DNull, err
+		return nil, err
 	}
 	unwrapped := UnwrapDatum(ctx, d)
 	if unwrapped == DNull {
@@ -3004,17 +3264,6 @@ func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return nil, err
 	}
 
-	if left == DNull || right == DNull {
-		switch expr.Operator {
-		case IsDistinctFrom:
-			return MakeDBool(!DBool(left == DNull && right == DNull)), nil
-		case IsNotDistinctFrom:
-			return MakeDBool(left == DNull && right == DNull), nil
-		default:
-			return DNull, nil
-		}
-	}
-
 	op := expr.Operator
 	if op.hasSubOperator() {
 		var datums Datums
@@ -3030,6 +3279,9 @@ func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 
 	_, newLeft, newRight, _, not := foldComparisonExpr(op, left, right)
+	if !expr.fn.NullableArgs && (newLeft == DNull || newRight == DNull) {
+		return DNull, nil
+	}
 	d, err := expr.fn.fn(ctx, newLeft.(Datum), newRight.(Datum))
 	if err != nil {
 		return nil, err
@@ -3081,7 +3333,7 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 // provided type. If the expected type is Any or if the datum is a Null
 // type, then no error will be returned.
 func ensureExpectedType(exp types.T, d Datum) error {
-	if !(exp.FamilyEqual(types.Any) || d.ResolvedType().Equivalent(types.Null) ||
+	if !(exp.FamilyEqual(types.Any) || d.ResolvedType().Equivalent(types.Unknown) ||
 		d.ResolvedType().Equivalent(exp)) {
 		return errors.Errorf("expected return type %q, got: %q", exp, d.ResolvedType())
 	}
@@ -3499,17 +3751,10 @@ func foldComparisonExpr(
 		// NotRegIMatch(left, right) is implemented as !RegIMatch(left, right)
 		return RegIMatch, left, right, false, true
 	case IsDistinctFrom:
-		// IsDistinctFrom(left, right) is implemented as !EQ(left, right)
-		//
-		// Note the special handling of NULLs and IS DISTINCT FROM is needed
-		// before this expression fold.
-		return EQ, left, right, false, true
-	case IsNotDistinctFrom:
-		// IsNotDistinctFrom(left, right) is implemented as EQ(left, right)
-		//
-		// Note the special handling of NULLs and IS NOT DISTINCT FROM is needed
-		// before this expression fold.
-		return EQ, left, right, false, false
+		// IsDistinctFrom(left, right) is implemented as !IsNotDistinctFrom(left, right)
+		// Note: this seems backwards, but IS NOT DISTINCT FROM is an extended
+		// version of IS and IS DISTINCT FROM is an extended version of IS NOT.
+		return IsNotDistinctFrom, left, right, false, true
 	}
 	return op, left, right, false, false
 }
@@ -3750,7 +3995,7 @@ OldLoop:
 				break
 			}
 
-			// Token was escaped. Copy eveything over and continue.
+			// Token was escaped. Copy everything over and continue.
 			retWidth += copy(ret[retWidth:], s[start:nextIdx+len(oldStr)])
 			start = nextIdx + len(oldStr)
 

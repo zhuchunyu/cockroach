@@ -76,6 +76,8 @@ const (
 
 	minimumNetworkFileDescriptors     = 256
 	recommendedNetworkFileDescriptors = 5000
+
+	defaultConnResultsBufferBytes = 16 << 10 // 16 KiB
 )
 
 var productionSettingsWebpage = fmt.Sprintf(
@@ -102,7 +104,7 @@ func (mo *MaxOffsetType) Set(v string) error {
 		return err
 	}
 	if nanos > maximumMaxClockOffset {
-		return errors.Errorf("%s is not a valid MaxOffset", v)
+		return errors.Errorf("%s is not a valid max offset, must be less than %v.", v, maximumMaxClockOffset)
 	}
 	*mo = MaxOffsetType(nanos)
 	return nil
@@ -162,6 +164,9 @@ type Config struct {
 	// SQLMemoryPoolSize is the amount of memory in bytes that can be
 	// used by SQL clients to store row data in server RAM.
 	SQLMemoryPoolSize int64
+
+	// SQLAuditLogDirName is the target directory name for SQL audit logs.
+	SQLAuditLogDirName *log.DirName
 
 	// Parsed values.
 
@@ -230,6 +235,18 @@ type Config struct {
 	// EnableWebSessionAuthentication enables session-based authentication for
 	// the Admin API's HTTP endpoints.
 	EnableWebSessionAuthentication bool
+
+	// UseLegacyConnHandling, if set, makes the Server use the old code for
+	// handling pgwire connections.
+	//
+	// TODO(andrei): remove this once the code for the old v3Conn and Executor is
+	// deleted.
+	UseLegacyConnHandling bool
+
+	// ConnResultsBufferBytes is the size of the buffer in which each connection
+	// accumulates results set. Results are flushed to the network when this
+	// buffer overflows.
+	ConnResultsBufferBytes int
 
 	enginesCreated bool
 }
@@ -367,13 +384,15 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 			Specs: []base.StoreSpec{storeSpec},
 		},
 		TempStorageConfig: base.TempStorageConfigFromEnv(
-			ctx, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes),
+			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes),
+		ConnResultsBufferBytes: defaultConnResultsBufferBytes,
 	}
 	cfg.AmbientCtx.Tracer = st.Tracer
 
 	cfg.Config.InitDefaults()
 	cfg.RaftConfig.SetDefaults()
 	cfg.LeaseManagerConfig = base.NewLeaseManagerConfig()
+
 	return cfg
 }
 
@@ -504,6 +523,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				WarnLargeBatchThreshold: 500 * time.Millisecond,
 				Settings:                cfg.Settings,
 				UseSwitchingEnv:         spec.UseSwitchingEnv,
+				RocksDBOptions:          spec.RocksDBOptions,
 				ExtraOptions:            spec.ExtraOptions,
 			}
 
@@ -585,6 +605,8 @@ func (cfg *Config) readEnvironmentVariables() {
 	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_LINEARIZABLE", cfg.Linearizable)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
+	cfg.UseLegacyConnHandling = envutil.EnvOrDefaultBool(
+		"COCKROACH_USE_LEGACY_CONN_HANDLING", false)
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.

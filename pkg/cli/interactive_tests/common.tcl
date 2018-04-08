@@ -102,8 +102,17 @@ proc stop_server {argv} {
     # Trigger a normal shutdown.
     system "$argv quit"
     # If after 5 seconds the server hasn't shut down, trigger an error.
-    system "for i in `seq 1 5`; do kill -CONT `cat server_pid` 2>/dev/null || exit 0; echo still waiting; sleep 1; done; echo 'server still running?'; exit 1"
+    system "for i in `seq 1 5`; do kill -CONT `cat server_pid` 2>/dev/null || exit 0; echo still waiting; sleep 1; done; echo 'server still running?'; exit 0"
+
     report "END STOP SERVER"
+}
+
+proc flush_server_logs {} {
+    report "BEGIN FLUSH LOGS"
+    system "kill -HUP `cat server_pid` 2>/dev/null"
+    # Wait for flush to occur.
+    system "for i in `seq 1 3`; do grep 'hangup received, flushing logs' logs/db/logs/cockroach.log && exit 0; echo still waiting; sleep 1; done; echo 'server failed to flush logs?'; exit 1"
+    report "END FLUSH LOGS"
 }
 
 proc force_stop_server {argv} {

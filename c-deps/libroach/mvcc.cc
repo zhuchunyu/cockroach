@@ -24,12 +24,14 @@ namespace {
 
 bool IsValidSplitKey(const rocksdb::Slice& key, bool allow_meta2_splits) {
   if (key == kMeta2KeyMax) {
-    // We do not allow splits at Meta2KeyMax. The reason for this is that the
-    // last range is the keyspace will always end at KeyMax, which will be
-    // stored at Meta2KeyMax because RangeMetaKey(KeyMax) = Meta2KeyMax. If we
-    // allowed splits at this key then the last descriptor would be stored on a
-    // non-meta range since the meta ranges would span from [KeyMin,Meta2KeyMax)
-    // and the first non-meta range would span [Meta2KeyMax,...).
+    // We do not allow splits at Meta2KeyMax. The reason for this is that range
+    // decriptors are stored at RangeMetaKey(range.EndKey), so the new range
+    // that ends at Meta2KeyMax would naturally store its decriptor at
+    // RangeMetaKey(Meta2KeyMax) = Meta1KeyMax. However, Meta1KeyMax already
+    // serves a different role of holding a second copy of the descriptor for
+    // the range that spans the meta2/userspace boundary (see case 3a in
+    // rangeAddressing). If we allowed splits at Meta2KeyMax, the two roles
+    // would overlap. See #1206.
     return false;
   }
   const auto& no_split_spans =
@@ -260,7 +262,7 @@ DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_sp
 }
 
 DBScanResults MVCCGet(DBIterator* iter, DBSlice key, DBTimestamp timestamp, DBTxn txn,
-                      bool consistent) {
+                      bool consistent, bool tombstones) {
   // Get is implemented as a scan where we retrieve a single key. Note
   // that the semantics of max_keys is that we retrieve one more key
   // than is specified in order to maintain the existing semantics of
@@ -270,17 +272,19 @@ DBScanResults MVCCGet(DBIterator* iter, DBSlice key, DBTimestamp timestamp, DBTx
   // don't retrieve a key different than the start key. This is a bit
   // of a hack.
   const DBSlice end = {0, 0};
-  mvccForwardScanner scanner(iter, key, end, timestamp, 0 /* max_keys */, txn, consistent);
+  mvccForwardScanner scanner(iter, key, end, timestamp, 0 /* max_keys */, txn, consistent,
+                             tombstones);
   return scanner.get();
 }
 
 DBScanResults MVCCScan(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp,
-                       int64_t max_keys, DBTxn txn, bool consistent, bool reverse) {
+                       int64_t max_keys, DBTxn txn, bool consistent, bool reverse,
+                       bool tombstones) {
   if (reverse) {
-    mvccReverseScanner scanner(iter, end, start, timestamp, max_keys, txn, consistent);
+    mvccReverseScanner scanner(iter, end, start, timestamp, max_keys, txn, consistent, tombstones);
     return scanner.scan();
   } else {
-    mvccForwardScanner scanner(iter, start, end, timestamp, max_keys, txn, consistent);
+    mvccForwardScanner scanner(iter, start, end, timestamp, max_keys, txn, consistent, tombstones);
     return scanner.scan();
   }
 }

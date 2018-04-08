@@ -177,16 +177,16 @@ func (v *planVisitor) visit(plan planNode) {
 		if v.observer.attr != nil {
 			jType := ""
 			switch n.joinType {
-			case joinTypeInner:
+			case sqlbase.InnerJoin:
 				jType = "inner"
 				if len(n.pred.leftColNames) == 0 && n.pred.onCond == nil {
 					jType = "cross"
 				}
-			case joinTypeLeftOuter:
+			case sqlbase.LeftOuterJoin:
 				jType = "left outer"
-			case joinTypeRightOuter:
+			case sqlbase.RightOuterJoin:
 				jType = "right outer"
-			case joinTypeFullOuter:
+			case sqlbase.FullOuterJoin:
 				jType = "full outer"
 			}
 			v.observer.attr(name, "type", jType)
@@ -284,13 +284,49 @@ func (v *planVisitor) visit(plan planNode) {
 		v.visit(n.plan)
 
 	case *groupNode:
-		if v.observer.expr != nil {
+		if v.observer.attr != nil {
+			inputCols := planColumns(n.plan)
 			for i, agg := range n.funcs {
-				v.expr(name, "aggregate", i, agg.expr)
+				var buf bytes.Buffer
+				if agg.isIdentAggregate() {
+					buf.WriteString(inputCols[agg.argRenderIdx].Name)
+				} else {
+					fmt.Fprintf(&buf, "%s(", agg.funcName)
+					if agg.argRenderIdx != noRenderIdx {
+						if agg.isDistinct() {
+							buf.WriteString("DISTINCT ")
+						}
+						buf.WriteString(inputCols[agg.argRenderIdx].Name)
+					}
+					buf.WriteByte(')')
+					if agg.filterRenderIdx != noRenderIdx {
+						fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.filterRenderIdx].Name)
+					}
+				}
+				v.observer.attr(name, fmt.Sprintf("aggregate %d", i), buf.String())
 			}
-		}
-		if v.observer.attr != nil && n.numGroupCols > 0 {
-			v.observer.attr(name, "group by", fmt.Sprintf("@1-@%d", n.numGroupCols))
+			if len(n.groupCols) > 0 {
+				// Display the grouping columns as @1-@x if possible.
+				shorthand := true
+				for i, idx := range n.groupCols {
+					if idx != i {
+						shorthand = false
+						break
+					}
+				}
+				if shorthand && len(n.groupCols) > 1 {
+					v.observer.attr(name, "group by", fmt.Sprintf("@1-@%d", len(n.groupCols)))
+				} else {
+					var buf bytes.Buffer
+					for i, idx := range n.groupCols {
+						if i > 0 {
+							buf.WriteByte(',')
+						}
+						fmt.Fprintf(&buf, "@%d", idx+1)
+					}
+					v.observer.attr(name, "group by", buf.String())
+				}
+			}
 		}
 
 		v.visit(n.plan)
@@ -335,7 +371,35 @@ func (v *planVisitor) visit(plan planNode) {
 			for i, dexpr := range n.defaultExprs {
 				v.expr(name, "default", i, dexpr)
 			}
-			for i, cexpr := range n.checkHelper.exprs {
+			for i, cexpr := range n.checkHelper.Exprs {
+				v.expr(name, "check", i, cexpr)
+			}
+			for i, rexpr := range n.rh.exprs {
+				v.expr(name, "returning", i, rexpr)
+			}
+		}
+		v.visit(n.run.rows)
+
+	case *upsertNode:
+		if v.observer.attr != nil {
+			var buf bytes.Buffer
+			buf.WriteString(n.tableDesc.Name)
+			buf.WriteByte('(')
+			for i, col := range n.insertCols {
+				if i > 0 {
+					buf.WriteString(", ")
+				}
+				buf.WriteString(col.Name)
+			}
+			buf.WriteByte(')')
+			v.observer.attr(name, "into", buf.String())
+		}
+
+		if v.observer.expr != nil {
+			for i, dexpr := range n.defaultExprs {
+				v.expr(name, "default", i, dexpr)
+			}
+			for i, cexpr := range n.checkHelper.Exprs {
 				v.expr(name, "check", i, cexpr)
 			}
 			for i, rexpr := range n.rh.exprs {
@@ -421,6 +485,12 @@ func (v *planVisitor) visit(plan planNode) {
 	case *ordinalityNode:
 		v.visit(n.source)
 
+	case *spoolNode:
+		if n.hardLimit > 0 && v.observer.attr != nil {
+			v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
+		}
+		v.visit(n.source)
+
 	case *showTraceNode:
 		v.visit(n.plan)
 
@@ -436,6 +506,11 @@ func (v *planVisitor) visit(plan planNode) {
 	case *cancelQueryNode:
 		if v.observer.expr != nil {
 			v.expr(name, "queryID", -1, n.queryID)
+		}
+
+	case *cancelSessionNode:
+		if v.observer.expr != nil {
+			v.expr(name, "sessionID", -1, n.sessionID)
 		}
 
 	case *controlJobNode:
@@ -492,6 +567,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterSequenceNode{}):        "alter sequence",
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
 	reflect.TypeOf(&cancelQueryNode{}):          "cancel query",
+	reflect.TypeOf(&cancelSessionNode{}):        "cancel session",
 	reflect.TypeOf(&controlJobNode{}):           "control job",
 	reflect.TypeOf(&createDatabaseNode{}):       "create database",
 	reflect.TypeOf(&createIndexNode{}):          "create index",
@@ -536,8 +612,10 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&showFingerprintsNode{}):     "showFingerprints",
 	reflect.TypeOf(&sortNode{}):                 "sort",
 	reflect.TypeOf(&splitNode{}):                "split",
+	reflect.TypeOf(&spoolNode{}):                "spool",
 	reflect.TypeOf(&unionNode{}):                "union",
 	reflect.TypeOf(&updateNode{}):               "update",
+	reflect.TypeOf(&upsertNode{}):               "upsert",
 	reflect.TypeOf(&valueGenerator{}):           "generator",
 	reflect.TypeOf(&valuesNode{}):               "values",
 	reflect.TypeOf(&windowNode{}):               "window",
